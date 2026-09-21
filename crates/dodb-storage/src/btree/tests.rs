@@ -510,6 +510,23 @@ fn corrupted_snapshot_artifacts_are_rejected() {
             Err(Error::SnapshotInvalid(_))
         ));
 
+        let mut wrong_uuid = SnapshotManifest::decode(&original_manifest).unwrap();
+        wrong_uuid.database_uuid[0] ^= 1;
+        fs::write(&manifest_path, wrong_uuid.encode().unwrap()).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::SnapshotInvalid(_))
+        ));
+
+        let mut wrong_shard = SnapshotManifest::decode(&original_manifest).unwrap();
+        wrong_shard.shard_id += 1;
+        wrong_shard.shard_epoch += 1;
+        fs::write(&manifest_path, wrong_shard.encode().unwrap()).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::SnapshotInvalid(_))
+        ));
+
         fs::write(&manifest_path, original_manifest.clone()).unwrap();
         let mut malformed_manifest = original_manifest.clone();
         malformed_manifest[0] ^= 1;
@@ -526,6 +543,13 @@ fn corrupted_snapshot_artifacts_are_rejected() {
         let mut database = original_database.clone();
         database[0] ^= 1;
         fs::write(&database_path, database).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::SnapshotInvalid(_))
+        ));
+
+        fs::write(&database_path, original_database.clone()).unwrap();
+        fs::write(&database_path, &original_database[..PAGE_SIZE * 2]).unwrap();
         assert!(matches!(
             validate_snapshot(&snapshot_path),
             Err(Error::SnapshotInvalid(_))
