@@ -1,9 +1,11 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dodb_core::DocumentKey;
 use dodb_storage::{BTreeStore, DatabaseConfig, ProductionFile};
 
 const ROWS: usize = 2_000;
+const ASYNC_OPERATIONS_PER_CLIENT: usize = 64;
 
 fn key(index: usize) -> DocumentKey {
     DocumentKey::new(
@@ -113,4 +115,44 @@ fn main() {
         }
         report("mixed read/write", start.elapsed(), ROWS);
     }
+
+    println!("\nasync coordinator baseline; default batch limit=64; 1 ms collection window");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("benchmark runtime should build");
+    runtime.block_on(async {
+        for clients in [1, 4, 16, 64] {
+            let store = fresh_store(256, &format!("async-{clients}"));
+            let shard = Arc::new(dodb_storage::AsyncShard::start(
+                store,
+                if clients == 1 { 1 } else { 256 },
+            ));
+            let start = Instant::now();
+            let mut tasks = Vec::with_capacity(clients);
+            for client in 0..clients {
+                let shard = Arc::clone(&shard);
+                tasks.push(tokio::spawn(async move {
+                    for operation in 0..ASYNC_OPERATIONS_PER_CLIENT {
+                        let index = (client * ASYNC_OPERATIONS_PER_CLIENT + operation) % ROWS;
+                        shard
+                            .execute(dodb_storage::BatchRequest::Put {
+                                key: key(index),
+                                value: (index as u64).to_le_bytes().to_vec(),
+                            })
+                            .await
+                            .expect("async put should succeed");
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.expect("async benchmark task should succeed");
+            }
+            report(
+                &format!("async PUT {clients} clients"),
+                start.elapsed(),
+                clients * ASYNC_OPERATIONS_PER_CLIENT,
+            );
+        }
+    });
 }

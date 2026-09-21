@@ -78,6 +78,11 @@ queue order against one private storage batch, and replies in request order.
 This establishes the future group-commit shape without pretending that the
 Phase 1 direct publisher is a WAL commit protocol.
 
+The checked-in `phase1-bench` binary reports synchronous cache baselines and
+async PUT throughput for 1, 4, 16, and 64 clients. The one-client run uses a
+queue capacity of one as the effectively-single-request comparison; larger
+runs use the bounded batching queue.
+
 ## Correctness coverage
 
 The storage crate covers empty-tree insertion, leaf and internal splits, root
