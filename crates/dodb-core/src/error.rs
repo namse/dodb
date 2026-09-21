@@ -12,6 +12,8 @@ pub enum Error {
     UnsupportedFormat(String),
     DurabilityFailure(String),
     RecoveryFailure(String),
+    CheckpointFailure(String),
+    SnapshotInvalid(String),
     InternalInvariantViolation(String),
 }
 
@@ -50,6 +52,14 @@ impl Error {
         Self::RecoveryFailure(message.into())
     }
 
+    pub fn checkpoint(message: impl Into<String>) -> Self {
+        Self::CheckpointFailure(message.into())
+    }
+
+    pub fn snapshot(message: impl Into<String>) -> Self {
+        Self::SnapshotInvalid(message.into())
+    }
+
     pub fn invariant(message: impl Into<String>) -> Self {
         Self::InternalInvariantViolation(message.into())
     }
@@ -67,6 +77,10 @@ impl fmt::Display for Error {
             Self::UnsupportedFormat(message) => write!(formatter, "unsupported format: {message}"),
             Self::DurabilityFailure(message) => write!(formatter, "durability failure: {message}"),
             Self::RecoveryFailure(message) => write!(formatter, "recovery failure: {message}"),
+            Self::CheckpointFailure(message) => {
+                write!(formatter, "checkpoint failure: {message}")
+            }
+            Self::SnapshotInvalid(message) => write!(formatter, "invalid snapshot: {message}"),
             Self::InternalInvariantViolation(message) => {
                 write!(formatter, "internal invariant violation: {message}")
             }

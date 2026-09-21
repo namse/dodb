@@ -234,6 +234,15 @@ pub struct StorageMetrics {
     pub publication_nanos: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointReport {
+    pub checkpoint_lsn: Lsn,
+    pub pages_flushed: usize,
+    pub bytes_written: u64,
+    pub wal_bytes_reclaimed: u64,
+    pub duration_nanos: u64,
+}
+
 /// A mutable, single-file B+Tree over canonical encoded document keys.
 pub struct BTreeStore<F: DurableFile, W: DurableFile = NoWal> {
     file: F,
@@ -352,9 +361,11 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             config.shard_id,
             config.shard_epoch,
         );
-        let wal = WalLog::open_with_fault_injector(
+        let checkpoint_hint = checkpoint_lsn_hint(&mut file).unwrap_or(Lsn::ZERO);
+        let wal = WalLog::open_with_fault_injector_and_start_lsn(
             wal_file,
             identity.clone(),
+            checkpoint_hint,
             fault_injector.as_deref_mut(),
         )?;
         if file.is_empty()? && wal.committed_batches().is_empty() {
@@ -369,6 +380,7 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         recover_data_file(
             &mut file,
             wal.committed_batches(),
+            checkpoint_hint,
             fault_injector.as_deref_mut(),
         )?;
         let length = file.len()?;
@@ -384,6 +396,8 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         validate_superblock_identity(&selected.superblock, &identity)?;
         let (root_page_id, free_list_head, high_water_page_id) =
             metadata_from_superblock(&selected.superblock, length)?;
+        let mut wal = wal;
+        wal.resume_after(selected.superblock.checkpoint_lsn)?;
         let mut store = BTreeStore::<F, W> {
             file,
             wal: Some(wal),
@@ -763,6 +777,153 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         self.flush_dirty_pages()
     }
 
+    pub fn checkpoint(&mut self) -> Result<CheckpointReport> {
+        let started = Instant::now();
+        if let Some(message) = &self.broken {
+            return Err(Error::checkpoint(format!(
+                "storage shard is degraded: {message}"
+            )));
+        }
+        self.hit_fault("before_checkpoint_gate")?;
+        let Some(wal) = self.wal.as_ref() else {
+            return Err(Error::checkpoint(
+                "formal checkpoint requires a WAL-backed store",
+            ));
+        };
+        let checkpoint_lsn = wal
+            .committed_batches()
+            .last()
+            .map(|batch| batch.commit_lsn)
+            .unwrap_or(self.current_superblock.checkpoint_lsn);
+        if checkpoint_lsn < self.current_superblock.checkpoint_lsn {
+            return Err(Error::invariant("checkpoint LSN would move backwards"));
+        }
+        let metadata_changed = checkpoint_lsn > self.current_superblock.checkpoint_lsn;
+        let dirty_page_count = self.dirty_pages.len();
+        let bytes_written = u64::try_from(dirty_page_count)
+            .ok()
+            .and_then(|count| count.checked_mul(PAGE_SIZE as u64))
+            .and_then(|bytes| {
+                bytes.checked_add(if metadata_changed {
+                    PAGE_SIZE as u64
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(|| Error::checkpoint("checkpoint byte count overflows"))?;
+        let wal_bytes_before = wal.metrics()?.wal_bytes;
+
+        self.hit_fault("before_checkpoint_data_flush")?;
+        self.flush_dirty_pages().map_err(|error| {
+            Error::checkpoint(format!("checkpoint data-file flush failed: {error}"))
+        })?;
+        self.hit_fault("after_checkpoint_data_sync")?;
+
+        if metadata_changed {
+            let checkpoint_superblock = decode_superblock(&encode_superblock(&Superblock {
+                generation: self
+                    .current_superblock
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("superblock generation exhausted"))?,
+                checkpoint_lsn,
+                ..self.current_superblock.clone()
+            })?)?;
+            let checkpoint_bytes = encode_superblock(&checkpoint_superblock)?;
+            let checkpoint_slot = match self.active_slot {
+                SuperblockSlot::A => SuperblockSlot::B,
+                SuperblockSlot::B => SuperblockSlot::A,
+            };
+            self.hit_fault("before_checkpoint_superblock_write")?;
+            let offset = match checkpoint_slot {
+                SuperblockSlot::A => SUPERBLOCK_A_OFFSET,
+                SuperblockSlot::B => SUPERBLOCK_B_OFFSET,
+            };
+            if let Err(error) = write_all_at(&mut self.file, offset, &checkpoint_bytes) {
+                self.broken = Some(error.to_string());
+                return Err(Error::checkpoint(format!(
+                    "checkpoint superblock write failed: {error}"
+                )));
+            }
+            self.hit_fault("after_checkpoint_superblock_write")?;
+            self.hit_fault("before_checkpoint_metadata_sync")?;
+            self.hit_fault("during_checkpoint_metadata_sync")?;
+            if let Err(error) = self.file.sync_data() {
+                self.broken = Some(error.to_string());
+                return Err(Error::checkpoint(format!(
+                    "checkpoint metadata sync failed: {error}"
+                )));
+            }
+            if let Err(error) = self.hit_fault("after_checkpoint_metadata_sync") {
+                self.broken = Some(error.to_string());
+                return Err(Error::checkpoint(format!(
+                    "checkpoint metadata completion was uncertain: {error}"
+                )));
+            }
+            self.current_superblock = checkpoint_superblock;
+            self.active_slot = checkpoint_slot;
+        }
+
+        if let Err(error) = self.check_invariants() {
+            self.broken = Some(error.to_string());
+            return Err(Error::checkpoint(format!(
+                "checkpoint invariant check failed: {error}"
+            )));
+        }
+
+        let should_reset_wal = self.wal.as_ref().is_some_and(|wal| {
+            !wal.committed_batches().is_empty() || wal.history_start_lsn() < checkpoint_lsn
+        });
+        if should_reset_wal {
+            let mut wal = self
+                .wal
+                .take()
+                .ok_or_else(|| Error::invariant("WAL disappeared during checkpoint"))?;
+            let reset_result = wal.reset(checkpoint_lsn, self.fault_injector.as_deref_mut());
+            if let Err(error) = reset_result {
+                self.wal = Some(wal);
+                self.broken = Some(error.to_string());
+                return Err(Error::checkpoint(format!("WAL reset failed: {error}")));
+            }
+            self.next_lsn = wal.next_lsn();
+            self.next_batch_id = wal.next_batch_id();
+            self.wal = Some(wal);
+        }
+        if let Err(error) = self.hit_fault("before_checkpoint_complete") {
+            self.broken = Some(error.to_string());
+            return Err(Error::checkpoint(format!(
+                "checkpoint completion was uncertain: {error}"
+            )));
+        }
+        let wal_bytes_after = self
+            .wal
+            .as_ref()
+            .map(WalLog::metrics)
+            .transpose()?
+            .map_or(0, |metrics| metrics.wal_bytes);
+        let wal_bytes_reclaimed = wal_bytes_before.saturating_sub(wal_bytes_after);
+        Ok(CheckpointReport {
+            checkpoint_lsn,
+            pages_flushed: dirty_page_count,
+            bytes_written,
+            wal_bytes_reclaimed,
+            duration_nanos: elapsed_nanos(started),
+        })
+    }
+
+    pub fn create_snapshot(
+        &mut self,
+        destination: impl AsRef<Path>,
+    ) -> Result<crate::SnapshotReport> {
+        self.checkpoint()?;
+        crate::snapshot::create_snapshot(
+            &mut self.file,
+            &self.current_superblock,
+            destination.as_ref(),
+            self.fault_injector.as_deref_mut(),
+        )
+    }
+
     pub fn check_invariants(&mut self) -> Result<InvariantReport> {
         if self.wal.is_some() {
             self.flush_dirty_pages()?;
@@ -790,6 +951,18 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             return Err(Error::corruption(
                 "in-memory allocator metadata does not match superblock",
             ));
+        }
+        if let Some(wal) = self.wal.as_ref() {
+            let latest_known_lsn = wal
+                .committed_batches()
+                .last()
+                .map(|batch| batch.commit_lsn)
+                .unwrap_or(self.current_superblock.checkpoint_lsn);
+            if self.current_superblock.checkpoint_lsn > latest_known_lsn {
+                return Err(Error::corruption(
+                    "checkpoint LSN is newer than the known durable WAL state",
+                ));
+            }
         }
         checker::check(&mut self.file, root, free_head, high_water)
     }
@@ -934,6 +1107,13 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         let bytes = read_exact_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, PAGE_SIZE)?;
         let decoded = decode_page_at(&bytes, Some(page_id))?;
         PageData::decode(decoded)
+    }
+
+    fn hit_fault(&mut self, point: &str) -> Result<()> {
+        if let Some(injector) = self.fault_injector.as_deref_mut() {
+            injector.hit(point)?;
+        }
+        Ok(())
     }
 }
 
@@ -1952,13 +2132,18 @@ fn validate_superblock_identity(superblock: &Superblock, identity: &WalIdentity)
 fn recover_data_file<F: DurableFile>(
     file: &mut F,
     committed_batches: &[CommittedWalBatch],
+    checkpoint_lsn: Lsn,
     mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
 ) -> Result<()> {
+    let committed_batches = committed_batches
+        .iter()
+        .filter(|batch| batch.commit_lsn > checkpoint_lsn)
+        .collect::<Vec<_>>();
     if committed_batches.is_empty() {
         return Ok(());
     }
     let mut highest_data_page = FIRST_DATA_PAGE;
-    for batch in committed_batches {
+    for batch in &committed_batches {
         for page in &batch.pages {
             if page.page_id.get() >= FIRST_DATA_PAGE {
                 highest_data_page = highest_data_page.max(page.page_id.get());
@@ -1981,7 +2166,7 @@ fn recover_data_file<F: DurableFile>(
 
     let mut changed = current_length < target_length;
     let readable_length = file.len()?;
-    for batch in committed_batches {
+    for batch in &committed_batches {
         for page in &batch.pages {
             let offset = page
                 .page_id
@@ -2021,6 +2206,18 @@ fn recover_data_file<F: DurableFile>(
         hit_fault(&mut injector, "after_recovery_sync")?;
     }
     Ok(())
+}
+
+fn checkpoint_lsn_hint<F: DurableFile>(file: &mut F) -> Result<Lsn> {
+    let length = file.len()?;
+    if length < (FIRST_DATA_PAGE * PAGE_SIZE as u64) {
+        return Ok(Lsn::ZERO);
+    }
+    let slot_a = read_exact_at(file, SUPERBLOCK_A_OFFSET, PAGE_SIZE)?;
+    let slot_b = read_exact_at(file, SUPERBLOCK_B_OFFSET, PAGE_SIZE)?;
+    Ok(choose_superblock(&slot_a, &slot_b)?
+        .superblock
+        .checkpoint_lsn)
 }
 
 fn hit_fault(

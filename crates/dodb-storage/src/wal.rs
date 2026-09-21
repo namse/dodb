@@ -15,7 +15,7 @@ use crate::fault::FaultInjector;
 use crate::page::{PAGE_SIZE, decode_page_at};
 use crate::superblock::decode_superblock;
 
-pub const WAL_FORMAT_VERSION: u16 = 1;
+pub const WAL_FORMAT_VERSION: u16 = 2;
 pub const WAL_MAGIC: [u8; 4] = *b"DWAL";
 pub const WAL_HEADER_SIZE: usize = 48;
 pub const WAL_TRAILER_SIZE: usize = 4;
@@ -24,7 +24,9 @@ pub const WAL_MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
 
 const HEADER_CHECKSUM_OFFSET: usize = 40;
 const PAYLOAD_CHECKSUM_OFFSET: usize = 44;
-const INIT_PAYLOAD_SIZE: usize = 44;
+const LEGACY_WAL_FORMAT_VERSION: u16 = 1;
+const LEGACY_INIT_PAYLOAD_SIZE: usize = 44;
+const INIT_PAYLOAD_SIZE: usize = 52;
 const PAGE_IMAGE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE;
 const COMMIT_PAYLOAD_SIZE: usize = 16;
 
@@ -125,6 +127,7 @@ pub struct WalMetrics {
 
 #[derive(Clone, Debug)]
 struct Frame {
+    format_version: u16,
     record_type: WalRecordType,
     record_lsn: Lsn,
     batch_id: u64,
@@ -144,8 +147,10 @@ struct PendingBatch {
 pub struct WalLog<F: DurableFile> {
     file: F,
     identity: WalIdentity,
+    format_version: u16,
     next_lsn: Lsn,
     next_batch_id: u64,
+    history_start_lsn: Lsn,
     committed: Vec<CommittedWalBatch>,
     scan_report: WalScanReport,
     sync_count: u64,
@@ -160,17 +165,33 @@ impl<F: DurableFile> WalLog<F> {
     }
 
     pub fn open_with_fault_injector(
+        file: F,
+        identity: WalIdentity,
+        mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Self> {
+        Self::open_with_fault_injector_and_start_lsn(file, identity, Lsn::ZERO, injector.take())
+    }
+
+    pub fn open_with_fault_injector_and_start_lsn(
         mut file: F,
         identity: WalIdentity,
+        start_after_lsn: Lsn,
         mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
     ) -> Result<Self> {
         let length = file.len()?;
         if length == 0 {
+            let next_lsn = start_after_lsn
+                .get()
+                .checked_add(1)
+                .map(Lsn::new)
+                .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
             let mut wal = Self {
                 file,
                 identity,
-                next_lsn: Lsn::new(1),
+                format_version: WAL_FORMAT_VERSION,
+                next_lsn,
                 next_batch_id: 1,
+                history_start_lsn: start_after_lsn,
                 committed: Vec::new(),
                 scan_report: WalScanReport::default(),
                 sync_count: 0,
@@ -178,7 +199,7 @@ impl<F: DurableFile> WalLog<F> {
                 append_nanos: 0,
                 sync_nanos: 0,
             };
-            let payload = wal.identity_payload();
+            let payload = wal.identity_payload(start_after_lsn);
             wal.append_frame(WalRecordType::Init, Lsn::ZERO, 0, 0, &payload, &mut None)?;
             wal.file
                 .sync_data()
@@ -188,8 +209,15 @@ impl<F: DurableFile> WalLog<F> {
             return Ok(wal);
         }
 
-        let (next_lsn, next_batch_id, committed, mut report, valid_length) =
-            scan_wal(&mut file, &identity)?;
+        let (
+            next_lsn,
+            next_batch_id,
+            format_version,
+            history_start_lsn,
+            committed,
+            mut report,
+            valid_length,
+        ) = scan_wal(&mut file, &identity)?;
         if valid_length < length {
             hit(&mut injector, "before_wal_tail_truncate")?;
             file.set_len(valid_length)?;
@@ -204,8 +232,10 @@ impl<F: DurableFile> WalLog<F> {
         Ok(Self {
             file,
             identity,
+            format_version,
             next_lsn,
             next_batch_id,
+            history_start_lsn,
             committed,
             scan_report: report,
             sync_count: 0,
@@ -229,6 +259,83 @@ impl<F: DurableFile> WalLog<F> {
 
     pub fn next_batch_id(&self) -> u64 {
         self.next_batch_id
+    }
+
+    pub fn history_start_lsn(&self) -> Lsn {
+        self.history_start_lsn
+    }
+
+    pub fn resume_after(&mut self, checkpoint_lsn: Lsn) -> Result<()> {
+        let next_lsn = checkpoint_lsn
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
+        if self.next_lsn < Lsn::new(next_lsn) {
+            self.next_lsn = Lsn::new(next_lsn);
+        }
+        Ok(())
+    }
+
+    pub fn reset(
+        &mut self,
+        checkpoint_lsn: Lsn,
+        mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<()> {
+        if checkpoint_lsn < self.history_start_lsn {
+            return Err(Error::checkpoint(
+                "WAL reset would move its history start backwards",
+            ));
+        }
+        hit(&mut injector, "before_wal_reset")?;
+        hit(&mut injector, "during_wal_truncate")?;
+        self.file
+            .set_len(0)
+            .map_err(|error| Error::checkpoint(format!("WAL reset truncation failed: {error}")))?;
+        hit(&mut injector, "after_wal_truncate")?;
+        hit(&mut injector, "before_wal_reset_truncate_sync")?;
+        hit(&mut injector, "during_wal_reset_truncate_sync")?;
+        self.file.sync_data().map_err(|error| {
+            Error::checkpoint(format!("WAL reset truncation sync failed: {error}"))
+        })?;
+        hit(&mut injector, "after_wal_reset_truncate_sync")?;
+
+        self.history_start_lsn = checkpoint_lsn;
+        self.format_version = WAL_FORMAT_VERSION;
+        self.next_lsn = checkpoint_lsn
+            .get()
+            .checked_add(1)
+            .map(Lsn::new)
+            .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
+        self.next_batch_id = 1;
+        self.committed.clear();
+        self.scan_report = WalScanReport {
+            records_scanned: 1,
+            ..WalScanReport::default()
+        };
+        self.page_images = 0;
+        hit(&mut injector, "before_wal_reinitialization")?;
+        let payload = self.identity_payload(checkpoint_lsn);
+        hit(&mut injector, "during_wal_reinitialization")?;
+        self.append_frame(
+            WalRecordType::Init,
+            Lsn::ZERO,
+            0,
+            0,
+            &payload,
+            &mut injector,
+        )?;
+        hit(&mut injector, "after_wal_reset_write")?;
+        hit(&mut injector, "before_wal_reset_sync")?;
+        hit(&mut injector, "during_wal_reset_sync")?;
+        self.file
+            .sync_data()
+            .map_err(|error| Error::checkpoint(format!("WAL reset sync failed: {error}")))?;
+        self.sync_count = self
+            .sync_count
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("WAL sync count overflow"))?;
+        hit(&mut injector, "after_wal_reset_sync")?;
+        Ok(())
     }
 
     pub fn scan_report(&self) -> &WalScanReport {
@@ -472,7 +579,7 @@ impl<F: DurableFile> WalLog<F> {
             .ok_or_else(|| Error::invalid_input("WAL frame length overflows"))?;
         let mut header = [0u8; WAL_HEADER_SIZE];
         header[0..4].copy_from_slice(&WAL_MAGIC);
-        header[4..6].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+        header[4..6].copy_from_slice(&self.format_version.to_le_bytes());
         header[6] = record_type as u8;
         header[8..12].copy_from_slice(
             &u32::try_from(frame_length)
@@ -518,13 +625,14 @@ impl<F: DurableFile> WalLog<F> {
         Ok(frame_length)
     }
 
-    fn identity_payload(&self) -> [u8; INIT_PAYLOAD_SIZE] {
+    fn identity_payload(&self, start_after_lsn: Lsn) -> [u8; INIT_PAYLOAD_SIZE] {
         let mut payload = [0u8; INIT_PAYLOAD_SIZE];
         payload[0..16].copy_from_slice(&self.identity.database_uuid);
         payload[16..24].copy_from_slice(&self.identity.tenant_id.get().to_le_bytes());
         payload[24..32].copy_from_slice(&self.identity.shard_id.get().to_le_bytes());
         payload[32..40].copy_from_slice(&self.identity.shard_epoch.get().to_le_bytes());
         payload[40..44].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+        payload[44..52].copy_from_slice(&start_after_lsn.get().to_le_bytes());
         payload
     }
 }
@@ -541,10 +649,17 @@ fn elapsed_nanos(started: Instant) -> Result<u64> {
         .map_err(|_| Error::invariant("WAL timing does not fit u64"))
 }
 
-fn scan_wal<F: DurableFile>(
-    file: &mut F,
-    identity: &WalIdentity,
-) -> Result<(Lsn, u64, Vec<CommittedWalBatch>, WalScanReport, u64)> {
+type WalScanResult = (
+    Lsn,
+    u64,
+    u16,
+    Lsn,
+    Vec<CommittedWalBatch>,
+    WalScanReport,
+    u64,
+);
+
+fn scan_wal<F: DurableFile>(file: &mut F, identity: &WalIdentity) -> Result<WalScanResult> {
     let length = file.len()?;
     let mut offset = 0u64;
     let mut previous_lsn = None;
@@ -556,8 +671,23 @@ fn scan_wal<F: DurableFile>(
             break;
         }
         let header_bytes = read_exact_at(file, offset, WAL_HEADER_SIZE)?;
-        let (record_type, frame_length, payload_length, record_lsn, batch_id, record_index) =
-            decode_header(&header_bytes)?;
+        let (
+            format_version,
+            record_type,
+            frame_length,
+            payload_length,
+            record_lsn,
+            batch_id,
+            record_index,
+        ) = decode_header(&header_bytes)?;
+        if frames
+            .first()
+            .is_some_and(|frame: &Frame| frame.format_version != format_version)
+        {
+            return Err(Error::corruption(
+                "WAL frames use inconsistent format versions",
+            ));
+        }
         if frame_length < WAL_MIN_FRAME_SIZE
             || frame_length != WAL_HEADER_SIZE + payload_length + WAL_TRAILER_SIZE
             || payload_length > WAL_MAX_PAYLOAD_SIZE
@@ -599,6 +729,7 @@ fn scan_wal<F: DurableFile>(
         previous_lsn = Some(record_lsn);
         verify_payload_checksum(&header_bytes, &payload, offset)?;
         frames.push(Frame {
+            format_version,
             record_type,
             record_lsn: Lsn::new(record_lsn),
             batch_id,
@@ -622,13 +753,18 @@ fn scan_wal<F: DurableFile>(
             "WAL does not begin with the required initialization record",
         ));
     }
-    verify_identity(&first.payload, identity)?;
+    let history_start_lsn = verify_identity(first.format_version, &first.payload, identity)?;
 
     let mut committed = Vec::new();
     let mut pending: Option<PendingBatch> = None;
     let mut highest_batch_id_seen = 0u64;
     let mut max_batch_id = 0u64;
     for frame in frames.iter().skip(1) {
+        if frame.record_lsn <= history_start_lsn {
+            return Err(Error::corruption(
+                "WAL record LSN is not after the initialization history boundary",
+            ));
+        }
         max_batch_id = max_batch_id.max(frame.batch_id);
         match frame.record_type {
             WalRecordType::Init => {
@@ -708,10 +844,18 @@ fn scan_wal<F: DurableFile>(
         .checked_add(1)
         .ok_or_else(|| Error::invariant("WAL batch ID exhausted"))?
         .max(1);
-    Ok((next_lsn, next_batch_id, committed, report, valid_length))
+    Ok((
+        next_lsn,
+        next_batch_id,
+        first.format_version,
+        history_start_lsn,
+        committed,
+        report,
+        valid_length,
+    ))
 }
 
-fn decode_header(bytes: &[u8]) -> Result<(WalRecordType, usize, usize, u64, u64, u32)> {
+fn decode_header(bytes: &[u8]) -> Result<(u16, WalRecordType, usize, usize, u64, u64, u32)> {
     if bytes.len() != WAL_HEADER_SIZE {
         return Err(Error::corruption("WAL header has an invalid length"));
     }
@@ -719,7 +863,7 @@ fn decode_header(bytes: &[u8]) -> Result<(WalRecordType, usize, usize, u64, u64,
         return Err(Error::corruption("WAL magic mismatch"));
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != WAL_FORMAT_VERSION {
+    if version != WAL_FORMAT_VERSION && version != LEGACY_WAL_FORMAT_VERSION {
         return Err(Error::unsupported_format(format!(
             "WAL version {version}, supported {WAL_FORMAT_VERSION}"
         )));
@@ -733,6 +877,7 @@ fn decode_header(bytes: &[u8]) -> Result<(WalRecordType, usize, usize, u64, u64,
         return Err(Error::corruption("WAL header checksum mismatch"));
     }
     Ok((
+        version,
         WalRecordType::decode(bytes[6])?,
         u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
         u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
@@ -812,8 +957,13 @@ fn decode_commit_payload(payload: &[u8]) -> Result<(Lsn, usize, u32)> {
     ))
 }
 
-fn verify_identity(payload: &[u8], expected: &WalIdentity) -> Result<()> {
-    if payload.len() != INIT_PAYLOAD_SIZE {
+fn verify_identity(version: u16, payload: &[u8], expected: &WalIdentity) -> Result<Lsn> {
+    let expected_length = if version == LEGACY_WAL_FORMAT_VERSION {
+        LEGACY_INIT_PAYLOAD_SIZE
+    } else {
+        INIT_PAYLOAD_SIZE
+    };
+    if payload.len() != expected_length {
         return Err(Error::corruption(
             "WAL initialization payload has invalid length",
         ));
@@ -833,7 +983,12 @@ fn verify_identity(payload: &[u8], expected: &WalIdentity) -> Result<()> {
             "WAL identity does not match the requested database shard",
         ));
     }
-    Ok(())
+    let start_after_lsn = if version == LEGACY_WAL_FORMAT_VERSION {
+        Lsn::ZERO
+    } else {
+        Lsn::new(u64::from_le_bytes(payload[44..52].try_into().unwrap()))
+    };
+    Ok(start_after_lsn)
 }
 
 fn header_checksum(header: &[u8]) -> u32 {

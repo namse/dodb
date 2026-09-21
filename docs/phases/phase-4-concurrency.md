@@ -110,7 +110,8 @@ concurrent storage actor, and the current policy remains understandable:
 - dirty pages and retained WAL remain bounded only by the existing explicit
   flush/reopen operational boundary.
 
-Formal checkpointing and WAL reclamation remain Phase 5.
+Phase 5 adds formal checkpointing and WAL reclamation while keeping the
+coordinator as the write serialization point.
 
 ## Baseline measurements before changes
 
@@ -206,7 +207,7 @@ checkpoint_lsn
     -> remains at the last formal checkpoint boundary; ordinary commits do not advance it
 ```
 
-Phase 4 does not reclaim WAL or implement a checkpoint. Phase 5 can therefore
-define the ordering `flush committed state through LSN N`, sync the database
-file, persist checkpoint metadata `N`, sync metadata, and only then reclaim WAL
-records at or below `N`.
+Phase 5 uses the coordinator FIFO to place checkpoint work between accepted
+mutation groups. The write gate is held through data sync, checkpoint
+superblock sync, WAL reset, and WAL reset sync; ordinary immutable reads keep
+using the committed read view.

@@ -92,8 +92,10 @@ memory. In the WAL-backed path, full page images and the alternate superblock
 image are appended to the separate redo-only WAL, followed by a `COMMIT` frame
 and WAL `sync_data`. That sync is the durability point. Only after it succeeds
 are the images published to the committed cache and dirty-page set. Data-file
-flushing is later and is not a commit boundary. The WAL is retained from
-database creation because Phase 2 has no formal checkpoint protocol.
+flushing is later and is not a commit boundary. Phase 5 adds a formal
+checkpoint that syncs the complete committed database image, advances the
+alternate superblock's `checkpoint_lsn`, and then resets the WAL with an
+identity `INIT` whose history starts after that LSN.
 
 The legacy `NamseEnt/namseent` `luda-editor/new-server/bptree` implementation
 is an architectural reference for page-oriented mutation, but dodb defines a

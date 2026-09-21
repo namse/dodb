@@ -74,11 +74,12 @@ Record LSNs are one strictly increasing sequence in one WAL. The `INIT` frame
 uses LSN 0. Page-image frames consume record LSNs and the following `COMMIT`
 frame's LSN is the commit LSN. A page header and every document revision
 changed by the commit use that commit LSN. The next record LSN is persisted by
-WAL history rather than guessed from the data-file superblock.
+WAL history rather than guessed from the data-file superblock. After Phase 5
+WAL reset, the new `INIT` records the checkpoint LSN immediately before its
+history and the next record LSN is the checkpoint LSN plus one.
 
-The superblock `checkpoint_lsn` remains the last checkpoint boundary. Phase 2
-does not claim that every commit is a checkpoint, so this field is not advanced
-by ordinary WAL commits. Formal checkpoints and WAL reclamation are deferred.
+The superblock `checkpoint_lsn` remains the last checkpoint boundary. Ordinary
+WAL commits do not advance it; only a formal Phase 5 checkpoint does.
 
 ## Recovery and redo
 
@@ -137,9 +138,8 @@ each transaction still has its own page-image sequence and `COMMIT` frame, but
 several sequences may share one WAL sync. Recovery replays those committed
 units in order.
 
-OCC validation, MVCC, snapshot, replication, checkpoint, WAL compaction,
-networking, and background flush workers remain outside this WAL document. A
-caller may invoke `flush` for a clean data-file image; successful writes do not
-depend on doing so. Phase 4 does not add a flush worker: dirty committed pages
-continue to accumulate until explicit `flush`, `checkpoint_lsn` remains
-unchanged, and retained WAL history remains the recovery authority.
+OCC validation, MVCC, replication, networking, and background flush workers
+remain outside this WAL document. Phase 5 adds local checkpoint and physical
+snapshot boundaries; remote retention, replication, and public PITR remain
+outside the phase. A caller may invoke `flush` for a clean data-file image;
+successful writes do not depend on doing so.

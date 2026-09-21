@@ -80,6 +80,71 @@ fn successful_write_survives_sigkill_and_restart() {
 }
 
 #[test]
+fn checkpoint_boundaries_survive_sigkill_and_restart() {
+    let executable = std::env::var_os("CARGO_BIN_EXE_phase2-crash-child")
+        .expect("Cargo should expose the crash child binary to integration tests");
+    let checkpoint_points = [
+        "before_checkpoint_data_flush",
+        "before_data_page_write",
+        "during_data_page_write",
+        "before_data_file_sync",
+        "before_checkpoint_superblock_write",
+        "before_checkpoint_metadata_sync",
+        "before_wal_reset",
+        "during_wal_truncate",
+        "before_wal_reset_truncate_sync",
+        "before_wal_reinitialization",
+        "during_wal_reinitialization",
+        "before_wal_reset_sync",
+        "during_wal_reset_sync",
+    ];
+    for (iteration, checkpoint_point) in checkpoint_points.into_iter().enumerate() {
+        let (data_path, wal_path, marker_path) = paths(20_000 + iteration);
+        let _ = std::fs::remove_file(&data_path);
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&marker_path);
+        let mut child = Command::new(&executable)
+            .arg(&data_path)
+            .arg(&wal_path)
+            .arg(&marker_path)
+            .arg(checkpoint_point)
+            .spawn()
+            .expect("checkpoint crash child should spawn");
+        for _ in 0..200 {
+            if marker_path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            marker_path.exists(),
+            "child did not reach checkpoint boundary {checkpoint_point}"
+        );
+        child.kill().expect("SIGKILL should terminate child");
+        let status = child.wait().expect("child status should be available");
+        assert!(!status.success(), "child must be terminated abruptly");
+
+        let mut store = BTreeStore::open_with_wal(
+            ProductionFile::open(&data_path).unwrap(),
+            ProductionFile::open(&wal_path).unwrap(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .get(&DocumentKey::new(b"subprocess".to_vec(), b"key".to_vec()))
+                .unwrap()
+                .value(),
+            Some(&b"value"[..])
+        );
+        store.check_invariants().unwrap();
+        let _ = std::fs::remove_file(data_path);
+        let _ = std::fs::remove_file(wal_path);
+        let _ = std::fs::remove_file(marker_path);
+    }
+}
+
+#[test]
 fn wrong_wal_identity_is_rejected() {
     let data_path =
         std::env::temp_dir().join(format!("dodb-phase2-identity-{}.db", std::process::id()));

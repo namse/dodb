@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -8,8 +9,11 @@ use dodb_core::{
 };
 
 use super::format::{MAX_OVERFLOW_PAGES, PageData, ValueRef};
-use super::{BTreeStore, BatchRequest, BatchResponse, StorageMetrics, validate_encoded_key};
+use super::{
+    BTreeStore, BatchRequest, BatchResponse, CheckpointReport, StorageMetrics, validate_encoded_key,
+};
 use crate::DurableFile;
+use crate::SnapshotReport;
 use crate::wal::WalMetrics;
 
 /// Internal scheduling limits for one shard coordinator.
@@ -152,6 +156,27 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
         }
     }
 
+    pub async fn checkpoint(&self) -> Result<CheckpointReport> {
+        match self.send(CoordinatorOperation::Checkpoint).await? {
+            CoordinatorResponse::Checkpoint(report) => Ok(report),
+            _ => Err(Error::invariant(
+                "coordinator returned the wrong checkpoint response",
+            )),
+        }
+    }
+
+    pub async fn create_snapshot(&self, destination: impl Into<PathBuf>) -> Result<SnapshotReport> {
+        match self
+            .send(CoordinatorOperation::Snapshot(destination.into()))
+            .await?
+        {
+            CoordinatorResponse::Snapshot(report) => Ok(report),
+            _ => Err(Error::invariant(
+                "coordinator returned the wrong snapshot response",
+            )),
+        }
+    }
+
     fn try_read(&self, request: &BatchRequest) -> Option<Result<BatchResponse>> {
         let state = self.read_view.read().ok()?;
         if let Some(message) = &state.broken {
@@ -229,12 +254,16 @@ enum CoordinatorOperation {
     Batch(BatchRequest),
     Transaction(TransactionRequest),
     TransactGet(Vec<DocumentKey>),
+    Checkpoint,
+    Snapshot(PathBuf),
 }
 
 enum CoordinatorResponse {
     Batch(BatchResponse),
     Transaction(TransactionResult),
     TransactGet(Vec<RevisionState>),
+    Checkpoint(CheckpointReport),
+    Snapshot(SnapshotReport),
 }
 
 fn try_enqueue(
@@ -486,6 +515,12 @@ fn process_group<F: DurableFile, W: DurableFile>(
             CoordinatorOperation::TransactGet(keys) => store
                 .transact_get(keys)
                 .map(CoordinatorResponse::TransactGet),
+            CoordinatorOperation::Checkpoint => {
+                store.checkpoint().map(CoordinatorResponse::Checkpoint)
+            }
+            CoordinatorOperation::Snapshot(destination) => store
+                .create_snapshot(destination)
+                .map(CoordinatorResponse::Snapshot),
         })
         .collect();
     Ok(responses)
@@ -548,6 +583,12 @@ fn batch_error(error: &Error) -> Error {
         Error::RecoveryFailure(message) => {
             Error::recovery(format!("batch was not published: {message}"))
         }
+        Error::CheckpointFailure(message) => {
+            Error::checkpoint(format!("batch was not published: {message}"))
+        }
+        Error::SnapshotInvalid(message) => {
+            Error::snapshot(format!("batch was not published: {message}"))
+        }
         Error::InternalInvariantViolation(message) => {
             Error::invariant(format!("batch was not published: {message}"))
         }
@@ -599,6 +640,8 @@ fn operation_size(operation: &CoordinatorOperation) -> usize {
             .iter()
             .map(|key| key.encode().len())
             .fold(0usize, usize::saturating_add),
+        CoordinatorOperation::Checkpoint => 0,
+        CoordinatorOperation::Snapshot(destination) => destination.to_string_lossy().len(),
     }
 }
 

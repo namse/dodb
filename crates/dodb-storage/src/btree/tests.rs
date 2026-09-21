@@ -2,6 +2,10 @@ use dodb_core::{
     DocumentKey, Error, PrimaryKey, Revision, RevisionState, TransactionCondition,
     TransactionMutation, TransactionRequest,
 };
+use std::fs;
+use std::path::PathBuf;
+
+use crate::{SnapshotManifest, restore_snapshot, validate_snapshot};
 
 use super::*;
 
@@ -335,6 +339,48 @@ async fn async_shard_keeps_logical_transaction_lsns_distinct() {
     shard.close().await.unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_checkpoint_is_fifo_and_reads_remain_available() {
+    let store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let shard = AsyncShard::start(store, 8);
+    let document_key = key(b"async-checkpoint", b"key");
+    let before = shard
+        .execute(BatchRequest::Put {
+            key: document_key.clone(),
+            value: b"before".to_vec(),
+        })
+        .await
+        .unwrap();
+    let BatchResponse::Put(before_revision) = before else {
+        panic!("expected PUT response");
+    };
+    let checkpoint = shard.checkpoint().await.unwrap();
+    assert_eq!(
+        checkpoint.checkpoint_lsn,
+        dodb_core::Lsn::new(before_revision.get())
+    );
+    let after = shard
+        .execute(BatchRequest::Put {
+            key: document_key.clone(),
+            value: b"after".to_vec(),
+        })
+        .await
+        .unwrap();
+    let BatchResponse::Put(after_revision) = after else {
+        panic!("expected PUT response");
+    };
+    assert!(after_revision > before_revision);
+    assert_eq!(
+        shard
+            .execute(BatchRequest::Get { key: document_key })
+            .await
+            .unwrap(),
+        BatchResponse::Get(RevisionState::present(b"after", after_revision))
+    );
+    shard.close().await.unwrap();
+}
+
 #[test]
 fn wal_backed_store_reopens_from_committed_page_images() {
     let mut store =
@@ -348,6 +394,171 @@ fn wal_backed_store_reopens_from_committed_page_images() {
         reopened.get(&document_key).unwrap(),
         RevisionState::present(b"wal", revision)
     );
+}
+
+#[test]
+fn checkpoint_flushes_state_resets_wal_and_preserves_lsn_monotonicity() {
+    let mut store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let document_key = key(b"checkpoint", b"key");
+    let first_revision = store.put(document_key.clone(), b"before").unwrap();
+    let before = store.wal_metrics().unwrap().unwrap().wal_bytes;
+    let report = store.checkpoint().unwrap();
+
+    assert_eq!(
+        report.checkpoint_lsn,
+        dodb_core::Lsn::new(first_revision.get())
+    );
+    assert!(report.pages_flushed > 0);
+    assert!(report.wal_bytes_reclaimed > 0);
+    assert!(store.wal_metrics().unwrap().unwrap().wal_bytes < before);
+    assert_eq!(
+        store.current_superblock().checkpoint_lsn,
+        report.checkpoint_lsn
+    );
+
+    let second_revision = store.put(document_key.clone(), b"after").unwrap();
+    assert!(second_revision > first_revision);
+    let (data, wal) = store.into_files().unwrap();
+    let mut reopened = BTreeStore::open_with_wal(data, wal, config(0)).unwrap();
+    assert_eq!(
+        reopened.current_superblock().checkpoint_lsn,
+        report.checkpoint_lsn
+    );
+    assert_eq!(
+        reopened.get(&document_key).unwrap(),
+        RevisionState::present(b"after", second_revision)
+    );
+    let repeated = reopened.checkpoint().unwrap();
+    assert_eq!(
+        repeated.checkpoint_lsn,
+        dodb_core::Lsn::new(second_revision.get())
+    );
+}
+
+#[test]
+fn snapshot_restores_checkpoint_and_composes_with_post_checkpoint_wal() {
+    let root = unique_test_path("dodb-snapshot");
+    let snapshot_path = root.join("snapshot");
+    let restored_path = root.join("restored.db");
+    fs::create_dir_all(&root).unwrap();
+    let result = {
+        let mut store =
+            BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0))
+                .unwrap();
+        let first_key = key(b"snapshot", b"first");
+        let second_key = key(b"snapshot", b"second");
+        store.put(first_key.clone(), b"at-checkpoint").unwrap();
+        let snapshot_report = store.create_snapshot(&snapshot_path).unwrap();
+        store.put(second_key.clone(), b"after-checkpoint").unwrap();
+        let (_live_data, post_checkpoint_wal) = store.into_files().unwrap();
+
+        let snapshot_manifest = validate_snapshot(&snapshot_path).unwrap();
+        assert_eq!(snapshot_manifest, snapshot_report.manifest);
+        restore_snapshot(&snapshot_path, &restored_path).unwrap();
+        let snapshot_database = fs::read(&restored_path).unwrap();
+        let mut restored = BTreeStore::open_with_wal(
+            MemoryFile {
+                bytes: snapshot_database,
+            },
+            post_checkpoint_wal,
+            config(0),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.get(&first_key).unwrap().value(),
+            Some(&b"at-checkpoint"[..])
+        );
+        assert_eq!(
+            restored.get(&second_key).unwrap().value(),
+            Some(&b"after-checkpoint"[..])
+        );
+        restored.check_invariants().unwrap();
+        Ok::<(), Error>(())
+    };
+    let _ = fs::remove_dir_all(&root);
+    result.unwrap();
+}
+
+#[test]
+fn corrupted_snapshot_artifacts_are_rejected() {
+    let root = unique_test_path("dodb-snapshot-corruption");
+    let snapshot_path = root.join("snapshot");
+    let restore_path = root.join("restore.db");
+    fs::create_dir_all(&root).unwrap();
+    let result = {
+        let mut store =
+            BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0))
+                .unwrap();
+        store.put(key(b"snapshot", b"corrupt"), b"value").unwrap();
+        store.create_snapshot(&snapshot_path).unwrap();
+
+        let manifest_path = snapshot_path.join(crate::SNAPSHOT_MANIFEST_NAME);
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        let unsupported_manifest = manifest_with_version(&original_manifest, 99);
+        fs::write(&manifest_path, unsupported_manifest).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::UnsupportedFormat(_))
+        ));
+
+        let mut wrong_identity = SnapshotManifest::decode(&original_manifest).unwrap();
+        wrong_identity.tenant_id += 1;
+        fs::write(&manifest_path, wrong_identity.encode().unwrap()).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::SnapshotInvalid(_))
+        ));
+
+        fs::write(&manifest_path, original_manifest.clone()).unwrap();
+        let mut malformed_manifest = original_manifest.clone();
+        malformed_manifest[0] ^= 1;
+        fs::write(&manifest_path, malformed_manifest).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::SnapshotInvalid(_))
+        ));
+        assert!(restore_snapshot(&snapshot_path, &restore_path).is_err());
+
+        fs::write(&manifest_path, original_manifest).unwrap();
+        let database_path = snapshot_path.join(crate::SNAPSHOT_DATABASE_NAME);
+        let original_database = fs::read(&database_path).unwrap();
+        let mut database = original_database.clone();
+        database[0] ^= 1;
+        fs::write(&database_path, database).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::SnapshotInvalid(_))
+        ));
+
+        fs::write(&database_path, original_database.clone()).unwrap();
+        let mut database = original_database;
+        database[2 * PAGE_SIZE + 100] ^= 1;
+        fs::write(&database_path, database).unwrap();
+        assert!(matches!(
+            validate_snapshot(&snapshot_path),
+            Err(Error::SnapshotInvalid(_))
+        ));
+        Ok::<(), Error>(())
+    };
+    let _ = fs::remove_dir_all(&root);
+    result.unwrap();
+}
+
+fn manifest_with_version(bytes: &[u8], version: u16) -> Vec<u8> {
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let body = text.split_once("manifest_checksum=").unwrap().0;
+    let body = body.replace("version=1\n", &format!("version={version}\n"));
+    let checksum = crc32c::crc32c(body.as_bytes());
+    format!("{body}manifest_checksum={checksum:08x}\n").into_bytes()
+}
+
+fn unique_test_path(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ))
 }
 
 fn put_transaction(key: DocumentKey, value: &[u8]) -> TransactionRequest {

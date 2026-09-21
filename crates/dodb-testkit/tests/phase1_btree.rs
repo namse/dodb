@@ -2,9 +2,14 @@ use dodb_core::{
     DocumentKey, PrimaryKey, Revision, RevisionState, SortKey, TransactionCondition,
     TransactionMutation, TransactionRequest,
 };
-use dodb_storage::{BTreeStore, DatabaseConfig, DurableFile};
+use dodb_storage::{
+    BTreeStore, DatabaseConfig, DurableFile, restore_snapshot, restore_snapshot_with_injector,
+};
+use std::fs;
 
-use dodb_testkit::{CrashableFile, FaultAction, FaultPlan, FileOperation, ReferenceDb};
+use dodb_testkit::{
+    CrashInjector, CrashableFile, FaultAction, FaultPlan, FileOperation, ReferenceDb,
+};
 
 fn key_from_rng(mut value: u64) -> DocumentKey {
     let pk_len = (value as usize) % 9;
@@ -168,6 +173,183 @@ fn deterministic_differential_sequences_match_reference() {
         }
         assert_same_scan(&mut store, &reference);
     }
+}
+
+#[test]
+fn checkpoint_fault_matrix_preserves_the_last_successful_commit() {
+    let checkpoint_points = [
+        "before_checkpoint_gate",
+        "before_checkpoint_data_flush",
+        "before_data_page_write",
+        "during_data_page_write",
+        "after_data_page_write",
+        "before_data_file_sync",
+        "during_data_file_sync",
+        "after_data_file_sync",
+        "before_checkpoint_superblock_write",
+        "after_checkpoint_superblock_write",
+        "before_checkpoint_metadata_sync",
+        "during_checkpoint_metadata_sync",
+        "after_checkpoint_metadata_sync",
+        "before_wal_reset",
+        "during_wal_truncate",
+        "after_wal_truncate",
+        "before_wal_reset_truncate_sync",
+        "during_wal_reset_truncate_sync",
+        "after_wal_reset_truncate_sync",
+        "before_wal_reinitialization",
+        "during_wal_reinitialization",
+        "after_wal_reset_write",
+        "before_wal_reset_sync",
+        "during_wal_reset_sync",
+        "after_wal_reset_sync",
+        "before_checkpoint_complete",
+    ];
+    let document_key = DocumentKey::new(b"checkpoint-crash", b"key");
+    for checkpoint_point in checkpoint_points {
+        let mut base = BTreeStore::open_with_wal(
+            CrashableFile::new(),
+            CrashableFile::new(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        let successful_revision = base.put(document_key.clone(), b"durable").unwrap();
+        base.set_fault_injector(CrashInjector::at(checkpoint_point, 1));
+        let mut trial = base;
+        assert!(
+            trial.checkpoint().is_err(),
+            "fault did not fire at {checkpoint_point}"
+        );
+        let (mut data, mut wal) = trial.into_files().unwrap();
+        data.crash();
+        wal.crash();
+        let mut reopened = BTreeStore::open_with_wal(data, wal, DatabaseConfig::default()).unwrap();
+        assert_eq!(
+            reopened.get(&document_key).unwrap(),
+            RevisionState::present(b"durable", successful_revision)
+        );
+        reopened.check_invariants().unwrap();
+    }
+}
+
+#[test]
+fn failed_snapshot_is_cleaned_up_without_affecting_live_reads() {
+    let root = std::env::temp_dir().join(format!("dodb-snapshot-failure-{}", std::process::id()));
+    let snapshot_path = root.join("snapshot");
+    fs::create_dir_all(&root).unwrap();
+    let result = {
+        let mut store = BTreeStore::open_with_wal(
+            CrashableFile::new(),
+            CrashableFile::new(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        let document_key = DocumentKey::new(b"snapshot", b"failure");
+        store.put(document_key.clone(), b"live").unwrap();
+        store.set_fault_injector(CrashInjector::at("during_snapshot_copy", 1));
+        assert!(store.create_snapshot(&snapshot_path).is_err());
+        assert!(!snapshot_path.exists());
+        assert_eq!(
+            store.get(&document_key).unwrap().value(),
+            Some(&b"live"[..])
+        );
+        store.set_fault_injector(CrashInjector::disabled());
+        store.create_snapshot(&snapshot_path).unwrap();
+        assert!(dodb_storage::validate_snapshot(&snapshot_path).is_ok());
+        let restored_path = root.join("restored.db");
+        let mut restore_injector = CrashInjector::at("during_restore_copy", 1);
+        assert!(
+            restore_snapshot_with_injector(
+                &snapshot_path,
+                &restored_path,
+                Some(&mut restore_injector),
+            )
+            .is_err()
+        );
+        assert!(!restored_path.exists());
+        restore_snapshot(&snapshot_path, &restored_path).unwrap();
+        Ok::<(), dodb_core::Error>(())
+    };
+    let _ = fs::remove_dir_all(&root);
+    result.unwrap();
+}
+
+#[test]
+fn randomized_checkpoint_snapshot_restore_matches_reference_state() {
+    let root = std::env::temp_dir().join(format!(
+        "dodb-checkpoint-differential-{}",
+        std::process::id()
+    ));
+    let snapshot_path = root.join("snapshot");
+    let restored_path = root.join("restored.db");
+    fs::create_dir_all(&root).unwrap();
+    let result = {
+        let mut store = BTreeStore::open_with_wal(
+            CrashableFile::new(),
+            CrashableFile::new(),
+            DatabaseConfig::default().with_cache_capacity(0),
+        )
+        .unwrap();
+        let mut reference = ReferenceDb::new();
+        let mut snapshot_reference = None;
+        let mut random_state = 0x5eed_cafe_u64;
+        for operation_index in 0..160u32 {
+            random_state = random_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let document_key = key_from_rng(random_state);
+            if random_state & 1 == 0 {
+                let value = value_from_rng(random_state.rotate_left(11));
+                let revision = store.put(document_key.clone(), value.clone()).unwrap();
+                reference
+                    .transact_at(
+                        TransactionRequest::new(
+                            Vec::new(),
+                            vec![TransactionMutation::Put {
+                                key: document_key,
+                                value,
+                            }],
+                        ),
+                        dodb_core::Lsn::new(revision.get()),
+                    )
+                    .unwrap();
+            } else {
+                let revision = store.delete(document_key.clone()).unwrap();
+                reference
+                    .transact_at(
+                        TransactionRequest::new(
+                            Vec::new(),
+                            vec![TransactionMutation::Delete { key: document_key }],
+                        ),
+                        dodb_core::Lsn::new(revision.get()),
+                    )
+                    .unwrap();
+            }
+            if operation_index.is_multiple_of(19) {
+                store.checkpoint().unwrap();
+            }
+            if operation_index == 47 {
+                store.create_snapshot(&snapshot_path).unwrap();
+                snapshot_reference = Some(reference.clone());
+            }
+            if operation_index == 103 {
+                restore_snapshot(&snapshot_path, &restored_path).unwrap();
+                let database = fs::read(&restored_path).unwrap();
+                store = BTreeStore::open_with_wal(
+                    CrashableFile::from_durable(database),
+                    CrashableFile::new(),
+                    DatabaseConfig::default().with_cache_capacity(0),
+                )
+                .unwrap();
+                reference = snapshot_reference.clone().unwrap();
+            }
+            assert_same_scan(&mut store, &reference);
+            store.check_invariants().unwrap();
+        }
+        Ok::<(), dodb_core::Error>(())
+    };
+    let _ = fs::remove_dir_all(&root);
+    result.unwrap();
 }
 
 #[test]

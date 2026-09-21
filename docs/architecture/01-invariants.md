@@ -5,6 +5,10 @@
 After a future transaction returns `COMMIT SUCCESS`, restart must expose all
 of its committed effects.
 
+After a checkpoint at LSN `N` completes, the database file is authoritative for
+committed state through `N`; recovery needs only complete committed WAL units
+with commit LSN greater than `N`.
+
 ## Atomicity and visibility
 
 - A multi-key transaction is applied wholly or not at all; partial commit is
@@ -40,10 +44,13 @@ insert -> delete ABA.
   best-effort decoder.
 - Page checksum validation covers the whole 4096-byte page with the checksum
   field zeroed during calculation.
+- `checkpoint_lsn` never decreases and advances only after the database file
+  and checkpoint superblock metadata have both been synced.
+- A reset WAL retains database identity and starts record LSNs strictly after
+  the durable checkpoint LSN.
 
 ## Transaction validation
 
 Optimistic validation checks the full point read set, including reads that
 observed `Missing(revision)`, as well as all write keys. Range reads are not a
 v1 transactional primitive.
-
