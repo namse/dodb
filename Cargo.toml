@@ -14,4 +14,4 @@ version = "0.1.0"
 [workspace.dependencies]
 crc32c = "0.6"
 proptest = "1.6"
-
+tokio = { version = "1.48", features = ["macros", "rt", "sync", "time"] }

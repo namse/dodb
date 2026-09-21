@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 crc32c.workspace = true
 dodb-core = { path = "../dodb-core" }
+tokio.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-
