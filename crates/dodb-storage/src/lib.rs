@@ -2,14 +2,18 @@
 
 pub mod btree;
 pub mod durable_file;
+pub mod fault;
 pub mod page;
 pub mod superblock;
+pub mod wal;
 
 pub use btree::{
     AsyncShard, BTreeStore, BatchRequest, BatchResponse, DatabaseConfig, Document, EngineRequest,
-    EngineResponse, InvariantReport, MAX_ENCODED_KEY_SIZE, Mutation, PreparedBatch, StorageLimits,
+    EngineResponse, InvariantReport, MAX_ENCODED_KEY_SIZE, Mutation, NoWal, PreparedBatch,
+    StorageLimits,
 };
 pub use durable_file::{DurableFile, ProductionFile};
+pub use fault::FaultInjector;
 pub use page::{
     DecodedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageType, decode_page, decode_page_at,
     encode_page,
@@ -17,4 +21,8 @@ pub use page::{
 pub use superblock::{
     SUPERBLOCK_FORMAT_VERSION, SelectedSuperblock, Superblock, SuperblockSlot, choose_superblock,
     decode_superblock, encode_superblock,
+};
+pub use wal::{
+    CommittedWalBatch, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAGIC, WalAppendReport,
+    WalIdentity, WalLog, WalMetrics, WalPageImage, WalRecordType, WalScanReport,
 };

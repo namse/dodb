@@ -8,6 +8,8 @@ pub enum Error {
     Corruption(String),
     Io(std::io::Error),
     UnsupportedFormat(String),
+    DurabilityFailure(String),
+    RecoveryFailure(String),
     InternalInvariantViolation(String),
 }
 
@@ -26,6 +28,14 @@ impl Error {
         Self::UnsupportedFormat(message.into())
     }
 
+    pub fn durability(message: impl Into<String>) -> Self {
+        Self::DurabilityFailure(message.into())
+    }
+
+    pub fn recovery(message: impl Into<String>) -> Self {
+        Self::RecoveryFailure(message.into())
+    }
+
     pub fn invariant(message: impl Into<String>) -> Self {
         Self::InternalInvariantViolation(message.into())
     }
@@ -39,6 +49,8 @@ impl fmt::Display for Error {
             Self::Corruption(message) => write!(formatter, "corruption: {message}"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::UnsupportedFormat(message) => write!(formatter, "unsupported format: {message}"),
+            Self::DurabilityFailure(message) => write!(formatter, "durability failure: {message}"),
+            Self::RecoveryFailure(message) => write!(formatter, "recovery failure: {message}"),
             Self::InternalInvariantViolation(message) => {
                 write!(formatter, "internal invariant violation: {message}")
             }

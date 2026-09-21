@@ -2,9 +2,10 @@
 
 Status: accepted
 
-The future durability layer will use redo-only WAL containing full-page
-after-images, with NO-STEAL and NO-FORCE. ARIES is not the target design.
+The durability layer uses redo-only WAL containing full-page after-images, with
+NO-STEAL and NO-FORCE. ARIES is not the target design. Phase 2 implements this
+decision with explicit framing, checksums, commit records, and startup redo.
 
-Phase 0 only defines page LSN/checksum fields and a durable-file seam. It does
-not write WAL records or implement recovery.
-
+The WAL carries the complete encoded page image and an explicit commit marker;
+the WAL sync is the durability point. The Phase 0 page LSN/checksum fields and
+durable-file seam remain the lower-level contracts used by the implementation.

@@ -21,12 +21,13 @@ fn random_index(state: &mut u64) -> usize {
     (*state as usize) % ROWS
 }
 
-fn fresh_store(cache_capacity: usize, name: &str) -> BTreeStore<ProductionFile> {
+fn fresh_store(cache_capacity: usize, name: &str) -> BTreeStore<ProductionFile, ProductionFile> {
     let path = std::env::temp_dir().join(format!(
         "dodb-phase1-bench-{}-{name}.db",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("wal"));
     BTreeStore::<ProductionFile>::open_path(
         &path,
         DatabaseConfig::default().with_cache_capacity(cache_capacity),
@@ -43,8 +44,21 @@ fn report(name: &str, elapsed: Duration, operations: usize) {
     );
 }
 
+fn report_wal(store: &BTreeStore<ProductionFile, ProductionFile>, operations: usize) {
+    if let Some(metrics) = store.wal_metrics().expect("WAL metrics should be readable") {
+        println!(
+            "  WAL: {} bytes, {} syncs, {:.2} operations/sync, {:.1} us append, {:.1} us sync",
+            metrics.wal_bytes,
+            metrics.wal_syncs,
+            operations as f64 / metrics.wal_syncs.max(1) as f64,
+            metrics.append_nanos as f64 / 1_000.0 / metrics.committed_batches.max(1) as f64,
+            metrics.sync_nanos as f64 / 1_000.0 / metrics.committed_batches.max(1) as f64,
+        );
+    }
+}
+
 fn main() {
-    println!("dodb Phase 1 baseline; rows={ROWS}; direct synchronized publisher");
+    println!("dodb Phase 2 WAL benchmark; rows={ROWS}; WAL-first publisher");
     for cache_capacity in [0, 16, 256] {
         println!("\ncache_capacity={cache_capacity}");
 
@@ -55,7 +69,8 @@ fn main() {
                 .put(key(index), (index as u64).to_le_bytes())
                 .expect("sequential put should succeed");
         }
-        report("sequential PUT", start.elapsed(), ROWS);
+        report("small-value PUT", start.elapsed(), ROWS);
+        report_wal(&store, ROWS);
 
         let mut store = fresh_store(cache_capacity, "random-put");
         let mut state = 0x5eed_cafe_u64;
@@ -67,6 +82,20 @@ fn main() {
                 .expect("random put should succeed");
         }
         report("random PUT", start.elapsed(), ROWS);
+        report_wal(&store, ROWS);
+
+        if cache_capacity == 256 {
+            let mut store = fresh_store(cache_capacity, "overflow-put");
+            let overflow_value = vec![0x5a; 9_000];
+            let start = Instant::now();
+            for index in 0..ROWS {
+                store
+                    .put(key(index), overflow_value.clone())
+                    .expect("overflow put should succeed");
+            }
+            report("overflow-value PUT", start.elapsed(), ROWS);
+            report_wal(&store, ROWS);
+        }
 
         let mut store = fresh_store(cache_capacity, "reads");
         for index in 0..ROWS {
@@ -116,7 +145,7 @@ fn main() {
         report("mixed read/write", start.elapsed(), ROWS);
     }
 
-    println!("\nasync coordinator baseline; default batch limit=64; 1 ms collection window");
+    println!("\nasync WAL coordinator; default batch limit=64; 1 ms collection window");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -153,6 +182,19 @@ fn main() {
                 start.elapsed(),
                 clients * ASYNC_OPERATIONS_PER_CLIENT,
             );
+            if let Some(metrics) = shard.wal_metrics() {
+                println!(
+                    "  WAL: {} bytes, {} syncs, {:.2} operations/sync, {:.1} us append, {:.1} us sync",
+                    metrics.wal_bytes,
+                    metrics.wal_syncs,
+                    (clients * ASYNC_OPERATIONS_PER_CLIENT) as f64
+                        / metrics.wal_syncs.max(1) as f64,
+                    metrics.append_nanos as f64 / 1_000.0
+                        / metrics.committed_batches.max(1) as f64,
+                    metrics.sync_nanos as f64 / 1_000.0
+                        / metrics.committed_batches.max(1) as f64,
+                );
+            }
         }
     });
 }

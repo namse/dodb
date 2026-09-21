@@ -84,14 +84,16 @@ All slotted offsets, lengths, page IDs, record states, ordering, and overflow
 chains are checked on decode. A malformed page returns `Corruption` or an
 explicit unsupported-format error and is never treated as an empty page.
 
-## Phase 1 persistence boundary
+## Phase 2 persistence boundary
 
 An operation batch reads committed/cache pages into a private overlay. Updated
 pages, allocator metadata, and the next superblock generation are prepared in
-memory. Publication writes full page images, writes the alternate superblock,
-and calls the existing `DurableFile::sync_data` seam. This is a clean-reopen
-path only; it is not a crash-safe commit protocol. Phase 2 will replace this
-publisher with WAL-first full-page after-image publication.
+memory. In the WAL-backed path, full page images and the alternate superblock
+image are appended to the separate redo-only WAL, followed by a `COMMIT` frame
+and WAL `sync_data`. That sync is the durability point. Only after it succeeds
+are the images published to the committed cache and dirty-page set. Data-file
+flushing is later and is not a commit boundary. The WAL is retained from
+database creation because Phase 2 has no formal checkpoint protocol.
 
 The legacy `NamseEnt/namseent` `luda-editor/new-server/bptree` implementation
 is an architectural reference for page-oriented mutation, but dodb defines a

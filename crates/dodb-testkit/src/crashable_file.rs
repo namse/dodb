@@ -42,6 +42,8 @@ impl FaultAction {
 #[derive(Clone, Debug, Default)]
 pub struct FaultPlan {
     faults: BTreeMap<u64, (FileOperation, FaultAction)>,
+    next_matching: BTreeMap<FileOperation, (u64, FaultAction)>,
+    matching_hits: BTreeMap<FileOperation, u64>,
     next_operation: u64,
 }
 
@@ -60,6 +62,19 @@ impl FaultPlan {
         self.faults.insert(operation_index, (operation, action));
     }
 
+    /// Schedules one fault on the next invocation of a matching file
+    /// operation, regardless of preceding reads or metadata calls.
+    pub fn on_next(self, operation: FileOperation, action: FaultAction) -> Self {
+        self.on_nth(operation, 1, action)
+    }
+
+    /// Schedules one fault on the Nth invocation of a matching file
+    /// operation, independent of other operation kinds.
+    pub fn on_nth(mut self, operation: FileOperation, nth: u64, action: FaultAction) -> Self {
+        self.next_matching.insert(operation, (nth.max(1), action));
+        self
+    }
+
     pub fn operation_count(&self) -> u64 {
         self.next_operation
     }
@@ -73,7 +88,21 @@ impl FaultPlan {
                 self.faults.insert(index, (expected_operation, action));
                 None
             }
-            None => None,
+            None => {
+                let hits = self.matching_hits.entry(operation).or_insert(0);
+                *hits = hits.saturating_add(1);
+                if self
+                    .next_matching
+                    .get(&operation)
+                    .is_some_and(|(nth, _)| *nth == *hits)
+                {
+                    self.next_matching
+                        .remove(&operation)
+                        .map(|(_, action)| action)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -114,6 +143,20 @@ impl CrashableFile {
 
     pub fn durable_bytes(&self) -> &[u8] {
         &self.durable
+    }
+
+    /// Flips one durable byte and mirrors the corruption into the volatile
+    /// view, modeling a damaged on-disk byte before the next open.
+    pub fn corrupt_durable_byte(&mut self, offset: usize) -> Result<()> {
+        let byte = self
+            .durable
+            .get_mut(offset)
+            .ok_or_else(|| Error::invalid_input("corruption offset is outside the durable file"))?;
+        *byte ^= 1;
+        if let Some(volatile_byte) = self.volatile.get_mut(offset) {
+            *volatile_byte = *byte;
+        }
+        Ok(())
     }
 
     /// Simulates process loss: unsynced volatile state is discarded.
@@ -254,5 +297,31 @@ mod tests {
         let mut file = CrashableFile::new().with_fault_plan(plan);
         assert_eq!(file.write_at(0, b"abcd").unwrap(), 2);
         assert!(matches!(file.sync_data(), Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn legacy_shadow_reset_window_loses_state_when_main_file_is_stale() {
+        let mut main = CrashableFile::new();
+        let mut shadow = CrashableFile::new();
+        let mut wal = CrashableFile::new();
+
+        main.write_at(0, b"old").unwrap();
+        main.sync_data().unwrap();
+        wal.write_at(0, b"committed-page-image").unwrap();
+        wal.sync_data().unwrap();
+        shadow.write_at(0, b"new").unwrap();
+        shadow.sync_data().unwrap();
+
+        // This is the legacy reset point: the shadow is durable, but the main
+        // file has not been copied and synced yet.
+        wal.set_len(0).unwrap();
+        wal.sync_data().unwrap();
+        main.crash();
+        shadow.crash();
+        wal.crash();
+
+        assert_eq!(main.durable_bytes(), b"old");
+        assert!(wal.durable_bytes().is_empty());
+        assert_eq!(shadow.durable_bytes(), b"new");
     }
 }

@@ -257,3 +257,18 @@ async fn async_shard_serializes_concurrent_requests_in_queue_order() {
     );
     shard.close().await.unwrap();
 }
+
+#[test]
+fn wal_backed_store_reopens_from_committed_page_images() {
+    let mut store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let document_key = key(vec![9], vec![9]);
+    let revision = store.put(document_key.clone(), b"wal".to_vec()).unwrap();
+    assert!(revision.get() > 1);
+    let (data, wal) = store.into_files().unwrap();
+    let mut reopened = BTreeStore::open_with_wal(data, wal, config(0)).unwrap();
+    assert_eq!(
+        reopened.get(&document_key).unwrap(),
+        RevisionState::present(b"wal", revision)
+    );
+}

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use dodb_core::{Error, Result as CoreResult};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CrashInjected {
     pub point: String,
@@ -71,6 +73,12 @@ impl CrashInjector {
 
     pub fn hit_count(&self, point: &str) -> u64 {
         self.hits.get(point).copied().unwrap_or(0)
+    }
+}
+
+impl dodb_storage::FaultInjector for CrashInjector {
+    fn hit(&mut self, point: &str) -> CoreResult<()> {
+        CrashInjector::hit(self, point).map_err(|crash| Error::recovery(crash.to_string()))
     }
 }
 

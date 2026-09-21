@@ -1,9 +1,8 @@
 //! Phase 1 single-file mutable B+Tree.
 //!
-//! The engine owns one [`DurableFile`], uses the Phase 0 double superblock,
-//! and publishes a prepared operation batch as full page images.  The direct
-//! publisher is intentionally not a WAL: Phase 1 has clean-reopen support but
-//! makes no crash-safety or commit-durability claim.
+//! The engine owns one data [`DurableFile`] and optionally a separate redo-only
+//! WAL. The single-file constructor remains available for Phase 1 format tests;
+//! production path opening uses the WAL-backed constructor.
 
 mod cache;
 mod checker;
@@ -26,6 +25,8 @@ use self::format::{
     leaf_fits,
 };
 use crate::PAGE_SIZE;
+use crate::fault::FaultInjector;
+use crate::wal::{CommittedWalBatch, WalIdentity, WalLog, WalMetrics, WalPageImage};
 use crate::{
     DurableFile, ProductionFile, Superblock, SuperblockSlot, choose_superblock, decode_page_at,
     decode_superblock, encode_superblock,
@@ -36,6 +37,37 @@ const FIRST_DATA_PAGE: u64 = 2;
 pub const MAX_ENCODED_KEY_SIZE: usize = 3992;
 const SUPERBLOCK_A_OFFSET: u64 = 0;
 const SUPERBLOCK_B_OFFSET: u64 = PAGE_SIZE as u64;
+
+/// Marker file type used by the compatibility constructor that has no
+/// separate WAL file.
+#[derive(Debug, Default)]
+pub struct NoWal;
+
+impl DurableFile for NoWal {
+    fn read_at(&mut self, _offset: u64, _buffer: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&mut self, _offset: u64, _bytes: &[u8]) -> Result<usize> {
+        Err(Error::invariant("NoWal cannot receive WAL writes"))
+    }
+
+    fn len(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    fn set_len(&mut self, _length: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_data(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_all(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// The supported value and page-layout limits for Phase 1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +183,8 @@ pub struct PreparedBatch {
     root_page_id: PageId,
     free_list_head: Option<PageId>,
     high_water_page_id: PageId,
+    commit_lsn: Option<Lsn>,
+    batch_id: u64,
 }
 
 impl PreparedBatch {
@@ -188,27 +222,34 @@ pub struct InvariantReport {
 }
 
 /// A mutable, single-file B+Tree over canonical encoded document keys.
-pub struct BTreeStore<F: DurableFile> {
+pub struct BTreeStore<F: DurableFile, W: DurableFile = NoWal> {
     file: F,
+    wal: Option<WalLog<W>>,
     current_superblock: Superblock,
     active_slot: SuperblockSlot,
     root_page_id: PageId,
     free_list_head: Option<PageId>,
     high_water_page_id: PageId,
     next_revision: Revision,
+    next_lsn: Lsn,
+    next_batch_id: u64,
     cache: PageCache,
     config: DatabaseConfig,
+    dirty_pages: BTreeMap<PageId, [u8; PAGE_SIZE]>,
+    dirty_superblock: Option<[u8; PAGE_SIZE]>,
+    broken: Option<String>,
+    fault_injector: Option<Box<dyn FaultInjector + Send>>,
 }
 
-impl<F: DurableFile> BTreeStore<F> {
+impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
     /// Opens an existing database or initializes a truly empty file.
     ///
     /// A non-empty file is never recreated.  It must contain two complete
     /// superblock pages and a valid selected tree.
-    pub fn open(mut file: F, config: DatabaseConfig) -> Result<Self> {
+    fn open_no_wal(mut file: F, config: DatabaseConfig) -> Result<BTreeStore<F, NoWal>> {
         let length = file.len()?;
         if length == 0 {
-            return Self::initialize(file, config);
+            return BTreeStore::<F, NoWal>::initialize(file, config);
         }
         if length < (FIRST_DATA_PAGE * PAGE_SIZE as u64) || !length.is_multiple_of(PAGE_SIZE as u64)
         {
@@ -222,16 +263,23 @@ impl<F: DurableFile> BTreeStore<F> {
         let selected = choose_superblock(&slot_a, &slot_b)?;
         let (root_page_id, free_list_head, high_water_page_id) =
             metadata_from_superblock(&selected.superblock, length)?;
-        let mut store = Self {
+        let mut store = BTreeStore::<F, NoWal> {
             file,
+            wal: None,
             current_superblock: selected.superblock,
             active_slot: selected.slot,
             root_page_id,
             free_list_head,
             high_water_page_id,
             next_revision: Revision::new(1),
+            next_lsn: Lsn::new(1),
+            next_batch_id: 1,
             cache: PageCache::new(config.cache_capacity),
             config,
+            dirty_pages: BTreeMap::new(),
+            dirty_superblock: None,
+            broken: None,
+            fault_injector: None,
         };
         let report = store.check_invariants()?;
         store.next_revision = Revision::new(
@@ -247,8 +295,111 @@ impl<F: DurableFile> BTreeStore<F> {
     pub fn open_path(
         path: impl AsRef<Path>,
         config: DatabaseConfig,
-    ) -> Result<BTreeStore<ProductionFile>> {
-        BTreeStore::open(ProductionFile::open(path)?, config)
+    ) -> Result<BTreeStore<ProductionFile, ProductionFile>> {
+        let path = path.as_ref();
+        let wal_path = path.with_extension("wal");
+        BTreeStore::<ProductionFile, ProductionFile>::open_with_wal(
+            ProductionFile::open(path)?,
+            ProductionFile::open(wal_path)?,
+            config,
+        )
+    }
+
+    pub fn open_with_wal(file: F, wal_file: W, config: DatabaseConfig) -> Result<BTreeStore<F, W>> {
+        Self::open_with_wal_internal(file, wal_file, config, None)
+    }
+
+    pub fn open_with_wal_and_fault_injector<I>(
+        file: F,
+        wal_file: W,
+        config: DatabaseConfig,
+        injector: I,
+    ) -> Result<BTreeStore<F, W>>
+    where
+        I: FaultInjector + Send + 'static,
+    {
+        Self::open_with_wal_internal(file, wal_file, config, Some(Box::new(injector)))
+    }
+
+    fn open_with_wal_internal(
+        mut file: F,
+        wal_file: W,
+        config: DatabaseConfig,
+        mut fault_injector: Option<Box<dyn FaultInjector + Send>>,
+    ) -> Result<BTreeStore<F, W>> {
+        let identity = WalIdentity::new(
+            config.database_uuid,
+            config.tenant_id,
+            config.shard_id,
+            config.shard_epoch,
+        );
+        let wal = WalLog::open_with_fault_injector(
+            wal_file,
+            identity.clone(),
+            fault_injector.as_deref_mut(),
+        )?;
+        if file.is_empty()? && wal.committed_batches().is_empty() {
+            let mut store = BTreeStore::<F, W>::initialize(file, config)?;
+            store.wal = Some(wal);
+            store.next_lsn = store.wal.as_ref().unwrap().next_lsn();
+            store.next_batch_id = store.wal.as_ref().unwrap().next_batch_id();
+            store.fault_injector = fault_injector;
+            return Ok(store);
+        }
+
+        recover_data_file(
+            &mut file,
+            wal.committed_batches(),
+            fault_injector.as_deref_mut(),
+        )?;
+        let length = file.len()?;
+        if length < (FIRST_DATA_PAGE * PAGE_SIZE as u64) || !length.is_multiple_of(PAGE_SIZE as u64)
+        {
+            return Err(Error::recovery(
+                "recovered database file is not page aligned",
+            ));
+        }
+        let slot_a = read_exact_at(&mut file, SUPERBLOCK_A_OFFSET, PAGE_SIZE)?;
+        let slot_b = read_exact_at(&mut file, SUPERBLOCK_B_OFFSET, PAGE_SIZE)?;
+        let selected = choose_superblock(&slot_a, &slot_b)?;
+        validate_superblock_identity(&selected.superblock, &identity)?;
+        let (root_page_id, free_list_head, high_water_page_id) =
+            metadata_from_superblock(&selected.superblock, length)?;
+        let mut store = BTreeStore::<F, W> {
+            file,
+            wal: Some(wal),
+            current_superblock: selected.superblock,
+            active_slot: selected.slot,
+            root_page_id,
+            free_list_head,
+            high_water_page_id,
+            next_revision: Revision::new(1),
+            next_lsn: Lsn::ZERO,
+            next_batch_id: 1,
+            cache: PageCache::new(config.cache_capacity),
+            config,
+            dirty_pages: BTreeMap::new(),
+            dirty_superblock: None,
+            broken: None,
+            fault_injector,
+        };
+        let report = store.check_invariants()?;
+        let max_commit_lsn = store
+            .wal
+            .as_ref()
+            .and_then(|wal| wal.committed_batches().last().map(|batch| batch.commit_lsn))
+            .unwrap_or(Lsn::ZERO);
+        store.next_revision = Revision::new(
+            report
+                .max_revision
+                .get()
+                .max(max_commit_lsn.get())
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("storage revision exhausted"))?,
+        );
+        store.next_lsn = store.wal.as_ref().unwrap().next_lsn();
+        store.next_batch_id = store.wal.as_ref().unwrap().next_batch_id();
+        Ok(store)
     }
 
     pub fn current_superblock(&self) -> &Superblock {
@@ -257,6 +408,17 @@ impl<F: DurableFile> BTreeStore<F> {
 
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    pub fn wal_metrics(&self) -> Result<Option<WalMetrics>> {
+        self.wal.as_ref().map(WalLog::metrics).transpose()
+    }
+
+    pub fn set_fault_injector<I>(&mut self, injector: I)
+    where
+        I: FaultInjector + Send + 'static,
+    {
+        self.fault_injector = Some(Box::new(injector));
     }
 
     pub fn get(&mut self, key: &DocumentKey) -> Result<RevisionState> {
@@ -342,9 +504,15 @@ impl<F: DurableFile> BTreeStore<F> {
         overlay.finish(responses)
     }
 
-    /// Publishes a prepared batch directly to the data file and syncs it.
-    /// This is deliberately isolated so Phase 2 can put WAL persistence here.
+    /// Publishes a prepared batch. WAL-backed stores append and sync the full
+    /// after-image commit before changing the committed view. Data pages are
+    /// retained as dirty committed images until [`Self::flush`] is called.
     pub fn publish_prepared(&mut self, prepared: PreparedBatch) -> Result<Vec<BatchResponse>> {
+        if let Some(message) = &self.broken {
+            return Err(Error::durability(format!(
+                "storage shard is not serving after an uncertain persistence failure: {message}"
+            )));
+        }
         if prepared.base_generation != self.current_superblock.generation {
             return Err(Error::Conflict(
                 "prepared batch was based on an older superblock generation".to_owned(),
@@ -353,26 +521,67 @@ impl<F: DurableFile> BTreeStore<F> {
         if prepared.changed_pages.is_empty() {
             return Ok(prepared.responses);
         }
-        let target_length = prepared
-            .high_water_page_id
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_input("database page id is exhausted"))?
-            .checked_mul(PAGE_SIZE as u64)
-            .ok_or_else(|| Error::invalid_input("database file length overflows"))?;
-        if self.file.len()? < target_length {
-            self.file.set_len(target_length)?;
-        }
-        for (page_id, bytes) in &prepared.changed_pages {
-            write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, bytes)?;
-        }
         let superblock_bytes = encode_superblock(&prepared.new_superblock)?;
-        let superblock_offset = match prepared.new_slot {
-            SuperblockSlot::A => SUPERBLOCK_A_OFFSET,
-            SuperblockSlot::B => SUPERBLOCK_B_OFFSET,
+        let mut changed_pages = prepared.changed_pages;
+        let wal_commit = if let Some(wal) = self.wal.as_mut() {
+            let commit_lsn = prepared
+                .commit_lsn
+                .ok_or_else(|| Error::invariant("WAL batch has no commit LSN"))?;
+            let mut images = changed_pages
+                .iter()
+                .map(|(page_id, image)| WalPageImage {
+                    page_id: *page_id,
+                    image: *image,
+                })
+                .collect::<Vec<_>>();
+            images.push(WalPageImage {
+                page_id: match prepared.new_slot {
+                    SuperblockSlot::A => PageId::ZERO,
+                    SuperblockSlot::B => PageId::new(1),
+                },
+                image: superblock_bytes,
+            });
+            match wal.append_commit(
+                prepared.batch_id,
+                commit_lsn,
+                &images,
+                self.fault_injector.as_deref_mut(),
+            ) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    self.broken = Some(error.to_string());
+                    return Err(error);
+                }
+            }
+        } else {
+            let target_length = prepared
+                .high_water_page_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("database page id is exhausted"))?
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or_else(|| Error::invalid_input("database file length overflows"))?;
+            if self.file.len()? < target_length {
+                self.file.set_len(target_length)?;
+            }
+            for (page_id, bytes) in &changed_pages {
+                write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, bytes)?;
+            }
+            let superblock_offset = match prepared.new_slot {
+                SuperblockSlot::A => SUPERBLOCK_A_OFFSET,
+                SuperblockSlot::B => SUPERBLOCK_B_OFFSET,
+            };
+            write_all_at(&mut self.file, superblock_offset, &superblock_bytes)?;
+            self.file.sync_data()?;
+            None
         };
-        write_all_at(&mut self.file, superblock_offset, &superblock_bytes)?;
-        self.file.sync_data()?;
+
+        if let Some(injector) = self.fault_injector.as_deref_mut()
+            && let Err(error) = injector.hit("before_publish")
+        {
+            self.broken = Some(error.to_string());
+            return Err(error);
+        }
 
         self.current_superblock = crate::decode_superblock(&superblock_bytes)?;
         self.active_slot = prepared.new_slot;
@@ -380,16 +589,40 @@ impl<F: DurableFile> BTreeStore<F> {
         self.free_list_head = prepared.free_list_head;
         self.high_water_page_id = prepared.high_water_page_id;
         self.next_revision = prepared.next_revision;
+        if let Some(report) = wal_commit {
+            self.next_lsn = Lsn::new(
+                report
+                    .commit_lsn
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            );
+            self.next_batch_id = self
+                .next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL batch ID exhausted"))?;
+            self.dirty_pages.append(&mut changed_pages);
+            self.dirty_superblock = Some(superblock_bytes);
+        }
         self.cache.insert_many(prepared.read_pages);
         self.cache.insert_many(prepared.changed_decoded);
+        if let Some(injector) = self.fault_injector.as_deref_mut() {
+            injector.hit("after_publish")?;
+        }
         Ok(prepared.responses)
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.file.sync_data()
+        if self.wal.is_none() {
+            return self.file.sync_data();
+        }
+        self.flush_dirty_pages()
     }
 
     pub fn check_invariants(&mut self) -> Result<InvariantReport> {
+        if self.wal.is_some() {
+            self.flush_dirty_pages()?;
+        }
         let length = self.file.len()?;
         if length < (FIRST_DATA_PAGE * PAGE_SIZE as u64) || !length.is_multiple_of(PAGE_SIZE as u64)
         {
@@ -419,6 +652,82 @@ impl<F: DurableFile> BTreeStore<F> {
 
     pub fn into_file(self) -> F {
         self.file
+    }
+
+    pub fn into_files(self) -> Result<(F, W)> {
+        let wal = self
+            .wal
+            .ok_or_else(|| Error::invalid_input("store does not have a WAL file"))?;
+        Ok((self.file, wal.into_file()))
+    }
+
+    fn flush_dirty_pages(&mut self) -> Result<()> {
+        if self.wal.is_none() {
+            return self.file.sync_data();
+        }
+        if self.dirty_pages.is_empty() && self.dirty_superblock.is_none() {
+            return Ok(());
+        }
+        let flush_result = (|| {
+            let target_length = self
+                .high_water_page_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("database page id is exhausted"))?
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or_else(|| Error::invalid_input("database file length overflows"))?;
+            if self.file.len()? < target_length {
+                self.file.set_len(target_length)?;
+            }
+            if let Some(injector) = self.fault_injector.as_deref_mut() {
+                injector.hit("before_data_page_write")?;
+            }
+            for (page_id, bytes) in &self.dirty_pages {
+                if let Some(injector) = self.fault_injector.as_deref_mut() {
+                    injector.hit("during_data_page_write")?;
+                }
+                write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, bytes)?;
+            }
+            if let Some(injector) = self.fault_injector.as_deref_mut() {
+                injector.hit("after_data_page_write")?;
+            }
+            if let Some(superblock_bytes) = self.dirty_superblock {
+                let offset = match self.active_slot {
+                    SuperblockSlot::A => SUPERBLOCK_A_OFFSET,
+                    SuperblockSlot::B => SUPERBLOCK_B_OFFSET,
+                };
+                write_all_at(&mut self.file, offset, &superblock_bytes)?;
+            }
+            Ok::<(), Error>(())
+        })();
+        if let Err(error) = flush_result {
+            self.broken = Some(error.to_string());
+            return Err(Error::durability(format!(
+                "database data-file write failed after WAL commit: {error}"
+            )));
+        }
+        if let Some(injector) = self.fault_injector.as_deref_mut() {
+            if let Err(error) = injector.hit("before_data_file_sync") {
+                self.broken = Some(error.to_string());
+                return Err(error);
+            }
+            if let Err(error) = injector.hit("during_data_file_sync") {
+                self.broken = Some(error.to_string());
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.file.sync_data() {
+            self.broken = Some(error.to_string());
+            return Err(Error::durability(format!(
+                "database data-file sync failed after WAL commit: {error}"
+            )));
+        }
+        self.dirty_pages.clear();
+        self.dirty_superblock = None;
+        if let Some(injector) = self.fault_injector.as_deref_mut() {
+            injector.hit("after_data_file_sync")?;
+        }
+        Ok(())
     }
 
     fn initialize(mut file: F, config: DatabaseConfig) -> Result<Self> {
@@ -452,26 +761,46 @@ impl<F: DurableFile> BTreeStore<F> {
         file.sync_all()?;
         Ok(Self {
             file,
+            wal: None,
             current_superblock: superblock,
             active_slot: SuperblockSlot::A,
             root_page_id,
             free_list_head: None,
             high_water_page_id: root_page_id,
             next_revision: Revision::new(1),
+            next_lsn: Lsn::new(1),
+            next_batch_id: 1,
             cache: PageCache::new(config.cache_capacity),
             config,
+            dirty_pages: BTreeMap::new(),
+            dirty_superblock: None,
+            broken: None,
+            fault_injector: None,
         })
     }
 
     fn read_page_from_file(&mut self, page_id: PageId) -> Result<PageData> {
+        if let Some(bytes) = self.dirty_pages.get(&page_id) {
+            let decoded = decode_page_at(bytes, Some(page_id))?;
+            return PageData::decode(decoded);
+        }
         let bytes = read_exact_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, PAGE_SIZE)?;
         let decoded = decode_page_at(&bytes, Some(page_id))?;
         PageData::decode(decoded)
     }
 }
 
-struct Overlay<'a, F: DurableFile> {
-    store: &'a mut BTreeStore<F>,
+impl<F: DurableFile> BTreeStore<F, NoWal> {
+    /// Opens the legacy single-file form without a separate WAL. This remains
+    /// useful for format-level tests; crash-safe deployments use
+    /// [`BTreeStore::open_with_wal`] or [`BTreeStore::open_path`].
+    pub fn open(file: F, config: DatabaseConfig) -> Result<Self> {
+        Self::open_no_wal(file, config)
+    }
+}
+
+struct Overlay<'a, F: DurableFile, W: DurableFile> {
+    store: &'a mut BTreeStore<F, W>,
     pages: BTreeMap<PageId, PageData>,
     dirty: BTreeSet<PageId>,
     read_pages: BTreeMap<PageId, PageData>,
@@ -483,8 +812,8 @@ struct Overlay<'a, F: DurableFile> {
     last_lsn: Option<Lsn>,
 }
 
-impl<'a, F: DurableFile> Overlay<'a, F> {
-    fn new(store: &'a mut BTreeStore<F>) -> Self {
+impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
+    fn new(store: &'a mut BTreeStore<F, W>) -> Self {
         Self {
             root_page_id: store.root_page_id,
             free_list_head: store.free_list_head,
@@ -525,17 +854,45 @@ impl<'a, F: DurableFile> Overlay<'a, F> {
     fn finish(self, responses: Vec<BatchResponse>) -> Result<PreparedBatch> {
         let Overlay {
             store,
-            pages,
+            mut pages,
             dirty,
             read_pages,
             root_page_id,
             free_list_head,
             high_water_page_id,
-            next_revision,
+            next_revision: _,
             last_lsn,
             ..
         } = self;
-        let new_superblock = if let Some(lsn) = last_lsn {
+        let provisional_lsn = last_lsn;
+        let commit_lsn = if provisional_lsn.is_some() {
+            let image_count = dirty
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL image count overflow"))?;
+            if store.wal.is_some() {
+                Some(Lsn::new(
+                    store
+                        .next_lsn
+                        .get()
+                        .checked_add(image_count as u64)
+                        .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+                ))
+            } else {
+                provisional_lsn
+            }
+        } else {
+            None
+        };
+        if let (Some(provisional), Some(committed)) = (provisional_lsn, commit_lsn) {
+            for page_id in &dirty {
+                pages
+                    .get_mut(page_id)
+                    .ok_or_else(|| Error::invariant("dirty page missing from overlay"))?
+                    .restamp(Revision::from(provisional), committed);
+            }
+        }
+        let new_superblock = if commit_lsn.is_some() {
             let candidate = Superblock {
                 generation: store
                     .current_superblock
@@ -545,7 +902,7 @@ impl<'a, F: DurableFile> Overlay<'a, F> {
                 root_page_id: Some(root_page_id),
                 free_list_head,
                 high_water_page_id: Some(high_water_page_id),
-                checkpoint_lsn: lsn,
+                checkpoint_lsn: store.current_superblock.checkpoint_lsn,
                 ..store.current_superblock.clone()
             };
             decode_superblock(&encode_superblock(&candidate)?)?
@@ -565,6 +922,24 @@ impl<'a, F: DurableFile> Overlay<'a, F> {
             changed_pages.insert(page_id, page.encode(page_id)?);
             changed_decoded.insert(page_id, page.clone());
         }
+        let responses = if let (Some(provisional), Some(committed)) = (provisional_lsn, commit_lsn)
+        {
+            restamp_responses(
+                responses,
+                Revision::from(provisional),
+                Revision::from(committed),
+            )
+        } else {
+            responses
+        };
+        let next_revision = match commit_lsn {
+            Some(lsn) => Revision::new(
+                lsn.get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("storage revision exhausted"))?,
+            ),
+            None => store.next_revision,
+        };
         Ok(PreparedBatch {
             responses,
             changed_pages,
@@ -577,6 +952,8 @@ impl<'a, F: DurableFile> Overlay<'a, F> {
             root_page_id,
             free_list_head,
             high_water_page_id,
+            commit_lsn,
+            batch_id: store.next_batch_id,
         })
     }
 
@@ -1050,13 +1427,10 @@ impl<'a, F: DurableFile> Overlay<'a, F> {
     }
 
     fn allocate_revision(&mut self) -> Result<Revision> {
-        let revision = self.next_revision;
-        self.next_revision = Revision::new(
-            revision
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("storage revision exhausted"))?,
-        );
+        let revision = self
+            .last_lsn
+            .map(Revision::from)
+            .unwrap_or(self.next_revision);
         self.last_lsn = Some(Lsn::new(revision.get()));
         Ok(revision)
     }
@@ -1249,6 +1623,103 @@ fn split_candidates(length: usize) -> impl Iterator<Item = usize> {
     candidates.into_iter()
 }
 
+fn validate_superblock_identity(superblock: &Superblock, identity: &WalIdentity) -> Result<()> {
+    if superblock.database_uuid != identity.database_uuid
+        || superblock.tenant_id != identity.tenant_id
+        || superblock.shard_id != identity.shard_id
+        || superblock.shard_epoch != identity.shard_epoch
+    {
+        return Err(Error::corruption(
+            "database superblock identity does not match the requested shard",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_data_file<F: DurableFile>(
+    file: &mut F,
+    committed_batches: &[CommittedWalBatch],
+    mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+) -> Result<()> {
+    if committed_batches.is_empty() {
+        return Ok(());
+    }
+    let mut highest_data_page = FIRST_DATA_PAGE;
+    for batch in committed_batches {
+        for page in &batch.pages {
+            if page.page_id.get() >= FIRST_DATA_PAGE {
+                highest_data_page = highest_data_page.max(page.page_id.get());
+            }
+        }
+    }
+    let target_length = highest_data_page
+        .checked_add(1)
+        .ok_or_else(|| Error::recovery("recovery page range overflows"))?
+        .checked_mul(PAGE_SIZE as u64)
+        .ok_or_else(|| Error::recovery("recovery file length overflows"))?;
+    let current_length = file.len()?;
+    if current_length == 0 || current_length < target_length {
+        file.set_len(target_length)?;
+    } else if !current_length.is_multiple_of(PAGE_SIZE as u64) {
+        return Err(Error::recovery(
+            "database file has a non-page-aligned length before recovery",
+        ));
+    }
+
+    let mut changed = current_length < target_length;
+    let readable_length = file.len()?;
+    for batch in committed_batches {
+        for page in &batch.pages {
+            let offset = page
+                .page_id
+                .get()
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or_else(|| Error::recovery("recovery page offset overflows"))?;
+            let should_write = if page.page_id == PageId::ZERO || page.page_id == PageId::new(1) {
+                true
+            } else {
+                let current = if offset
+                    .checked_add(PAGE_SIZE as u64)
+                    .is_some_and(|end| end <= readable_length)
+                {
+                    let bytes = read_exact_at(file, offset, PAGE_SIZE)?;
+                    decode_page_at(&bytes, Some(page.page_id)).ok()
+                } else {
+                    None
+                };
+                match current {
+                    Some(current) => current.header.page_lsn < batch.commit_lsn,
+                    None => true,
+                }
+            };
+            if should_write {
+                hit_fault(&mut injector, "during_recovery_page_write")?;
+                write_all_at(file, offset, &page.image)?;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        hit_fault(&mut injector, "before_recovery_sync")?;
+        hit_fault(&mut injector, "during_recovery_sync")?;
+        file.sync_data().map_err(|error| {
+            Error::durability(format!("database sync during WAL recovery failed: {error}"))
+        })?;
+        hit_fault(&mut injector, "after_recovery_sync")?;
+    }
+    Ok(())
+}
+
+fn hit_fault(
+    injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
+    point: &str,
+) -> Result<()> {
+    if let Some(injector) = injector.as_deref_mut() {
+        injector.hit(point)?;
+    }
+    Ok(())
+}
+
 fn metadata_from_superblock(
     superblock: &Superblock,
     file_length: u64,
@@ -1325,6 +1796,42 @@ fn validate_encoded_key(key: &[u8]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn restamp_responses(
+    mut responses: Vec<BatchResponse>,
+    provisional: Revision,
+    committed: Revision,
+) -> Vec<BatchResponse> {
+    for response in &mut responses {
+        match response {
+            BatchResponse::Put(revision) | BatchResponse::Delete(revision) => {
+                if *revision == provisional {
+                    *revision = committed;
+                }
+            }
+            BatchResponse::Get(state) => restamp_state(state, provisional, committed),
+            BatchResponse::Query(rows) | BatchResponse::Scan(rows) => {
+                for row in rows {
+                    if row.revision == provisional {
+                        row.revision = committed;
+                    }
+                }
+            }
+        }
+    }
+    responses
+}
+
+fn restamp_state(state: &mut RevisionState, provisional: Revision, committed: Revision) {
+    match state {
+        RevisionState::Present { revision, .. } | RevisionState::Missing { revision }
+            if *revision == provisional =>
+        {
+            *revision = committed
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

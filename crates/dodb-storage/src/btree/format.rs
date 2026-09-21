@@ -83,6 +83,22 @@ impl PageData {
         }
     }
 
+    pub(crate) fn restamp(&mut self, provisional: Revision, committed: Lsn) {
+        match self {
+            Self::Leaf { lsn, entries, .. } => {
+                *lsn = committed;
+                for entry in entries {
+                    if entry.revision == provisional {
+                        entry.revision = Revision::from(committed);
+                    }
+                }
+            }
+            Self::Internal { lsn, .. } | Self::Overflow { lsn, .. } | Self::Free { lsn, .. } => {
+                *lsn = committed
+            }
+        }
+    }
+
     pub(crate) fn encode(&self, page_id: PageId) -> Result<[u8; PAGE_SIZE]> {
         let body = self.encode_body()?;
         crate::page::encode_page(

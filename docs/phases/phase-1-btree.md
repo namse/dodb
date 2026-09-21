@@ -7,10 +7,11 @@ canonical `(pk, sk)` encoding from Phase 0. It implements get, unconditional
 upsert, delete, same-primary-key query, ordered scan, clean reopen, page
 cache, reusable overflow/free pages, and an offline invariant checker.
 
-It does not implement WAL, crash recovery, transactional commit, MVCC,
-snapshotting, networking, or background compaction. Direct page publication
-is synchronized for deterministic clean-reopen tests, but Phase 1 does not
-claim crash-safe commit semantics.
+It does not define the Phase 2 WAL or recovery protocol, transactional commit,
+MVCC, snapshotting, networking, or background compaction. The compatibility
+single-file publisher remains synchronized for deterministic clean-reopen
+tests; crash-safe production opening is supplied by Phase 2's paired data/WAL
+path.
 
 ## Legacy implementation relationship
 
@@ -67,21 +68,22 @@ reinitialized.
 `prepare_batch` constructs a private overlay over committed/cache pages. It
 returns full encoded images for every changed page, read pages, the resulting
 allocator/root state, the alternate superblock image/slot, and logical
-responses. `publish_prepared` is the only direct data-file publication
-boundary. It writes pages, writes the alternate generation superblock,
-synchronizes the data file, and then updates the cache.
+responses. `publish_prepared` is the only commit publication boundary. The
+Phase 2 WAL-backed path logs and syncs those images before updating the cache;
+the data file is flushed later. The compatibility path still writes and syncs
+the data file directly.
 If preparation fails, no overlay state is published.
 
 The optional `AsyncShard` owns a bounded Tokio request queue and one
 coordinator. It collects at most 64 requests for up to 1 ms, executes them in
 queue order against one private storage batch, and replies in request order.
-This establishes the future group-commit shape without pretending that the
-Phase 1 direct publisher is a WAL commit protocol.
+This preserves the group-commit shape used by Phase 2: one prepared batch can
+share one WAL commit and sync.
 
-The checked-in `phase1-bench` binary reports synchronous cache baselines and
-async PUT throughput for 1, 4, 16, and 64 clients. The one-client run uses a
-queue capacity of one as the effectively-single-request comparison; larger
-runs use the bounded batching queue.
+The checked-in benchmark reports the same synchronous cache baselines and
+async PUT throughput for 1, 4, 16, and 64 clients against the WAL-backed path.
+The one-client run uses a queue capacity of one as the effectively-single-
+request comparison; larger runs use the bounded batching queue.
 
 ## Correctness coverage
 
