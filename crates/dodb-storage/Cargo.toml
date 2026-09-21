@@ -1,0 +1,13 @@
+[package]
+name = "dodb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32c.workspace = true
+dodb-core = { path = "../dodb-core" }
+
+[dev-dependencies]
+proptest.workspace = true
+
