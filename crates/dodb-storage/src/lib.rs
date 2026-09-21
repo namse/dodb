@@ -8,9 +8,9 @@ pub mod superblock;
 pub mod wal;
 
 pub use btree::{
-    AsyncShard, BTreeStore, BatchRequest, BatchResponse, DatabaseConfig, Document, EngineRequest,
-    EngineResponse, InvariantReport, MAX_ENCODED_KEY_SIZE, Mutation, NoWal, PreparedBatch,
-    StorageLimits,
+    AsyncShard, BTreeStore, BatchRequest, BatchResponse, CoordinatorConfig, CoordinatorMetrics,
+    DatabaseConfig, Document, EngineRequest, EngineResponse, InvariantReport, MAX_ENCODED_KEY_SIZE,
+    Mutation, NoWal, PreparedBatch, StorageLimits, StorageMetrics,
 };
 pub use durable_file::{DurableFile, ProductionFile};
 pub use fault::FaultInjector;
@@ -23,6 +23,6 @@ pub use superblock::{
     decode_superblock, encode_superblock,
 };
 pub use wal::{
-    CommittedWalBatch, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAGIC, WalAppendReport,
+    CommittedWalBatch, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAGIC, WalAppendReport, WalCommit,
     WalIdentity, WalLog, WalMetrics, WalPageImage, WalRecordType, WalScanReport,
 };

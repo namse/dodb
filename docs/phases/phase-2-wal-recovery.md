@@ -21,13 +21,13 @@
   crash tests, structural recovery tests, corruption tests, and a real abrupt
   subprocess restart test.
 
-## Preserved Phase 1 semantics
+## Phase 2 baseline semantics
 
-`PreparedBatch` remains a private overlay and one batch is still all-or-nothing.
-Individual request errors abort the entire preparation and do not publish
-earlier requests. The async coordinator still collects up to 64 requests in
-its existing bounded window and submits one storage batch, allowing those
-requests to share one WAL sync where the batch contains mutations.
+`PreparedBatch` remained a private overlay and one storage batch was
+all-or-nothing. Individual request errors aborted the entire preparation and
+did not publish earlier requests. Phase 3 retains this low-level API for
+compatibility, while its async coordinator maps independent mutation requests
+to independent logical transactions that can share one WAL sync.
 
 The single-file `BTreeStore::open` constructor remains as a format/testing
 compatibility path without a separate WAL. Production path opening and the new

@@ -1,5 +1,8 @@
-use dodb_core::{DocumentKey, PrimaryKey, RevisionState, SortKey};
-use dodb_storage::{BTreeStore, DatabaseConfig};
+use dodb_core::{
+    DocumentKey, PrimaryKey, Revision, RevisionState, SortKey, TransactionCondition,
+    TransactionMutation, TransactionRequest,
+};
+use dodb_storage::{BTreeStore, DatabaseConfig, DurableFile};
 
 use dodb_testkit::{CrashableFile, FaultAction, FaultPlan, FileOperation, ReferenceDb};
 
@@ -40,7 +43,10 @@ fn value_from_rng(mut value: u64) -> Vec<u8> {
     output
 }
 
-fn assert_same_scan(store: &mut BTreeStore<CrashableFile>, reference: &ReferenceDb) {
+fn assert_same_scan<W: DurableFile>(
+    store: &mut BTreeStore<CrashableFile, W>,
+    reference: &ReferenceDb,
+) {
     let actual = store.scan(None, usize::MAX).unwrap();
     let expected = reference.scan(None, usize::MAX);
     assert_documents_equal(&actual, &expected);
@@ -226,6 +232,147 @@ fn wal_commit_survives_a_simulated_process_crash_before_data_flush() {
         RevisionState::present(b"durable WAL value", revision)
     );
     reopened.check_invariants().unwrap();
+}
+
+#[test]
+fn synced_transaction_group_recovers_after_publication_is_interrupted() {
+    let mut store = BTreeStore::open_with_wal(
+        CrashableFile::new(),
+        CrashableFile::new(),
+        DatabaseConfig::default().with_cache_capacity(0),
+    )
+    .unwrap();
+    store.set_fault_injector(dodb_testkit::CrashInjector::at("after_wal_sync", 1));
+    let a = DocumentKey::new(vec![9], vec![1]);
+    let b = DocumentKey::new(vec![9], vec![2]);
+    let requests = [
+        TransactionRequest::new(
+            Vec::new(),
+            vec![TransactionMutation::Put {
+                key: a.clone(),
+                value: b"a".to_vec(),
+            }],
+        ),
+        TransactionRequest::new(
+            Vec::new(),
+            vec![TransactionMutation::Put {
+                key: b.clone(),
+                value: b"b".to_vec(),
+            }],
+        ),
+    ];
+    assert!(store.apply_transaction_group(&requests).is_err());
+    let (mut data, mut wal) = store.into_files().unwrap();
+    data.crash();
+    wal.crash();
+    let mut reopened =
+        BTreeStore::open_with_wal(data, wal, DatabaseConfig::default().with_cache_capacity(0))
+            .unwrap();
+    assert_eq!(reopened.get(&a).unwrap().value(), Some(&b"a"[..]));
+    assert_eq!(reopened.get(&b).unwrap().value(), Some(&b"b"[..]));
+    reopened.check_invariants().unwrap();
+}
+
+#[test]
+fn randomized_transaction_groups_match_the_reference_model() {
+    let mut store = BTreeStore::open_with_wal(
+        CrashableFile::new(),
+        CrashableFile::new(),
+        DatabaseConfig::default().with_cache_capacity(8),
+    )
+    .unwrap();
+    let mut reference = ReferenceDb::new();
+    let keys: Vec<_> = (0..32)
+        .map(|index| DocumentKey::new(vec![index / 8], vec![index % 8]))
+        .collect();
+    let mut rng = 0xd0db_2026_0003_u64;
+
+    for iteration in 0..2_000usize {
+        let group_size = (next_random(&mut rng) % 4 + 1) as usize;
+        let mut requests = Vec::with_capacity(group_size);
+        for _ in 0..group_size {
+            let condition_key = &keys[(next_random(&mut rng) as usize) % keys.len()];
+            let current = reference.get(condition_key);
+            let condition = match next_random(&mut rng) % 5 {
+                0 => None,
+                1 => Some(TransactionCondition::RevisionEquals {
+                    key: condition_key.clone(),
+                    expected_revision: current.revision(),
+                }),
+                2 => Some(TransactionCondition::RevisionEquals {
+                    key: condition_key.clone(),
+                    expected_revision: if current.revision() == Revision::ZERO {
+                        Revision::new(1)
+                    } else {
+                        Revision::new(current.revision().get() - 1)
+                    },
+                }),
+                3 => Some(TransactionCondition::Exists {
+                    key: condition_key.clone(),
+                }),
+                _ => Some(TransactionCondition::NotExists {
+                    key: condition_key.clone(),
+                }),
+            };
+
+            let mutation_count = (next_random(&mut rng) % 3 + 1) as usize;
+            let mut mutation_keys = std::collections::BTreeSet::new();
+            let mut mutations = Vec::with_capacity(mutation_count);
+            while mutations.len() < mutation_count {
+                let mutation_key = keys[(next_random(&mut rng) as usize) % keys.len()].clone();
+                if !mutation_keys.insert(mutation_key.clone()) {
+                    continue;
+                }
+                if next_random(&mut rng) & 1 == 0 {
+                    mutations.push(TransactionMutation::Put {
+                        key: mutation_key,
+                        value: vec![
+                            (next_random(&mut rng) & 0xff) as u8;
+                            1 + (next_random(&mut rng) % 32) as usize
+                        ],
+                    });
+                } else {
+                    mutations.push(TransactionMutation::Delete { key: mutation_key });
+                }
+            }
+            requests.push(TransactionRequest::new(
+                condition.into_iter().collect(),
+                mutations,
+            ));
+        }
+
+        let actual = store.apply_transaction_group(&requests).unwrap();
+        assert_eq!(actual.len(), requests.len());
+        for (request, result) in requests.into_iter().zip(actual) {
+            match result {
+                Ok(transaction) => {
+                    reference
+                        .transact_at(request, transaction.commit_lsn)
+                        .expect("reference should accept a successful real transaction");
+                }
+                Err(dodb_core::Error::Conflict(_)) => {
+                    assert!(matches!(
+                        reference.transact(request),
+                        Err(dodb_core::Error::Conflict(_))
+                    ));
+                }
+                Err(error) => panic!("unexpected randomized transaction error: {error}"),
+            }
+        }
+
+        if iteration % 101 == 0 {
+            assert_same_scan(&mut store, &reference);
+            store.check_invariants().unwrap();
+        }
+    }
+    assert_same_scan(&mut store, &reference);
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    *state
 }
 
 #[test]

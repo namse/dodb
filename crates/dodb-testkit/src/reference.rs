@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use dodb_core::{
-    DocumentKey, Error, Lsn, PrimaryKey, ReadSet, Result, Revision, RevisionState, SortKey, TxnId,
-    WriteIntent, WriteSet,
+    DocumentKey, Error, Lsn, PrimaryKey, ReadSet, Result, Revision, RevisionState, SortKey,
+    TransactionCondition, TransactionMutation, TransactionRequest, TxnId, WriteIntent, WriteSet,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +67,7 @@ impl ReferenceDb {
         );
         ReferenceTransaction {
             txn_id,
+            conditions: Vec::new(),
             read_set: ReadSet::default(),
             write_set: WriteSet::default(),
         }
@@ -75,32 +76,88 @@ impl ReferenceDb {
     /// Validates every point in the read set before applying any write.
     /// Therefore a successful multi-key commit is atomic in this model.
     pub fn commit(&mut self, transaction: ReferenceTransaction) -> Result<Option<Lsn>> {
-        for (key, observed_revision) in transaction.read_set.iter() {
-            let actual_revision = self.get(key).revision();
-            if actual_revision != *observed_revision {
-                return Err(Error::Conflict(format!(
-                    "transaction {} observed key at revision {}, current revision {}",
-                    transaction.txn_id.get(),
-                    observed_revision.get(),
-                    actual_revision.get()
-                )));
+        let conditions = transaction
+            .read_set
+            .iter()
+            .map(|(key, revision)| TransactionCondition::RevisionEquals {
+                key: key.clone(),
+                expected_revision: *revision,
+            })
+            .chain(transaction.conditions.iter().cloned())
+            .collect();
+        let mutations = transaction
+            .write_set
+            .iter()
+            .map(|(key, intent)| match intent {
+                WriteIntent::Put(value) => TransactionMutation::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                WriteIntent::Delete => TransactionMutation::Delete { key: key.clone() },
+            })
+            .collect();
+        self.transact(TransactionRequest::new(conditions, mutations))
+            .map(Some)
+    }
+
+    /// Applies one validated request atomically at the reference model's
+    /// serialization point.
+    pub fn transact(&mut self, request: TransactionRequest) -> Result<Lsn> {
+        self.transact_at(request, self.next_lsn)
+    }
+
+    /// Applies a request using a commit LSN supplied by a physical engine.
+    /// This lets differential tests replay real WAL commit identities while
+    /// the ordinary reference path continues to use synthetic LSNs.
+    pub fn transact_at(&mut self, request: TransactionRequest, commit_lsn: Lsn) -> Result<Lsn> {
+        if commit_lsn == Lsn::ZERO {
+            return Err(Error::invalid_request(
+                "a committed transaction LSN must be non-zero",
+            ));
+        }
+        request.validate()?;
+        for condition in &request.conditions {
+            let actual = self.get(condition.key());
+            let satisfied = match condition {
+                TransactionCondition::RevisionEquals {
+                    expected_revision, ..
+                } => actual.revision() == *expected_revision,
+                TransactionCondition::Exists { .. } => !actual.is_missing(),
+                TransactionCondition::NotExists { .. } => actual.is_missing(),
+            };
+            if !satisfied {
+                return Err(Error::conflict(dodb_core::TransactionConflict {
+                    key: condition.key().clone(),
+                    expected: condition.expectation(),
+                    actual,
+                }));
             }
         }
 
-        if transaction.write_set.is_empty() {
-            return Ok(None);
-        }
-
-        let lsn = self.allocate_lsn()?;
-        let revision = Revision::from(lsn);
-        for (key, intent) in transaction.write_set.iter() {
-            let state = match intent {
-                WriteIntent::Put(value) => RevisionState::present(value.clone(), revision),
-                WriteIntent::Delete => RevisionState::missing(revision),
+        let revision = Revision::from(commit_lsn);
+        for mutation in &request.mutations {
+            let (key, state) = match mutation {
+                TransactionMutation::Put { key, value } => {
+                    (key, RevisionState::present(value.clone(), revision))
+                }
+                TransactionMutation::Delete { key } => (key, RevisionState::missing(revision)),
             };
             self.states.insert(key.clone(), state);
         }
-        Ok(Some(lsn))
+        let next_lsn = Lsn::new(
+            commit_lsn
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("synthetic LSN exhausted"))?,
+        );
+        if next_lsn > self.next_lsn {
+            self.next_lsn = next_lsn;
+        }
+        Ok(commit_lsn)
+    }
+
+    pub fn transact_get(&self, keys: &[DocumentKey]) -> Vec<RevisionState> {
+        keys.iter().map(|key| self.get(key)).collect()
     }
 
     pub fn query(
@@ -154,20 +211,11 @@ impl ReferenceDb {
             .filter(|state| matches!(state, RevisionState::Present { .. }))
             .count()
     }
-
-    fn allocate_lsn(&mut self) -> Result<Lsn> {
-        let lsn = self.next_lsn;
-        self.next_lsn = Lsn::new(
-            lsn.get()
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("synthetic LSN exhausted"))?,
-        );
-        Ok(lsn)
-    }
 }
 
 pub struct ReferenceTransaction {
     pub txn_id: TxnId,
+    pub conditions: Vec<TransactionCondition>,
     pub read_set: ReadSet,
     pub write_set: WriteSet,
 }
@@ -201,6 +249,22 @@ impl ReferenceTransaction {
     pub fn delete(&mut self, db: &ReferenceDb, key: DocumentKey) {
         self.observe(db, &key);
         self.write_set.delete(key);
+    }
+
+    pub fn revision_equals(&mut self, key: DocumentKey, expected_revision: Revision) {
+        self.conditions.push(TransactionCondition::RevisionEquals {
+            key,
+            expected_revision,
+        });
+    }
+
+    pub fn exists(&mut self, key: DocumentKey) {
+        self.conditions.push(TransactionCondition::Exists { key });
+    }
+
+    pub fn not_exists(&mut self, key: DocumentKey) {
+        self.conditions
+            .push(TransactionCondition::NotExists { key });
     }
 
     fn observe(&mut self, db: &ReferenceDb, key: &DocumentKey) {
@@ -328,6 +392,50 @@ mod tests {
         db.put(a.clone(), b"external-a").unwrap();
         assert!(db.commit(doomed).is_err());
         assert_eq!(db.get(&c), RevisionState::missing(Revision::ZERO));
+    }
+
+    #[test]
+    fn explicit_conditions_report_structured_conflicts_and_missing_semantics() {
+        let mut db = ReferenceDb::new();
+        let key = key(6, 1);
+        let never = db.get(&key).revision();
+        db.put(key.clone(), b"value").unwrap();
+        let deleted_revision = db.delete(key.clone()).unwrap();
+
+        let stale = TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: key.clone(),
+                expected_revision: never,
+            }],
+            vec![TransactionMutation::Put {
+                key: key.clone(),
+                value: b"stale".to_vec(),
+            }],
+        );
+        match db.transact(stale) {
+            Err(Error::Conflict(conflict)) => {
+                assert_eq!(conflict.key, key);
+                assert_eq!(
+                    conflict.actual,
+                    RevisionState::missing(deleted_revision.into())
+                );
+            }
+            other => panic!("expected a structured conflict, got {other:?}"),
+        }
+
+        let insert = TransactionRequest::new(
+            vec![TransactionCondition::NotExists { key: key.clone() }],
+            vec![TransactionMutation::Put {
+                key: key.clone(),
+                value: b"reinserted".to_vec(),
+            }],
+        );
+        db.transact(insert).unwrap();
+        let exists = TransactionRequest::new(
+            vec![TransactionCondition::Exists { key: key.clone() }],
+            vec![TransactionMutation::Delete { key }],
+        );
+        db.transact(exists).unwrap();
     }
 
     #[test]

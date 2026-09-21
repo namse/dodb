@@ -82,6 +82,14 @@ pub struct WalPageImage {
     pub image: [u8; PAGE_SIZE],
 }
 
+/// One logical commit in a physical WAL group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalCommit {
+    pub batch_id: u64,
+    pub commit_lsn: Lsn,
+    pub pages: Vec<WalPageImage>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedWalBatch {
     pub batch_id: u64,
@@ -110,6 +118,7 @@ pub struct WalMetrics {
     pub wal_bytes: u64,
     pub wal_syncs: u64,
     pub committed_batches: usize,
+    pub page_images: usize,
     pub append_nanos: u64,
     pub sync_nanos: u64,
 }
@@ -140,6 +149,7 @@ pub struct WalLog<F: DurableFile> {
     committed: Vec<CommittedWalBatch>,
     scan_report: WalScanReport,
     sync_count: u64,
+    page_images: usize,
     append_nanos: u64,
     sync_nanos: u64,
 }
@@ -164,6 +174,7 @@ impl<F: DurableFile> WalLog<F> {
                 committed: Vec::new(),
                 scan_report: WalScanReport::default(),
                 sync_count: 0,
+                page_images: 0,
                 append_nanos: 0,
                 sync_nanos: 0,
             };
@@ -189,6 +200,7 @@ impl<F: DurableFile> WalLog<F> {
         }
         report.torn_tail_bytes = usize::try_from(length - valid_length)
             .map_err(|_| Error::invariant("WAL tail length does not fit usize"))?;
+        let page_images = report.replayable_pages;
         Ok(Self {
             file,
             identity,
@@ -197,6 +209,7 @@ impl<F: DurableFile> WalLog<F> {
             committed,
             scan_report: report,
             sync_count: 0,
+            page_images,
             append_nanos: 0,
             sync_nanos: 0,
         })
@@ -227,14 +240,13 @@ impl<F: DurableFile> WalLog<F> {
             wal_bytes: self.file.len()?,
             wal_syncs: self.sync_count,
             committed_batches: self.committed.len(),
+            page_images: self.page_images,
             append_nanos: self.append_nanos,
             sync_nanos: self.sync_nanos,
         })
     }
 
-    /// Appends all page images and their commit marker in one contiguous WAL
-    /// range, then syncs the WAL. The supplied commit LSN must be the next
-    /// record LSN after the page images.
+    /// Appends one logical commit and syncs the WAL.
     pub fn append_commit(
         &mut self,
         batch_id: u64,
@@ -242,35 +254,140 @@ impl<F: DurableFile> WalLog<F> {
         pages: &[WalPageImage],
         mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
     ) -> Result<WalAppendReport> {
+        let mut reports = self.append_group(
+            &[WalCommit {
+                batch_id,
+                commit_lsn,
+                pages: pages.to_vec(),
+            }],
+            injector.take(),
+        )?;
+        Ok(reports.remove(0))
+    }
+
+    /// Appends several logical commits in serialization order and performs
+    /// exactly one WAL sync for the group. Each commit retains its own batch
+    /// identity, page images, commit marker, and commit LSN.
+    pub fn append_group(
+        &mut self,
+        commits: &[WalCommit],
+        mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Vec<WalAppendReport>> {
+        if commits.is_empty() {
+            return Err(Error::invalid_input("a WAL group must contain a commit"));
+        }
+
+        let append_started = Instant::now();
+        hit(&mut injector, "before_wal_append")?;
+        let mut next_lsn = self.next_lsn;
+        let mut next_batch_id = self.next_batch_id;
+        let mut reports = Vec::with_capacity(commits.len());
+        let mut committed = Vec::with_capacity(commits.len());
+
+        for commit in commits {
+            let report =
+                self.append_group_commit(commit, next_lsn, next_batch_id, &mut injector)?;
+            next_lsn = Lsn::new(
+                report
+                    .commit_lsn
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            );
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
+            committed.push(CommittedWalBatch {
+                batch_id: commit.batch_id,
+                commit_lsn: commit.commit_lsn,
+                pages: commit.pages.clone(),
+            });
+            reports.push(report);
+        }
+
+        self.append_nanos = self
+            .append_nanos
+            .checked_add(elapsed_nanos(append_started)?)
+            .ok_or_else(|| Error::invariant("WAL append timing overflow"))?;
+        hit(&mut injector, "after_group_records_written")?;
+        hit(&mut injector, "before_wal_sync")?;
+        hit(&mut injector, "during_wal_sync")?;
+        let sync_started = Instant::now();
+        self.file.sync_data().map_err(|error| {
+            Error::durability(format!(
+                "WAL group sync failed at commit LSN {}: {error}",
+                commits.last().expect("non-empty WAL group").commit_lsn
+            ))
+        })?;
+        self.sync_nanos = self
+            .sync_nanos
+            .checked_add(elapsed_nanos(sync_started)?)
+            .ok_or_else(|| Error::invariant("WAL sync timing overflow"))?;
+        self.sync_count = self
+            .sync_count
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("WAL sync count overflow"))?;
+        hit(&mut injector, "after_wal_sync")?;
+
+        self.committed.extend(committed);
+        self.next_lsn = next_lsn;
+        self.next_batch_id = next_batch_id;
+        let record_count = commits.iter().try_fold(0usize, |count, commit| {
+            count
+                .checked_add(commit.pages.len() + 1)
+                .ok_or_else(|| Error::invariant("WAL record count overflow"))
+        })?;
+        self.scan_report.records_scanned = self
+            .scan_report
+            .records_scanned
+            .checked_add(record_count)
+            .ok_or_else(|| Error::invariant("WAL record count overflow"))?;
+        self.scan_report.committed_batches += commits.len();
+        self.scan_report.replayable_pages += commits
+            .iter()
+            .map(|commit| commit.pages.len())
+            .sum::<usize>();
+        self.page_images = self
+            .page_images
+            .checked_add(commits.iter().map(|commit| commit.pages.len()).sum())
+            .ok_or_else(|| Error::invariant("WAL page-image count overflow"))?;
+
+        Ok(reports)
+    }
+
+    fn append_group_commit(
+        &mut self,
+        commit: &WalCommit,
+        first_record_lsn: Lsn,
+        expected_batch_id: u64,
+        injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<WalAppendReport> {
+        let pages = &commit.pages;
         if pages.is_empty() {
             return Err(Error::invalid_input(
                 "a WAL commit must contain at least one page image",
             ));
         }
-        if batch_id != self.next_batch_id {
+        if commit.batch_id != expected_batch_id {
             return Err(Error::invariant(format!(
                 "WAL batch id {}, expected {}",
-                batch_id, self.next_batch_id
+                commit.batch_id, expected_batch_id
             )));
         }
         let page_count = u64::try_from(pages.len())
             .map_err(|_| Error::invalid_input("WAL page count does not fit u64"))?;
-        let expected_commit = self
-            .next_lsn
+        let expected_commit = first_record_lsn
             .get()
             .checked_add(page_count)
             .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
-        if commit_lsn.get() != expected_commit {
+        if commit.commit_lsn.get() != expected_commit {
             return Err(Error::invariant(format!(
                 "WAL commit LSN {}, expected {}",
-                commit_lsn.get(),
+                commit.commit_lsn.get(),
                 expected_commit
             )));
         }
 
-        let first_record_lsn = self.next_lsn;
-        let append_started = Instant::now();
-        hit(&mut injector, "before_wal_append")?;
         let mut digest_input = Vec::with_capacity(
             pages
                 .len()
@@ -279,7 +396,7 @@ impl<F: DurableFile> WalLog<F> {
         );
         let mut bytes_written = 0usize;
         for (index, page) in pages.iter().enumerate() {
-            validate_page_image_lsn(page, commit_lsn)?;
+            validate_page_image_lsn(page, commit.commit_lsn)?;
             let payload = encode_page_image(page)?;
             digest_input.extend_from_slice(&payload);
             let record_lsn = Lsn::new(
@@ -293,16 +410,16 @@ impl<F: DurableFile> WalLog<F> {
                     self.append_frame(
                         WalRecordType::PageImage,
                         record_lsn,
-                        batch_id,
+                        commit.batch_id,
                         u32::try_from(index)
                             .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?,
                         &payload,
-                        &mut injector,
+                        &mut *injector,
                     )?,
                 )
                 .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
         }
-        hit(&mut injector, "after_page_images_written")?;
+        hit(&mut *injector, "after_page_images_written")?;
 
         let digest = crc32c::crc32c(&digest_input);
         let mut commit_payload = [0u8; COMMIT_PAYLOAD_SIZE];
@@ -313,70 +430,25 @@ impl<F: DurableFile> WalLog<F> {
                 .to_le_bytes(),
         );
         commit_payload[12..16].copy_from_slice(&u32::to_le_bytes(digest));
-        hit(&mut injector, "before_commit_record")?;
+        hit(&mut *injector, "before_commit_record")?;
         bytes_written = bytes_written
             .checked_add(
                 self.append_frame(
                     WalRecordType::Commit,
-                    commit_lsn,
-                    batch_id,
+                    commit.commit_lsn,
+                    commit.batch_id,
                     u32::try_from(pages.len())
                         .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?,
                     &commit_payload,
-                    &mut injector,
+                    &mut *injector,
                 )?,
             )
             .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
-        hit(&mut injector, "after_commit_record_write")?;
-        self.append_nanos = self
-            .append_nanos
-            .checked_add(elapsed_nanos(append_started)?)
-            .ok_or_else(|| Error::invariant("WAL append timing overflow"))?;
-        hit(&mut injector, "before_wal_sync")?;
-        hit(&mut injector, "during_wal_sync")?;
-        let sync_started = Instant::now();
-        self.file.sync_data().map_err(|error| {
-            Error::durability(format!(
-                "WAL sync failed at commit LSN {}: {error}",
-                commit_lsn
-            ))
-        })?;
-        self.sync_nanos = self
-            .sync_nanos
-            .checked_add(elapsed_nanos(sync_started)?)
-            .ok_or_else(|| Error::invariant("WAL sync timing overflow"))?;
-        self.sync_count = self
-            .sync_count
-            .checked_add(1)
-            .ok_or_else(|| Error::invariant("WAL sync count overflow"))?;
-        hit(&mut injector, "after_wal_sync")?;
-
-        self.committed.push(CommittedWalBatch {
-            batch_id,
-            commit_lsn,
-            pages: pages.to_vec(),
-        });
-        self.next_lsn = Lsn::new(
-            commit_lsn
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
-        );
-        self.next_batch_id = self
-            .next_batch_id
-            .checked_add(1)
-            .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
-        self.scan_report.records_scanned = self
-            .scan_report
-            .records_scanned
-            .checked_add(pages.len() + 1)
-            .ok_or_else(|| Error::invariant("WAL record count overflow"))?;
-        self.scan_report.committed_batches += 1;
-        self.scan_report.replayable_pages += pages.len();
+        hit(&mut *injector, "after_commit_record_write")?;
 
         Ok(WalAppendReport {
             first_record_lsn,
-            commit_lsn,
+            commit_lsn: commit.commit_lsn,
             page_count: pages.len(),
             bytes_written,
         })

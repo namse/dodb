@@ -75,10 +75,10 @@ the data file directly.
 If preparation fails, no overlay state is published.
 
 The optional `AsyncShard` owns a bounded Tokio request queue and one
-coordinator. It collects at most 64 requests for up to 1 ms, executes them in
-queue order against one private storage batch, and replies in request order.
-This preserves the group-commit shape used by Phase 2: one prepared batch can
-share one WAL commit and sync.
+coordinator. Phase 1 established the bounded queue and short collection shape;
+later phases retain the coordinator as the physical writer while ordinary reads
+use the published committed view and mutation groups retain explicit request
+and byte limits.
 
 The checked-in benchmark reports the same synchronous cache baselines and
 async PUT throughput for 1, 4, 16, and 64 clients against the WAL-backed path.

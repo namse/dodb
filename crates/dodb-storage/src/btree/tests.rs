@@ -1,4 +1,7 @@
-use dodb_core::{DocumentKey, Error, PrimaryKey, Revision, RevisionState};
+use dodb_core::{
+    DocumentKey, Error, PrimaryKey, Revision, RevisionState, TransactionCondition,
+    TransactionMutation, TransactionRequest,
+};
 
 use super::*;
 
@@ -239,22 +242,96 @@ fn all_cache_sizes_use_the_same_results() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn async_shard_serializes_concurrent_requests_in_queue_order() {
+async fn async_shard_makes_committed_writes_visible_after_success() {
     let store = BTreeStore::open(MemoryFile::default(), config(2)).unwrap();
     let shard = AsyncShard::start(store, 8);
-    let first = shard.execute(BatchRequest::Put {
-        key: key(vec![1], vec![1]),
-        value: b"first".to_vec(),
-    });
-    let second = shard.execute(BatchRequest::Get {
-        key: key(vec![1], vec![1]),
-    });
-    let (first, second) = tokio::join!(first, second);
-    assert_eq!(first.unwrap(), BatchResponse::Put(Revision::new(1)));
+    let first = shard
+        .execute(BatchRequest::Put {
+            key: key(vec![1], vec![1]),
+            value: b"first".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first, BatchResponse::Put(Revision::new(1)));
+    let second = shard
+        .execute(BatchRequest::Get {
+            key: key(vec![1], vec![1]),
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        second.unwrap(),
+        second,
         BatchResponse::Get(RevisionState::present(b"first", Revision::new(1)))
     );
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_shard_reads_use_one_committed_view_and_bypass_write_queue() {
+    let store = BTreeStore::open(MemoryFile::default(), config(0)).unwrap();
+    let shard = AsyncShard::start(store, 8);
+    for index in 0..240usize {
+        shard
+            .execute(BatchRequest::Put {
+                key: key(b"read-view", index.to_le_bytes().to_vec()),
+                value: vec![index as u8],
+            })
+            .await
+            .unwrap();
+    }
+
+    let get = shard
+        .execute(BatchRequest::Get {
+            key: key(b"read-view", 239usize.to_le_bytes().to_vec()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        get,
+        BatchResponse::Get(RevisionState::present([239], Revision::new(240)))
+    );
+    let query = shard
+        .execute(BatchRequest::Query {
+            pk: PrimaryKey::new(b"read-view".to_vec()),
+            exclusive_after_sk: None,
+            limit: 240,
+        })
+        .await
+        .unwrap();
+    let BatchResponse::Query(query) = query else {
+        panic!("expected query response");
+    };
+    assert_eq!(query.len(), 240);
+    let scan = shard
+        .execute(BatchRequest::Scan {
+            exclusive_after_key: None,
+            limit: 240,
+        })
+        .await
+        .unwrap();
+    let BatchResponse::Scan(scan) = scan else {
+        panic!("expected scan response");
+    };
+    assert_eq!(scan.len(), 240);
+    let metrics = shard.coordinator_metrics();
+    assert_eq!(metrics.queued_requests, 240);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_shard_keeps_logical_transaction_lsns_distinct() {
+    let store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let shard = AsyncShard::start(store, 8);
+    let a = key(b"async", b"a");
+    let b = key(b"async", b"b");
+    let first = shard.execute_transaction(put_transaction(a.clone(), b"a"));
+    let second = shard.execute_transaction(put_transaction(b.clone(), b"b"));
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap().commit_lsn;
+    let second = second.unwrap().commit_lsn;
+    assert_ne!(first, second);
+    assert_eq!(shard.transact_get(vec![a, b]).await.unwrap().len(), 2);
     shard.close().await.unwrap();
 }
 
@@ -270,5 +347,237 @@ fn wal_backed_store_reopens_from_committed_page_images() {
     assert_eq!(
         reopened.get(&document_key).unwrap(),
         RevisionState::present(b"wal", revision)
+    );
+}
+
+fn put_transaction(key: DocumentKey, value: &[u8]) -> TransactionRequest {
+    TransactionRequest::new(
+        Vec::new(),
+        vec![TransactionMutation::Put {
+            key,
+            value: value.to_vec(),
+        }],
+    )
+}
+
+#[test]
+fn transaction_workflow_validates_all_point_dependencies_and_commits_atomically() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let a = key(b"p", b"a");
+    let b = key(b"p", b"b");
+    let c = key(b"p", b"c");
+    let a_revision = store.put(a.clone(), b"old-a").unwrap();
+    let b_revision = store.put(b.clone(), b"old-b").unwrap();
+
+    let request = TransactionRequest::new(
+        vec![
+            TransactionCondition::RevisionEquals {
+                key: a.clone(),
+                expected_revision: a_revision,
+            },
+            TransactionCondition::RevisionEquals {
+                key: b.clone(),
+                expected_revision: b_revision,
+            },
+            TransactionCondition::NotExists { key: c.clone() },
+        ],
+        vec![
+            TransactionMutation::Put {
+                key: a.clone(),
+                value: b"new-a".to_vec(),
+            },
+            TransactionMutation::Put {
+                key: c.clone(),
+                value: b"new-c".to_vec(),
+            },
+        ],
+    );
+    let result = store.transact(request).unwrap();
+    assert_eq!(store.get(&a).unwrap().revision(), result.commit_lsn.into());
+    assert_eq!(store.get(&c).unwrap().revision(), result.commit_lsn.into());
+    assert_eq!(store.get(&b).unwrap().revision(), b_revision);
+}
+
+#[test]
+fn transaction_conflict_on_a_read_only_dependency_rolls_back_all_mutations() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let a = key(b"p", b"a");
+    let b = key(b"p", b"b");
+    let a_revision = store.put(a.clone(), b"a").unwrap();
+    let request = TransactionRequest::new(
+        vec![TransactionCondition::RevisionEquals {
+            key: a.clone(),
+            expected_revision: a_revision,
+        }],
+        vec![TransactionMutation::Put {
+            key: b.clone(),
+            value: b"b".to_vec(),
+        }],
+    );
+    store.put(a.clone(), b"changed").unwrap();
+    let error = store.transact(request).unwrap_err();
+    assert!(matches!(error, Error::Conflict(_)));
+    assert_eq!(
+        store.get(&b).unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+}
+
+#[test]
+fn revision_equals_distinguishes_never_existing_from_deleted_and_not_exists_does_not() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let x = key(b"p", b"x");
+    let never_existing = store.get(&x).unwrap().revision();
+    store.put(x.clone(), b"x").unwrap();
+    store.delete(x.clone()).unwrap();
+
+    let stale = TransactionRequest::new(
+        vec![TransactionCondition::RevisionEquals {
+            key: x.clone(),
+            expected_revision: never_existing,
+        }],
+        vec![TransactionMutation::Put {
+            key: key(b"p", b"y"),
+            value: b"y".to_vec(),
+        }],
+    );
+    assert!(matches!(store.transact(stale), Err(Error::Conflict(_))));
+
+    let insert = TransactionRequest::new(
+        vec![TransactionCondition::NotExists { key: x.clone() }],
+        vec![TransactionMutation::Put {
+            key: x.clone(),
+            value: b"reinserted".to_vec(),
+        }],
+    );
+    store.transact(insert).unwrap();
+}
+
+#[test]
+fn transaction_group_assigns_separate_lsns_and_stages_shared_pages_in_order() {
+    let mut store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let a = key(b"same", b"a");
+    let b = key(b"same", b"b");
+    let results = store
+        .apply_transaction_group(&[
+            put_transaction(a.clone(), b"a"),
+            put_transaction(b.clone(), b"b"),
+            put_transaction(a.clone(), b"a-again"),
+        ])
+        .unwrap();
+    let first = results[0].as_ref().unwrap().commit_lsn;
+    let second = results[1].as_ref().unwrap().commit_lsn;
+    let third = results[2].as_ref().unwrap().commit_lsn;
+    assert!(first < second && second < third);
+    let metrics = store.wal_metrics().unwrap().unwrap();
+    assert_eq!(metrics.committed_batches, 3);
+    assert_eq!(metrics.wal_syncs, 2);
+    assert_eq!(store.get(&a).unwrap().revision(), third.into());
+    assert_eq!(store.get(&b).unwrap().revision(), second.into());
+    store.check_invariants().unwrap();
+
+    let (data, wal) = store.into_files().unwrap();
+    let mut reopened = BTreeStore::open_with_wal(data, wal, config(0)).unwrap();
+    assert_eq!(reopened.get(&a).unwrap().value(), Some(&b"a-again"[..]));
+    assert_eq!(reopened.get(&b).unwrap().value(), Some(&b"b"[..]));
+    reopened.check_invariants().unwrap();
+}
+
+#[test]
+fn insert_if_absent_race_has_one_winner_in_one_coordinator_group() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let key = key(b"race", b"x");
+    let request = |value: &[u8]| {
+        TransactionRequest::new(
+            vec![TransactionCondition::NotExists { key: key.clone() }],
+            vec![TransactionMutation::Put {
+                key: key.clone(),
+                value: value.to_vec(),
+            }],
+        )
+    };
+    let results = store
+        .apply_transaction_group(&[request(b"first"), request(b"second")])
+        .unwrap();
+    assert!(results[0].is_ok());
+    assert!(matches!(results[1], Err(Error::Conflict(_))));
+    assert_eq!(store.get(&key).unwrap().value(), Some(&b"first"[..]));
+}
+
+#[test]
+fn same_group_revision_dependency_conflicts_against_the_staged_commit() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let a = key(b"group", b"a");
+    let b = key(b"group", b"b");
+    let old_revision = store.put(a.clone(), b"old").unwrap();
+    let first = TransactionRequest::new(
+        vec![TransactionCondition::RevisionEquals {
+            key: a.clone(),
+            expected_revision: old_revision,
+        }],
+        vec![TransactionMutation::Put {
+            key: a.clone(),
+            value: b"new".to_vec(),
+        }],
+    );
+    let second = TransactionRequest::new(
+        vec![TransactionCondition::RevisionEquals {
+            key: a.clone(),
+            expected_revision: old_revision,
+        }],
+        vec![TransactionMutation::Put {
+            key: b.clone(),
+            value: b"should-not-appear".to_vec(),
+        }],
+    );
+    let results = store.apply_transaction_group(&[first, second]).unwrap();
+    assert!(results[0].is_ok());
+    assert!(matches!(results[1], Err(Error::Conflict(_))));
+    assert_eq!(
+        store.get(&b).unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+}
+
+#[test]
+fn transact_get_preserves_input_order_and_revisions() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let first = key(b"p", b"1");
+    let second = key(b"p", b"2");
+    let first_revision = store.put(first.clone(), b"one").unwrap();
+    let second_revision = store.put(second.clone(), b"two").unwrap();
+    assert_eq!(
+        store
+            .transact_get(&[second.clone(), first.clone()])
+            .unwrap(),
+        vec![
+            RevisionState::present(b"two", second_revision),
+            RevisionState::present(b"one", first_revision),
+        ]
+    );
+}
+
+#[test]
+fn ambiguous_transaction_mutations_are_rejected_without_changes() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let key = key(b"p", b"duplicate");
+    let request = TransactionRequest::new(
+        Vec::new(),
+        vec![
+            TransactionMutation::Put {
+                key: key.clone(),
+                value: b"one".to_vec(),
+            },
+            TransactionMutation::Delete { key: key.clone() },
+        ],
+    );
+    assert!(matches!(
+        store.transact(request),
+        Err(Error::InvalidRequest(_))
+    ));
+    assert_eq!(
+        store.get(&key).unwrap(),
+        RevisionState::missing(Revision::ZERO)
     );
 }

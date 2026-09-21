@@ -1,11 +1,139 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
-use crate::{DocumentKey, Revision};
+use crate::{DocumentKey, Lsn, Revision, RevisionState};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteIntent {
     Put(Vec<u8>),
     Delete,
+}
+
+/// A point-key predicate evaluated at the transaction commit serialization
+/// point.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionCondition {
+    RevisionEquals {
+        key: DocumentKey,
+        expected_revision: Revision,
+    },
+    Exists {
+        key: DocumentKey,
+    },
+    NotExists {
+        key: DocumentKey,
+    },
+}
+
+impl TransactionCondition {
+    pub fn key(&self) -> &DocumentKey {
+        match self {
+            Self::RevisionEquals { key, .. } | Self::Exists { key } | Self::NotExists { key } => {
+                key
+            }
+        }
+    }
+
+    pub fn expectation(&self) -> ConditionExpectation {
+        match self {
+            Self::RevisionEquals {
+                expected_revision, ..
+            } => ConditionExpectation::RevisionEquals(*expected_revision),
+            Self::Exists { .. } => ConditionExpectation::Exists,
+            Self::NotExists { .. } => ConditionExpectation::NotExists,
+        }
+    }
+}
+
+/// The expected part of a structured transaction conflict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionExpectation {
+    RevisionEquals(Revision),
+    Exists,
+    NotExists,
+}
+
+/// A mutation applied atomically with all other mutations in a request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionMutation {
+    Put { key: DocumentKey, value: Vec<u8> },
+    Delete { key: DocumentKey },
+}
+
+impl TransactionMutation {
+    pub fn key(&self) -> &DocumentKey {
+        match self {
+            Self::Put { key, .. } | Self::Delete { key } => key,
+        }
+    }
+}
+
+/// The single-shot semantic primitive for an optimistic atomic write.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TransactionRequest {
+    pub conditions: Vec<TransactionCondition>,
+    pub mutations: Vec<TransactionMutation>,
+}
+
+impl TransactionRequest {
+    pub fn new(conditions: Vec<TransactionCondition>, mutations: Vec<TransactionMutation>) -> Self {
+        Self {
+            conditions,
+            mutations,
+        }
+    }
+
+    /// Rejects ambiguous requests before any storage preparation takes place.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.mutations.is_empty() {
+            return Err(crate::Error::invalid_request(
+                "a transaction must contain at least one mutation",
+            ));
+        }
+
+        let mut mutation_keys = BTreeSet::new();
+        for mutation in &self.mutations {
+            if !mutation_keys.insert(mutation.key().clone()) {
+                return Err(crate::Error::invalid_request(
+                    "a transaction contains multiple mutations for one key",
+                ));
+            }
+        }
+
+        let mut condition_keys = BTreeSet::new();
+        for condition in &self.conditions {
+            if !condition_keys.insert(condition.key().clone()) {
+                return Err(crate::Error::invalid_request(
+                    "a transaction contains multiple conditions for one key",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The committed identity returned for one successful logical transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionResult {
+    pub commit_lsn: Lsn,
+}
+
+/// Structured expected-vs-actual information for an optimistic conflict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionConflict {
+    pub key: DocumentKey,
+    pub expected: ConditionExpectation,
+    pub actual: RevisionState,
+}
+
+impl fmt::Display for TransactionConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "key {:?}: expected {:?}, actual {:?}",
+            self.key, self.expected, self.actual
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

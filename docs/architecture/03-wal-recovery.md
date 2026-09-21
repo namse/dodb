@@ -130,7 +130,16 @@ WAL record merely because another file received the image.
 
 ## Scope and limitations
 
-The WAL commit unit is a storage batch, not yet a user transaction API. There
-is no OCC validation, MVCC, snapshot, replication, checkpoint, WAL compaction,
-networking, or background flush worker in Phase 2. A caller may invoke `flush`
-for a clean data-file image; successful writes do not depend on doing so.
+Phase 2 established the single-commit append path. Phase 3 and Phase 4 reuse
+the same framing and recovery rules for a group of logical point-key
+transactions:
+each transaction still has its own page-image sequence and `COMMIT` frame, but
+several sequences may share one WAL sync. Recovery replays those committed
+units in order.
+
+OCC validation, MVCC, snapshot, replication, checkpoint, WAL compaction,
+networking, and background flush workers remain outside this WAL document. A
+caller may invoke `flush` for a clean data-file image; successful writes do not
+depend on doing so. Phase 4 does not add a flush worker: dirty committed pages
+continue to accumulate until explicit `flush`, `checkpoint_lsn` remains
+unchanged, and retained WAL history remains the recovery authority.

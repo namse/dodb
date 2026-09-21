@@ -9,14 +9,16 @@ mod checker;
 mod coordinator;
 mod format;
 
-pub use coordinator::AsyncShard;
+pub use coordinator::{AsyncShard, CoordinatorConfig, CoordinatorMetrics};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 use dodb_core::{
     DocumentKey, Error, Lsn, PageId, PrimaryKey, Result, Revision, RevisionState, ShardEpoch,
-    ShardId, SortKey, TenantId,
+    ShardId, SortKey, TenantId, TransactionCondition, TransactionConflict, TransactionMutation,
+    TransactionRequest, TransactionResult,
 };
 
 use self::cache::PageCache;
@@ -26,7 +28,7 @@ use self::format::{
 };
 use crate::PAGE_SIZE;
 use crate::fault::FaultInjector;
-use crate::wal::{CommittedWalBatch, WalIdentity, WalLog, WalMetrics, WalPageImage};
+use crate::wal::{CommittedWalBatch, WalCommit, WalIdentity, WalLog, WalMetrics, WalPageImage};
 use crate::{
     DurableFile, ProductionFile, Superblock, SuperblockSlot, choose_superblock, decode_page_at,
     decode_superblock, encode_superblock,
@@ -211,6 +213,10 @@ impl PreparedBatch {
     pub fn read_page_ids(&self) -> impl Iterator<Item = PageId> + '_ {
         self.read_pages.keys().copied()
     }
+
+    pub fn commit_lsn(&self) -> Option<Lsn> {
+        self.commit_lsn
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,6 +225,13 @@ pub struct InvariantReport {
     pub free_pages: usize,
     pub leaked_pages: Vec<PageId>,
     pub max_revision: Revision,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StorageMetrics {
+    pub validation_nanos: u64,
+    pub btree_preparation_nanos: u64,
+    pub publication_nanos: u64,
 }
 
 /// A mutable, single-file B+Tree over canonical encoded document keys.
@@ -237,6 +250,9 @@ pub struct BTreeStore<F: DurableFile, W: DurableFile = NoWal> {
     config: DatabaseConfig,
     dirty_pages: BTreeMap<PageId, [u8; PAGE_SIZE]>,
     dirty_superblock: Option<[u8; PAGE_SIZE]>,
+    track_published_pages: bool,
+    published_page_updates: BTreeMap<PageId, PageData>,
+    storage_metrics: StorageMetrics,
     broken: Option<String>,
     fault_injector: Option<Box<dyn FaultInjector + Send>>,
 }
@@ -278,6 +294,9 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             config,
             dirty_pages: BTreeMap::new(),
             dirty_superblock: None,
+            track_published_pages: false,
+            published_page_updates: BTreeMap::new(),
+            storage_metrics: StorageMetrics::default(),
             broken: None,
             fault_injector: None,
         };
@@ -380,6 +399,9 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             config,
             dirty_pages: BTreeMap::new(),
             dirty_superblock: None,
+            track_published_pages: false,
+            published_page_updates: BTreeMap::new(),
+            storage_metrics: StorageMetrics::default(),
             broken: None,
             fault_injector,
         };
@@ -408,6 +430,27 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
 
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    pub(crate) fn enable_published_page_tracking(&mut self) {
+        self.track_published_pages = true;
+    }
+
+    pub(crate) fn take_published_page_updates(&mut self) -> BTreeMap<PageId, PageData> {
+        std::mem::take(&mut self.published_page_updates)
+    }
+
+    pub(crate) fn degraded_reason(&self) -> Option<&str> {
+        self.broken.as_deref()
+    }
+
+    pub(crate) fn add_validation_time(&mut self, nanos: u64) {
+        self.storage_metrics.validation_nanos =
+            self.storage_metrics.validation_nanos.saturating_add(nanos);
+    }
+
+    pub fn storage_metrics(&self) -> StorageMetrics {
+        self.storage_metrics.clone()
     }
 
     pub fn wal_metrics(&self) -> Result<Option<WalMetrics>> {
@@ -495,6 +538,71 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         self.publish_prepared(prepared)
     }
 
+    /// Commits one optimistic point-key transaction as one logical commit.
+    pub fn transact(&mut self, request: TransactionRequest) -> Result<TransactionResult> {
+        let mut results = self.apply_transaction_group(std::slice::from_ref(&request))?;
+        results
+            .pop()
+            .ok_or_else(|| Error::invariant("transaction group returned no result"))?
+    }
+
+    /// Commits candidates in coordinator order. Accepted candidates are
+    /// staged serially, so later validation sees earlier accepted writes, but
+    /// no staged state is published until the WAL group is durable.
+    pub fn apply_transaction_group(
+        &mut self,
+        requests: &[TransactionRequest],
+    ) -> Result<Vec<Result<TransactionResult>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut overlay = Overlay::new(self);
+        let mut prepared = Vec::new();
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let preparation_started = Instant::now();
+            match overlay.prepare_transaction(request) {
+                Ok(candidate) => {
+                    let commit_lsn = candidate
+                        .commit_lsn
+                        .ok_or_else(|| Error::invariant("transaction has no commit LSN"))?;
+                    prepared.push(candidate);
+                    results.push(Ok(TransactionResult { commit_lsn }));
+                }
+                Err(error @ Error::Conflict(_))
+                | Err(error @ Error::InvalidRequest(_))
+                | Err(error @ Error::InvalidInput(_)) => {
+                    results.push(Err(error));
+                }
+                Err(error) => return Err(error),
+            }
+            overlay.store.storage_metrics.btree_preparation_nanos = overlay
+                .store
+                .storage_metrics
+                .btree_preparation_nanos
+                .saturating_add(elapsed_nanos(preparation_started));
+        }
+
+        if prepared.is_empty() {
+            return Ok(results);
+        }
+        self.publish_prepared_group(prepared)?;
+        Ok(results)
+    }
+
+    /// Reads a set of point keys from one committed coordinator state. The
+    /// output preserves the caller's input order.
+    pub fn transact_get(&mut self, keys: &[DocumentKey]) -> Result<Vec<RevisionState>> {
+        if let Some(message) = &self.broken {
+            return Err(Error::durability(format!(
+                "storage shard is not serving after an uncertain persistence failure: {message}"
+            )));
+        }
+        let mut overlay = Overlay::new(self);
+        keys.iter().map(|key| overlay.get_state(key)).collect()
+    }
+
     pub fn prepare_batch(&mut self, requests: &[BatchRequest]) -> Result<PreparedBatch> {
         let mut overlay = Overlay::new(self);
         let mut responses = Vec::with_capacity(requests.len());
@@ -508,73 +616,95 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
     /// after-image commit before changing the committed view. Data pages are
     /// retained as dirty committed images until [`Self::flush`] is called.
     pub fn publish_prepared(&mut self, prepared: PreparedBatch) -> Result<Vec<BatchResponse>> {
+        let responses = prepared.responses.clone();
+        self.publish_prepared_group(vec![prepared])?;
+        Ok(responses)
+    }
+
+    fn publish_prepared_group(&mut self, prepared: Vec<PreparedBatch>) -> Result<()> {
         if let Some(message) = &self.broken {
             return Err(Error::durability(format!(
                 "storage shard is not serving after an uncertain persistence failure: {message}"
             )));
         }
-        if prepared.base_generation != self.current_superblock.generation {
-            return Err(Error::Conflict(
-                "prepared batch was based on an older superblock generation".to_owned(),
-            ));
+
+        let mut expected_generation = self.current_superblock.generation;
+        for candidate in &prepared {
+            if candidate.base_generation != expected_generation {
+                return Err(Error::invariant(
+                    "prepared transaction group has a non-contiguous superblock generation",
+                ));
+            }
+            expected_generation = candidate.new_superblock.generation;
         }
-        if prepared.changed_pages.is_empty() {
-            return Ok(prepared.responses);
+
+        if prepared
+            .iter()
+            .all(|candidate| candidate.changed_pages.is_empty())
+        {
+            return Ok(());
         }
-        let superblock_bytes = encode_superblock(&prepared.new_superblock)?;
-        let mut changed_pages = prepared.changed_pages;
-        let wal_commit = if let Some(wal) = self.wal.as_mut() {
-            let commit_lsn = prepared
-                .commit_lsn
-                .ok_or_else(|| Error::invariant("WAL batch has no commit LSN"))?;
-            let mut images = changed_pages
-                .iter()
-                .map(|(page_id, image)| WalPageImage {
-                    page_id: *page_id,
-                    image: *image,
-                })
-                .collect::<Vec<_>>();
-            images.push(WalPageImage {
-                page_id: match prepared.new_slot {
-                    SuperblockSlot::A => PageId::ZERO,
-                    SuperblockSlot::B => PageId::new(1),
-                },
-                image: superblock_bytes,
-            });
-            match wal.append_commit(
-                prepared.batch_id,
-                commit_lsn,
-                &images,
-                self.fault_injector.as_deref_mut(),
-            ) {
-                Ok(report) => Some(report),
-                Err(error) => {
-                    self.broken = Some(error.to_string());
-                    return Err(error);
-                }
+
+        let mut encoded_superblocks = Vec::with_capacity(prepared.len());
+        let mut wal_commits = Vec::with_capacity(prepared.len());
+        for candidate in &prepared {
+            let superblock_bytes = encode_superblock(&candidate.new_superblock)?;
+            if self.wal.is_some() {
+                let commit_lsn = candidate
+                    .commit_lsn
+                    .ok_or_else(|| Error::invariant("WAL transaction has no commit LSN"))?;
+                let mut images = candidate
+                    .changed_pages
+                    .iter()
+                    .map(|(page_id, image)| WalPageImage {
+                        page_id: *page_id,
+                        image: *image,
+                    })
+                    .collect::<Vec<_>>();
+                images.push(WalPageImage {
+                    page_id: match candidate.new_slot {
+                        SuperblockSlot::A => PageId::ZERO,
+                        SuperblockSlot::B => PageId::new(1),
+                    },
+                    image: superblock_bytes,
+                });
+                wal_commits.push(WalCommit {
+                    batch_id: candidate.batch_id,
+                    commit_lsn,
+                    pages: images,
+                });
+            }
+            encoded_superblocks.push(superblock_bytes);
+        }
+
+        if let Some(wal) = self.wal.as_mut() {
+            if let Err(error) = wal.append_group(&wal_commits, self.fault_injector.as_deref_mut()) {
+                self.broken = Some(error.to_string());
+                return Err(error);
             }
         } else {
-            let target_length = prepared
-                .high_water_page_id
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::invalid_input("database page id is exhausted"))?
-                .checked_mul(PAGE_SIZE as u64)
-                .ok_or_else(|| Error::invalid_input("database file length overflows"))?;
-            if self.file.len()? < target_length {
-                self.file.set_len(target_length)?;
+            for (candidate, superblock_bytes) in prepared.iter().zip(&encoded_superblocks) {
+                let target_length = candidate
+                    .high_water_page_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invalid_input("database page id is exhausted"))?
+                    .checked_mul(PAGE_SIZE as u64)
+                    .ok_or_else(|| Error::invalid_input("database file length overflows"))?;
+                if self.file.len()? < target_length {
+                    self.file.set_len(target_length)?;
+                }
+                for (page_id, bytes) in &candidate.changed_pages {
+                    write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, bytes)?;
+                }
+                let superblock_offset = match candidate.new_slot {
+                    SuperblockSlot::A => SUPERBLOCK_A_OFFSET,
+                    SuperblockSlot::B => SUPERBLOCK_B_OFFSET,
+                };
+                write_all_at(&mut self.file, superblock_offset, superblock_bytes)?;
+                self.file.sync_data()?;
             }
-            for (page_id, bytes) in &changed_pages {
-                write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, bytes)?;
-            }
-            let superblock_offset = match prepared.new_slot {
-                SuperblockSlot::A => SUPERBLOCK_A_OFFSET,
-                SuperblockSlot::B => SUPERBLOCK_B_OFFSET,
-            };
-            write_all_at(&mut self.file, superblock_offset, &superblock_bytes)?;
-            self.file.sync_data()?;
-            None
-        };
+        }
 
         if let Some(injector) = self.fault_injector.as_deref_mut()
             && let Err(error) = injector.hit("before_publish")
@@ -583,33 +713,47 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             return Err(error);
         }
 
-        self.current_superblock = crate::decode_superblock(&superblock_bytes)?;
-        self.active_slot = prepared.new_slot;
-        self.root_page_id = prepared.root_page_id;
-        self.free_list_head = prepared.free_list_head;
-        self.high_water_page_id = prepared.high_water_page_id;
-        self.next_revision = prepared.next_revision;
-        if let Some(report) = wal_commit {
-            self.next_lsn = Lsn::new(
-                report
-                    .commit_lsn
-                    .get()
+        let publication_started = Instant::now();
+        for (candidate, superblock_bytes) in prepared.into_iter().zip(encoded_superblocks) {
+            self.current_superblock = crate::decode_superblock(&superblock_bytes)?;
+            self.active_slot = candidate.new_slot;
+            self.root_page_id = candidate.root_page_id;
+            self.free_list_head = candidate.free_list_head;
+            self.high_water_page_id = candidate.high_water_page_id;
+            self.next_revision = candidate.next_revision;
+            if let Some(commit_lsn) = candidate.commit_lsn {
+                self.next_lsn = Lsn::new(
+                    commit_lsn
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+                );
+                self.next_batch_id = candidate
+                    .batch_id
                     .checked_add(1)
-                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
-            );
-            self.next_batch_id = self
-                .next_batch_id
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("WAL batch ID exhausted"))?;
-            self.dirty_pages.append(&mut changed_pages);
-            self.dirty_superblock = Some(superblock_bytes);
+                    .ok_or_else(|| Error::invariant("WAL batch ID exhausted"))?;
+                self.dirty_pages.extend(candidate.changed_pages);
+                self.dirty_superblock = Some(superblock_bytes);
+            }
+            self.cache.insert_many(candidate.read_pages);
+            if self.track_published_pages {
+                self.published_page_updates.extend(
+                    candidate
+                        .changed_decoded
+                        .iter()
+                        .map(|(page_id, page)| (*page_id, page.clone())),
+                );
+            }
+            self.cache.insert_many(candidate.changed_decoded);
         }
-        self.cache.insert_many(prepared.read_pages);
-        self.cache.insert_many(prepared.changed_decoded);
+        self.storage_metrics.publication_nanos = self
+            .storage_metrics
+            .publication_nanos
+            .saturating_add(elapsed_nanos(publication_started));
         if let Some(injector) = self.fault_injector.as_deref_mut() {
             injector.hit("after_publish")?;
         }
-        Ok(prepared.responses)
+        Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -774,6 +918,9 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             config,
             dirty_pages: BTreeMap::new(),
             dirty_superblock: None,
+            track_published_pages: false,
+            published_page_updates: BTreeMap::new(),
+            storage_metrics: StorageMetrics::default(),
             broken: None,
             fault_injector: None,
         })
@@ -810,21 +957,37 @@ struct Overlay<'a, F: DurableFile, W: DurableFile> {
     high_water_page_id: PageId,
     next_revision: Revision,
     last_lsn: Option<Lsn>,
+    next_lsn: Lsn,
+    next_batch_id: u64,
+    current_superblock: Superblock,
+    active_slot: SuperblockSlot,
 }
 
 impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
     fn new(store: &'a mut BTreeStore<F, W>) -> Self {
+        let root_page_id = store.root_page_id;
+        let free_list_head = store.free_list_head;
+        let high_water_page_id = store.high_water_page_id;
+        let next_revision = store.next_revision;
+        let next_lsn = store.next_lsn;
+        let next_batch_id = store.next_batch_id;
+        let current_superblock = store.current_superblock.clone();
+        let active_slot = store.active_slot;
         Self {
-            root_page_id: store.root_page_id,
-            free_list_head: store.free_list_head,
-            high_water_page_id: store.high_water_page_id,
-            next_revision: store.next_revision,
+            root_page_id,
+            free_list_head,
+            high_water_page_id,
+            next_revision,
             store,
             pages: BTreeMap::new(),
             dirty: BTreeSet::new(),
             read_pages: BTreeMap::new(),
             allocated: HashSet::new(),
             last_lsn: None,
+            next_lsn,
+            next_batch_id,
+            current_superblock,
+            active_slot,
         }
     }
 
@@ -849,6 +1012,156 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
                 self.scan(exclusive_after_key.as_ref(), *limit)?,
             )),
         }
+    }
+
+    fn validate_transaction_mutation(&self, mutation: &TransactionMutation) -> Result<()> {
+        match mutation {
+            TransactionMutation::Put { key, value } => {
+                self.validate_value(value)?;
+                validate_encoded_key(&key.encode())?;
+            }
+            TransactionMutation::Delete { key } => {
+                validate_encoded_key(&key.encode())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_transaction(&mut self, request: &TransactionRequest) -> Result<PreparedBatch> {
+        let validation_started = Instant::now();
+        request.validate()?;
+        for mutation in &request.mutations {
+            self.validate_transaction_mutation(mutation)?;
+        }
+        for condition in &request.conditions {
+            let actual = self.get_state(condition.key())?;
+            let satisfied = match condition {
+                TransactionCondition::RevisionEquals {
+                    expected_revision, ..
+                } => actual.revision() == *expected_revision,
+                TransactionCondition::Exists { .. } => !actual.is_missing(),
+                TransactionCondition::NotExists { .. } => actual.is_missing(),
+            };
+            if !satisfied {
+                self.store
+                    .add_validation_time(elapsed_nanos(validation_started));
+                return Err(Error::conflict(TransactionConflict {
+                    key: condition.key().clone(),
+                    expected: condition.expectation(),
+                    actual,
+                }));
+            }
+        }
+        self.store
+            .add_validation_time(elapsed_nanos(validation_started));
+
+        for mutation in &request.mutations {
+            match mutation {
+                TransactionMutation::Put { key, value } => {
+                    self.put(key, value)?;
+                }
+                TransactionMutation::Delete { key } => {
+                    self.delete(key)?;
+                }
+            }
+        }
+        self.finish_transaction()
+    }
+
+    fn finish_transaction(&mut self) -> Result<PreparedBatch> {
+        let provisional_lsn = self
+            .last_lsn
+            .ok_or_else(|| Error::invariant("transaction has no provisional revision"))?;
+        let base_generation = self.current_superblock.generation;
+        let commit_lsn = if self.store.wal.is_some() {
+            let image_count = self
+                .dirty
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL image count overflow"))?;
+            Lsn::new(
+                self.next_lsn
+                    .get()
+                    .checked_add(image_count as u64)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            )
+        } else {
+            provisional_lsn
+        };
+
+        for page_id in &self.dirty {
+            self.pages
+                .get_mut(page_id)
+                .ok_or_else(|| Error::invariant("dirty page missing from overlay"))?
+                .restamp(Revision::from(provisional_lsn), commit_lsn);
+        }
+
+        let new_superblock = {
+            let candidate = Superblock {
+                generation: base_generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("superblock generation exhausted"))?,
+                root_page_id: Some(self.root_page_id),
+                free_list_head: self.free_list_head,
+                high_water_page_id: Some(self.high_water_page_id),
+                checkpoint_lsn: self.current_superblock.checkpoint_lsn,
+                ..self.current_superblock.clone()
+            };
+            decode_superblock(&encode_superblock(&candidate)?)?
+        };
+        let new_slot = match self.active_slot {
+            SuperblockSlot::A => SuperblockSlot::B,
+            SuperblockSlot::B => SuperblockSlot::A,
+        };
+        let mut changed_pages = BTreeMap::new();
+        let mut changed_decoded = BTreeMap::new();
+        for page_id in &self.dirty {
+            let page = self
+                .pages
+                .get(page_id)
+                .ok_or_else(|| Error::invariant("dirty page missing from overlay"))?;
+            changed_pages.insert(*page_id, page.encode(*page_id)?);
+            changed_decoded.insert(*page_id, page.clone());
+        }
+        let read_pages = std::mem::take(&mut self.read_pages);
+        let next_revision = Revision::new(
+            commit_lsn
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("storage revision exhausted"))?,
+        );
+        let prepared = PreparedBatch {
+            responses: Vec::new(),
+            changed_pages,
+            changed_decoded,
+            read_pages,
+            new_superblock: new_superblock.clone(),
+            new_slot,
+            base_generation,
+            next_revision,
+            root_page_id: self.root_page_id,
+            free_list_head: self.free_list_head,
+            high_water_page_id: self.high_water_page_id,
+            commit_lsn: Some(commit_lsn),
+            batch_id: self.next_batch_id,
+        };
+
+        self.current_superblock = new_superblock;
+        self.active_slot = new_slot;
+        self.next_revision = next_revision;
+        self.next_lsn = Lsn::new(
+            commit_lsn
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+        );
+        self.next_batch_id = self
+            .next_batch_id
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("WAL batch ID exhausted"))?;
+        self.dirty.clear();
+        self.last_lsn = None;
+        Ok(prepared)
     }
 
     fn finish(self, responses: Vec<BatchResponse>) -> Result<PreparedBatch> {
@@ -1786,6 +2099,10 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
         position += count;
     }
     Ok(())
+}
+
+fn elapsed_nanos(started: Instant) -> u64 {
+    started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX)
 }
 
 fn validate_encoded_key(key: &[u8]) -> Result<()> {

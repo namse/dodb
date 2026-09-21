@@ -4,7 +4,9 @@ use std::fmt;
 #[derive(Debug)]
 pub enum Error {
     InvalidInput(String),
-    Conflict(String),
+    InvalidRequest(String),
+    Overloaded(String),
+    Conflict(crate::transaction::TransactionConflict),
     Corruption(String),
     Io(std::io::Error),
     UnsupportedFormat(String),
@@ -22,6 +24,18 @@ impl Error {
 
     pub fn corruption(message: impl Into<String>) -> Self {
         Self::Corruption(message.into())
+    }
+
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::InvalidRequest(message.into())
+    }
+
+    pub fn overloaded(message: impl Into<String>) -> Self {
+        Self::Overloaded(message.into())
+    }
+
+    pub fn conflict(conflict: crate::transaction::TransactionConflict) -> Self {
+        Self::Conflict(conflict)
     }
 
     pub fn unsupported_format(message: impl Into<String>) -> Self {
@@ -45,7 +59,9 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidInput(message) => write!(formatter, "invalid input: {message}"),
-            Self::Conflict(message) => write!(formatter, "conflict: {message}"),
+            Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
+            Self::Overloaded(message) => write!(formatter, "overloaded: {message}"),
+            Self::Conflict(conflict) => write!(formatter, "conflict: {conflict}"),
             Self::Corruption(message) => write!(formatter, "corruption: {message}"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
             Self::UnsupportedFormat(message) => write!(formatter, "unsupported format: {message}"),
