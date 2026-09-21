@@ -1,0 +1,8 @@
+[package]
+name = "dodb-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dodb-core = { path = "../dodb-core" }

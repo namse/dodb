@@ -6,7 +6,9 @@ adds a checked single-file B+Tree storage engine for one shard. Phase 2 adds
 the redo-only WAL and crash recovery. Phase 3 adds optimistic same-shard
 point-key transactions and WAL group commit.
 Phase 5 adds formal checkpoints, WAL reclamation, local physical snapshots,
-and validated restore.
+and validated restore. Phase 6 adds the bounded raw QUIC application protocol,
+the transport-independent service boundary, the local tenant/shard service,
+and the first-party Rust client.
 
 The planned v1 deployment is one compute process with one file per shard. A
 tenant may later span multiple shards, so `TenantId` and `ShardId` remain
@@ -23,10 +25,24 @@ separate types and routing stays outside the physical document key.
   facade with the Phase 4 committed-read lane and single-writer coordinator.
 - `dodb-testkit`: deterministic volatile/durable file simulation, named crash
   points, and the simple reference database/transaction oracle.
+- `dodb-service`: storage-independent request/response values and the
+  asynchronous `DodbService` boundary used by transports and test doubles.
+- `dodb-protocol`: the versioned big-endian binary frame codec and stable
+  application error mapping. It depends on `dodb-core` and `dodb-service`,
+  but not on storage or QUIC.
+- `dodb-client`: the async Rust client. It depends on `dodb-core`,
+  `dodb-service`, `dodb-protocol`, Quinn, and Tokio, and owns one reusable
+  QUIC connection per client.
+- `dodb-server`: the Quinn transport, TLS configuration, bounded stream
+  execution, metrics, and local `TenantId -> ShardId -> AsyncShard` service.
+  It depends on `dodb-core`, `dodb-service`, `dodb-protocol`, and
+  `dodb-storage`.
 
-Phase 5 remains local to one physical shard. It does not add replication,
-remote object storage, public PITR, distributed checkpoints, or a network
-endpoint.
+Phase 5 remains local to one physical shard. Phase 6 keeps the same local
+durability boundary: network requests never expose pages, WAL records, LSN
+frames, superblocks, checkpoints, or snapshots. There is no replication,
+remote object storage, public PITR, distributed checkpoint, authentication,
+tenant authorization, or distributed routing.
 
 The Phase 1 engine is a mutable fixed-4KiB slotted-page B+Tree with inline
 small values and overflow pages. Phase 2 adds a separate redo-only full-page

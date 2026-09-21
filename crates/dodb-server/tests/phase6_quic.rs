@@ -1,0 +1,379 @@
+use std::sync::Arc;
+
+use dodb_client::{ClientError, ClientTlsConfig, DodbClient};
+use dodb_core::{
+    ConditionExpectation, DocumentKey, Revision, RevisionState, TenantId, TransactionCondition,
+    TransactionMutation, TransactionRequest,
+};
+use dodb_server::{
+    DodbServer, DodbServerConfig, LocalTenantService, LocalTenantServiceConfig, ServerTlsConfig,
+};
+use dodb_service::TransactionOutcome;
+use quinn::rustls::pki_types::CertificateDer;
+use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
+use rcgen::generate_simple_self_signed;
+
+struct TestTls {
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
+}
+
+fn test_tls() -> TestTls {
+    let certified = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    TestTls {
+        certificate: certified.cert.der().to_vec(),
+        private_key: certified.signing_key.serialize_der(),
+    }
+}
+
+async fn start_server(
+    data_dir: std::path::PathBuf,
+    tls: &TestTls,
+) -> (
+    Arc<DodbServer<LocalTenantService>>,
+    tokio::task::JoinHandle<Result<(), dodb_server::ServerError>>,
+) {
+    let service = Arc::new(
+        LocalTenantService::new(LocalTenantServiceConfig {
+            data_dir,
+            ..LocalTenantServiceConfig::default()
+        })
+        .unwrap(),
+    );
+    let server = Arc::new(
+        DodbServer::bind(
+            service,
+            DodbServerConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                tls: ServerTlsConfig::from_der(
+                    vec![tls.certificate.clone()],
+                    tls.private_key.clone(),
+                )
+                .unwrap(),
+                protocol_limits: dodb_protocol::ProtocolLimits::default(),
+                max_connections: 8,
+                max_concurrent_streams: 64,
+            },
+        )
+        .unwrap(),
+    );
+    let task_server = Arc::clone(&server);
+    let task = tokio::spawn(async move { task_server.run().await });
+    (server, task)
+}
+
+async fn connect_client(
+    server: &DodbServer<LocalTenantService>,
+    tls: &TestTls,
+    tenant: TenantId,
+) -> DodbClient {
+    DodbClient::connect(
+        "0.0.0.0:0".parse().unwrap(),
+        server.local_addr().unwrap(),
+        "localhost",
+        tenant,
+        ClientTlsConfig::from_der(vec![tls.certificate.clone()]).unwrap(),
+        dodb_protocol::ProtocolLimits::default(),
+    )
+    .await
+    .unwrap()
+}
+
+fn key(pk: &[u8], sk: &[u8]) -> DocumentKey {
+    DocumentKey::new(pk.to_vec(), sk.to_vec())
+}
+
+async fn stop_server(
+    client: DodbClient,
+    server: Arc<DodbServer<LocalTenantService>>,
+    task: tokio::task::JoinHandle<Result<(), dodb_server::ServerError>>,
+) {
+    client.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+async fn abruptly_disconnect(
+    server: &DodbServer<LocalTenantService>,
+    tls: &TestTls,
+    request: Option<dodb_service::Request>,
+) {
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(tls.certificate.clone()))
+        .unwrap();
+    endpoint.set_default_client_config(
+        QuinnClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+    );
+    let connection = endpoint
+        .connect(server.local_addr().unwrap(), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _receive) = connection.open_bi().await.unwrap();
+    if let Some(request) = request {
+        let frame = dodb_protocol::encode_request(
+            TenantId::new(91),
+            &request,
+            dodb_protocol::ProtocolLimits::default(),
+        )
+        .unwrap();
+        send.write_all(&frame).await.unwrap();
+        send.finish().unwrap();
+    }
+    connection.close(quinn::VarInt::from_u32(0), b"abrupt test disconnect");
+    endpoint.close(quinn::VarInt::from_u32(0), b"abrupt test disconnect");
+}
+
+#[tokio::test]
+async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+    let tenant = TenantId::new(41);
+    let client = connect_client(&server, &tls, tenant).await;
+    let missing_key = key(&[], &[0xff]);
+
+    assert_eq!(
+        client.get(missing_key.clone()).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    assert!(
+        client
+            .query(dodb_core::PrimaryKey::new(Vec::new()), None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(client.scan(None, 10).await.unwrap().is_empty());
+    assert_eq!(
+        client
+            .transact_get(vec![missing_key.clone()])
+            .await
+            .unwrap(),
+        vec![RevisionState::missing(Revision::ZERO)]
+    );
+    let condition_only = client
+        .transact(TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: missing_key.clone(),
+                expected_revision: Revision::ZERO,
+            }],
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(condition_only, TransactionOutcome::conditions_satisfied());
+    assert!(
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+
+    let first_revision = client
+        .put(missing_key.clone(), vec![0, 0xff, 1])
+        .await
+        .unwrap();
+    assert!(first_revision > Revision::ZERO);
+    assert_eq!(
+        client.get(missing_key.clone()).await.unwrap(),
+        RevisionState::present(vec![0, 0xff, 1], first_revision)
+    );
+    let second_key = key(&[1], &[2]);
+    let batch = client
+        .batch(vec![
+            TransactionMutation::Put {
+                key: second_key.clone(),
+                value: vec![3, 4],
+            },
+            TransactionMutation::Delete {
+                key: key(&[5], &[6]),
+            },
+        ])
+        .await
+        .unwrap();
+    assert!(batch.commit_lsn.is_some());
+    let rows = client
+        .query(dodb_core::PrimaryKey::new(vec![1]), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value, vec![3, 4]);
+    assert_eq!(client.scan(None, 10).await.unwrap().len(), 2);
+
+    let transaction = client
+        .transact(TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: missing_key.clone(),
+                expected_revision: first_revision,
+            }],
+            vec![TransactionMutation::Put {
+                key: missing_key.clone(),
+                value: vec![9],
+            }],
+        ))
+        .await
+        .unwrap();
+    assert!(transaction.commit_lsn.is_some());
+    let conflict = client
+        .transact(TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: missing_key.clone(),
+                expected_revision: first_revision,
+            }],
+            vec![TransactionMutation::Delete {
+                key: missing_key.clone(),
+            }],
+        ))
+        .await
+        .unwrap_err();
+    match conflict {
+        ClientError::Application(error) => {
+            assert_eq!(error.kind, dodb_protocol::ApplicationErrorKind::Conflict);
+            assert_eq!(
+                error.conflict.as_ref().unwrap().expected,
+                ConditionExpectation::RevisionEquals(first_revision)
+            );
+        }
+        other => panic!("unexpected conflict error: {other}"),
+    }
+
+    let deleted_revision = client.delete(missing_key.clone()).await.unwrap();
+    let aba_conflict = client
+        .transact(TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: missing_key.clone(),
+                expected_revision: Revision::ZERO,
+            }],
+            vec![TransactionMutation::Put {
+                key: missing_key,
+                value: vec![10],
+            }],
+        ))
+        .await
+        .unwrap_err();
+    match aba_conflict {
+        ClientError::Application(error) => {
+            let conflict = error.conflict.as_ref().unwrap();
+            assert_eq!(conflict.actual, RevisionState::missing(deleted_revision));
+        }
+        other => panic!("unexpected ABA error: {other}"),
+    }
+
+    stop_server(client, server, task).await;
+}
+
+#[tokio::test]
+async fn concurrent_streams_and_tenant_isolation_are_preserved() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+    let first_client = connect_client(&server, &tls, TenantId::new(1)).await;
+    let second_client = connect_client(&server, &tls, TenantId::new(2)).await;
+    let shared_key = key(&[7], &[8]);
+    let mut write_tasks = Vec::new();
+    for value in 0..16u8 {
+        let client = first_client.clone();
+        let key = shared_key.clone();
+        write_tasks.push(tokio::spawn(
+            async move { client.put(key, vec![value]).await },
+        ));
+    }
+    for task in write_tasks {
+        task.await.unwrap().unwrap();
+    }
+    let mut read_tasks = Vec::new();
+    for _ in 0..64 {
+        let client = first_client.clone();
+        let key = shared_key.clone();
+        read_tasks.push(tokio::spawn(async move { client.get(key).await }));
+    }
+    for task in read_tasks {
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            RevisionState::Present { .. }
+        ));
+    }
+    assert_eq!(
+        second_client.get(shared_key).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    assert_eq!(
+        first_client
+            .transact_get(vec![key(&[7], &[8])])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    stop_server(first_client, server, task).await;
+    second_client.close();
+}
+
+#[tokio::test]
+async fn persisted_state_is_available_after_server_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let tenant = TenantId::new(55);
+    let persisted_key = key(&[0, 1], &[2, 3]);
+    {
+        let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+        let client = connect_client(&server, &tls, tenant).await;
+        client
+            .put(persisted_key.clone(), vec![4, 5, 6])
+            .await
+            .unwrap();
+        stop_server(client, server, task).await;
+    }
+    {
+        let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+        let client = connect_client(&server, &tls, tenant).await;
+        assert_eq!(
+            client.get(persisted_key).await.unwrap().value(),
+            Some(&[4, 5, 6][..])
+        );
+        stop_server(client, server, task).await;
+    }
+}
+
+#[tokio::test]
+async fn abrupt_disconnects_do_not_trigger_implicit_mutation_retries() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+    let tenant = TenantId::new(91);
+    let key = key(&[1], &[2]);
+
+    abruptly_disconnect(&server, &tls, None).await;
+    abruptly_disconnect(
+        &server,
+        &tls,
+        Some(dodb_service::Request::Get { key: key.clone() }),
+    )
+    .await;
+    let client = connect_client(&server, &tls, tenant).await;
+    assert_eq!(
+        client.get(key.clone()).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    client.close();
+
+    abruptly_disconnect(
+        &server,
+        &tls,
+        Some(dodb_service::Request::Put {
+            key: key.clone(),
+            value: vec![8, 9],
+        }),
+    )
+    .await;
+    let reconnect = connect_client(&server, &tls, tenant).await;
+    let state = reconnect.get(key).await.unwrap();
+    match state {
+        RevisionState::Missing { .. } => {}
+        RevisionState::Present { value, .. } => assert_eq!(value, vec![8, 9]),
+    }
+    stop_server(reconnect, server, task).await;
+}

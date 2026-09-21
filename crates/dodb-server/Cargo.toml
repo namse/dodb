@@ -1,0 +1,20 @@
+[package]
+name = "dodb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dodb-core = { path = "../dodb-core" }
+dodb-protocol = { path = "../dodb-protocol" }
+dodb-service = { path = "../dodb-service" }
+dodb-storage = { path = "../dodb-storage" }
+quinn.workspace = true
+rustls-pemfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+dodb-client = { path = "../dodb-client" }
+quinn.workspace = true
+rcgen = "0.14"
+tempfile = "3"

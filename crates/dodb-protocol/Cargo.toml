@@ -1,0 +1,12 @@
+[package]
+name = "dodb-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dodb-core = { path = "../dodb-core" }
+dodb-service = { path = "../dodb-service" }
+
+[dev-dependencies]
+proptest.workspace = true
