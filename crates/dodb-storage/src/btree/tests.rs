@@ -4,6 +4,7 @@ use dodb_core::{
 };
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::{SnapshotManifest, restore_snapshot, validate_snapshot};
 
@@ -381,6 +382,117 @@ async fn async_checkpoint_is_fifo_and_reads_remain_available() {
     shard.close().await.unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_shard_groups_mutations_around_transact_get_barriers() {
+    let store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let shard = AsyncShard::start_with_config(
+        store,
+        CoordinatorConfig {
+            max_collection_delay: Duration::from_millis(10),
+            ..CoordinatorConfig::default()
+        },
+    );
+    let first_key = key(b"barrier", b"first");
+    let second_key = key(b"barrier", b"second");
+    let third_key = key(b"barrier", b"third");
+    let first = shard.execute(BatchRequest::Put {
+        key: first_key.clone(),
+        value: b"first".to_vec(),
+    });
+    let second = shard.execute(BatchRequest::Put {
+        key: second_key.clone(),
+        value: b"second".to_vec(),
+    });
+    let barrier = shard.transact_get(vec![first_key.clone(), second_key.clone()]);
+    let third = shard.execute(BatchRequest::Put {
+        key: third_key.clone(),
+        value: b"third".to_vec(),
+    });
+    let (first, second, barrier, third) = tokio::join!(first, second, barrier, third);
+    let BatchResponse::Put(first_revision) = first.unwrap() else {
+        panic!("expected first PUT response");
+    };
+    let BatchResponse::Put(second_revision) = second.unwrap() else {
+        panic!("expected second PUT response");
+    };
+    assert!(first_revision < second_revision);
+    assert_eq!(
+        barrier.unwrap(),
+        vec![
+            RevisionState::present(b"first", first_revision),
+            RevisionState::present(b"second", second_revision),
+        ]
+    );
+    let BatchResponse::Put(third_revision) = third.unwrap() else {
+        panic!("expected third PUT response");
+    };
+    assert!(second_revision < third_revision);
+    assert_eq!(
+        shard
+            .execute(BatchRequest::Get { key: third_key })
+            .await
+            .unwrap(),
+        BatchResponse::Get(RevisionState::present(b"third", third_revision))
+    );
+    assert_eq!(shard.wal_metrics().unwrap().wal_syncs, 3);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_shard_groups_mutations_around_checkpoint_barriers() {
+    let store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let shard = AsyncShard::start_with_config(
+        store,
+        CoordinatorConfig {
+            max_collection_delay: Duration::from_millis(10),
+            ..CoordinatorConfig::default()
+        },
+    );
+    let first_key = key(b"checkpoint-barrier", b"first");
+    let second_key = key(b"checkpoint-barrier", b"second");
+    let third_key = key(b"checkpoint-barrier", b"third");
+    let first = shard.execute(BatchRequest::Put {
+        key: first_key.clone(),
+        value: b"first".to_vec(),
+    });
+    let second = shard.execute(BatchRequest::Put {
+        key: second_key.clone(),
+        value: b"second".to_vec(),
+    });
+    let checkpoint = shard.checkpoint();
+    let third = shard.execute(BatchRequest::Put {
+        key: third_key.clone(),
+        value: b"third".to_vec(),
+    });
+    let (first, second, checkpoint, third) = tokio::join!(first, second, checkpoint, third);
+    let BatchResponse::Put(first_revision) = first.unwrap() else {
+        panic!("expected first PUT response");
+    };
+    let BatchResponse::Put(second_revision) = second.unwrap() else {
+        panic!("expected second PUT response");
+    };
+    assert!(first_revision < second_revision);
+    assert_eq!(
+        checkpoint.unwrap().checkpoint_lsn,
+        dodb_core::Lsn::new(second_revision.get())
+    );
+    let BatchResponse::Put(third_revision) = third.unwrap() else {
+        panic!("expected third PUT response");
+    };
+    assert!(second_revision < third_revision);
+    assert_eq!(
+        shard
+            .execute(BatchRequest::Get { key: third_key })
+            .await
+            .unwrap(),
+        BatchResponse::Get(RevisionState::present(b"third", third_revision))
+    );
+    assert_eq!(shard.wal_metrics().unwrap().wal_syncs, 4);
+    shard.close().await.unwrap();
+}
+
 #[test]
 fn wal_backed_store_reopens_from_committed_page_images() {
     let mut store =
@@ -410,6 +522,10 @@ fn checkpoint_flushes_state_resets_wal_and_preserves_lsn_monotonicity() {
         dodb_core::Lsn::new(first_revision.get())
     );
     assert!(report.pages_flushed > 0);
+    assert_eq!(
+        report.bytes_written,
+        report.pages_flushed as u64 * PAGE_SIZE as u64 + 2 * PAGE_SIZE as u64
+    );
     assert!(report.wal_bytes_reclaimed > 0);
     assert!(store.wal_metrics().unwrap().unwrap().wal_bytes < before);
     assert_eq!(

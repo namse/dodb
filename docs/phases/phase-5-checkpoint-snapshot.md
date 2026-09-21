@@ -27,7 +27,10 @@ checkpoint as its history start.
 `BTreeStore::checkpoint` is a synchronous local primitive. `AsyncShard` exposes
 the same operation through its bounded FIFO coordinator. A checkpoint operation
 is ordered after already admitted mutations; mutations admitted after it stay
-behind it. Ordinary immutable reads continue through the committed read view.
+behind it. Collected mutations before and after `TransactGet`, `Checkpoint`, or
+`Snapshot` barriers are committed as separate physical groups, and responses
+for a completed group are released before a later barrier runs. Ordinary
+immutable reads continue through the committed read view.
 
 The checkpoint chooses the last durable WAL commit LSN, or the current
 checkpoint LSN when there is no later commit. It rejects a decreasing boundary,
@@ -38,8 +41,11 @@ LSN, syncs that metadata, runs the invariant checker, and only then resets the
 WAL.
 
 The checkpoint report contains the LSN, page count, bytes written, reclaimed
-WAL bytes, and elapsed time. Repeated checkpoints with no writes do not move
-the boundary or rewrite the WAL unnecessarily.
+WAL bytes, and elapsed time. `bytes_written` counts every dirty data-page image
+and every superblock image written by the checkpoint, including the pre-existing
+dirty superblock and the new checkpoint metadata superblock. Repeated
+checkpoints with no writes do not move the boundary or rewrite the WAL
+unnecessarily.
 
 ## WAL reclamation and recovery
 
@@ -80,12 +86,21 @@ preserved on restore; tenant and shard identity remain separate fields.
 
 Snapshot creation uses a temporary sibling directory, copies and syncs the
 database, writes and syncs the manifest, validates the temporary directory with
-the normal superblock/page/B+Tree checker, and atomically renames it to the
-requested destination. A failed copy or validation removes the temporary
-artifact and does not alter the live database.
+the normal superblock/page/B+Tree checker, syncs the temporary directory
+metadata, and atomically renames it to the requested destination. The parent
+directory is synced after the rename. Restore uses the same file-sync, atomic
+rename, and parent-directory-sync ordering. Directory synchronization is
+explicitly supported only on platforms where the filesystem exposes a
+directory file descriptor; unsupported platforms return a snapshot error
+instead of claiming durable finalization. Temporary artifacts use unique
+process-local names, so stale artifacts from an interrupted attempt do not
+block a later operation. A failed copy or validation removes the temporary
+artifact on a best-effort basis and does not alter the live database.
 
 `validate_snapshot` checks manifest integrity, file size, whole-file checksum,
-identity, format, checkpoint metadata, and normal structural invariants.
+identity, format, checkpoint metadata, and normal structural invariants. The
+whole-file CRC32C is calculated with a bounded streaming buffer rather than a
+database-sized allocation.
 `restore_snapshot` requires a new destination path, validates the source,
 copies the database to a temporary file, syncs and validates it with the normal
 database codecs, and atomically installs the destination file.
@@ -98,16 +113,26 @@ database open/recovery.
 
 Named fault points cover checkpoint gate acquisition, data page writes and sync,
 alternate superblock writes and sync, WAL truncation, WAL initialization, WAL
-reset sync, snapshot creation/copy/sync/manifest/finalization, and restore
-copy/sync/finalization. Deterministic tests reopen after every checkpoint reset
-boundary and run the invariant checker.
+reset sync, snapshot creation/copy/sync/manifest/directory finalization, and
+restore copy/sync/directory finalization. If a reset leaves a prefix of the new
+INIT, recovery recognizes only a prefix of the expected identity-bearing INIT,
+reconstructs it from the durable checkpoint, and continues with LSNs greater
+than that checkpoint. A complete but corrupted record remains an error. Before
+initializing an empty WAL for an existing data file, open validates the data
+file identity, so a wrong-identity open cannot persistently modify the WAL.
+Deterministic tests reopen after every checkpoint reset boundary and run the
+invariant checker.
 
 The test suite includes:
 
 - checkpoint flush, metadata ordering, repeated checkpoint, and monotonic LSN tests;
+- checkpoint byte accounting including both written superblock images;
 - a deterministic checkpoint fault matrix using volatile/durable file state;
+- partial-persistence torn-INIT recovery tests at multiple frame boundaries;
 - real subprocess abrupt-termination tests at page, metadata, and WAL-reset boundaries;
 - snapshot copy failure cleanup and restore-copy failure cleanup;
+- unique stale-temporary-artifact and large streaming-validation tests;
+- FIFO coordinator grouping tests around transaction reads and checkpoints;
 - malformed manifest and corrupted database rejection;
 - snapshot-at-N plus compatible post-N WAL recovery;
 - deterministic randomized checkpoint/snapshot/restore differential testing against `ReferenceDb`.
@@ -118,8 +143,8 @@ local databases. One local run produced:
 
 | Rows | Checkpoint pause | Pages | Bytes | WAL reclaimed | Snapshot bytes | Copy | Validation | Restore |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | 25.8 ms | 4 | 20,480 | 284,784 | 24,576 | 14.2 ms | 0.9 ms | 8.9 ms |
-| 512 | 24.3 ms | 28 | 118,784 | 4,506,672 | 122,880 | 16.4 ms | 5.1 ms | 20.6 ms |
+| 32 | 25.8 ms | 4 | 24,576 | 284,784 | 24,576 | 14.2 ms | 0.9 ms | 8.9 ms |
+| 512 | 24.3 ms | 28 | 122,880 | 4,506,672 | 122,880 | 16.4 ms | 5.1 ms | 20.6 ms |
 
 These are local observations, not compatibility thresholds. The benchmark
 intentionally measures the portable full-copy pause rather than relying on

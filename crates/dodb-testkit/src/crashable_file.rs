@@ -164,6 +164,12 @@ impl CrashableFile {
         self.volatile = self.durable.clone();
     }
 
+    pub fn crash_with_persisted_prefix(&mut self, length: usize) {
+        let persisted_length = length.min(self.volatile.len());
+        self.durable = self.volatile[..persisted_length].to_vec();
+        self.volatile = self.durable.clone();
+    }
+
     fn fault(&mut self, operation: FileOperation) -> Result<Option<FaultAction>> {
         Ok(self.fault_plan.next_fault(operation))
     }
@@ -283,6 +289,15 @@ mod tests {
         file.crash();
         assert_eq!(file.volatile_bytes(), b"old");
         assert_eq!(file.durable_bytes(), b"old");
+    }
+
+    #[test]
+    fn crash_can_persist_a_prefix_of_unsynced_writes() {
+        let mut file = CrashableFile::new();
+        file.write_at(0, b"abcdef").unwrap();
+        file.crash_with_persisted_prefix(3);
+        assert_eq!(file.durable_bytes(), b"abc");
+        assert_eq!(file.volatile_bytes(), b"abc");
     }
 
     #[test]

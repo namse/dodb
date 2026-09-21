@@ -343,41 +343,63 @@ async fn coordinator<F: DurableFile + Send + 'static, W: DurableFile + Send + 's
             collection_nanos,
         );
 
-        let processing_started = Instant::now();
         let operations = requests
             .iter()
             .map(|request| request.operation.clone())
             .collect::<Vec<_>>();
-        let result = process_group(&mut store, &operations);
-        record_processing(
-            &shared.coordinator_metrics,
-            elapsed_nanos(processing_started),
-        );
-        if let Some(message) = store.degraded_reason() {
-            mark_read_view_broken(&shared.read_view, message);
-        }
-
-        let read_view_result = publish_read_updates(&shared.read_view, &mut store);
-        let result = match (result, read_view_result) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(error), Ok(())) => Err(error),
-            (_, Err(error)) => Err(error),
-        };
-        if let Ok(mut current) = shared.metrics.lock() {
-            *current = store.wal_metrics().ok().flatten();
-        }
-        if let Ok(mut current) = shared.storage_metrics.lock() {
-            *current = Some(store.storage_metrics());
-        }
-        match result {
-            Ok(responses) => {
-                for (queued, response) in requests.into_iter().zip(responses) {
-                    let _ = queued.response_tx.send(response);
-                }
+        let mut queued_requests = requests.into_iter().map(Some).collect::<Vec<_>>();
+        let mut operation_start = 0;
+        while operation_start < operations.len() {
+            let operation_end = if is_mutation(&operations[operation_start]) {
+                operations[operation_start..]
+                    .iter()
+                    .position(|operation| !is_mutation(operation))
+                    .map_or(operations.len(), |offset| operation_start + offset)
+            } else {
+                operation_start + 1
+            };
+            let processing_started = Instant::now();
+            let segment_result =
+                process_segment(&mut store, &operations[operation_start..operation_end]);
+            record_processing(
+                &shared.coordinator_metrics,
+                elapsed_nanos(processing_started),
+            );
+            if let Some(message) = store.degraded_reason() {
+                mark_read_view_broken(&shared.read_view, message);
             }
-            Err(error) => {
-                for queued in requests {
-                    let _ = queued.response_tx.send(Err(batch_error(&error)));
+
+            let read_view_result = publish_read_updates(&shared.read_view, &mut store);
+            let segment_result = match (segment_result, read_view_result) {
+                (Ok(result), Ok(())) => Ok(result),
+                (Err(error), Ok(())) => Err(error),
+                (_, Err(error)) => Err(error),
+            };
+            if let Ok(mut current) = shared.metrics.lock() {
+                *current = store.wal_metrics().ok().flatten();
+            }
+            if let Ok(mut current) = shared.storage_metrics.lock() {
+                *current = Some(store.storage_metrics());
+            }
+            match segment_result {
+                Ok(responses) => {
+                    for (queued, response) in queued_requests[operation_start..operation_end]
+                        .iter_mut()
+                        .zip(responses)
+                    {
+                        if let Some(queued) = queued.take() {
+                            let _ = queued.response_tx.send(response);
+                        }
+                    }
+                    operation_start = operation_end;
+                }
+                Err(error) => {
+                    for queued in &mut queued_requests[operation_start..] {
+                        if let Some(queued) = queued.take() {
+                            let _ = queued.response_tx.send(Err(batch_error(&error)));
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -469,7 +491,7 @@ fn can_add(
                 || current_bytes.saturating_add(request_bytes) <= config.max_group_bytes))
 }
 
-fn process_group<F: DurableFile, W: DurableFile>(
+fn process_segment<F: DurableFile, W: DurableFile>(
     store: &mut BTreeStore<F, W>,
     operations: &[CoordinatorOperation],
 ) -> Result<Vec<Result<CoordinatorResponse>>> {

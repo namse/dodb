@@ -175,6 +175,51 @@ fn wrong_wal_identity_is_rejected() {
 }
 
 #[test]
+fn wrong_identity_does_not_initialize_an_empty_wal_for_an_existing_database() {
+    let data_path = std::env::temp_dir().join(format!(
+        "dodb-phase2-empty-wal-identity-{}.db",
+        std::process::id()
+    ));
+    let wal_path = data_path.with_extension("wal");
+    let valid = DatabaseConfig {
+        database_uuid: [7; 16],
+        ..DatabaseConfig::default()
+    };
+    let store = BTreeStore::open_with_wal(
+        ProductionFile::open(&data_path).unwrap(),
+        ProductionFile::open(&wal_path).unwrap(),
+        valid.clone(),
+    )
+    .unwrap();
+    drop(store);
+    std::fs::remove_file(&wal_path).unwrap();
+    let database_before = std::fs::read(&data_path).unwrap();
+
+    let wrong = DatabaseConfig {
+        database_uuid: [8; 16],
+        ..valid.clone()
+    };
+    let result = BTreeStore::open_with_wal(
+        ProductionFile::open(&data_path).unwrap(),
+        ProductionFile::open(&wal_path).unwrap(),
+        wrong,
+    );
+    assert!(matches!(result, Err(Error::Corruption(_))));
+    assert_eq!(std::fs::read(&data_path).unwrap(), database_before);
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+
+    let mut reopened = BTreeStore::open_with_wal(
+        ProductionFile::open(&data_path).unwrap(),
+        ProductionFile::open(&wal_path).unwrap(),
+        valid,
+    )
+    .unwrap();
+    reopened.check_invariants().unwrap();
+    let _ = std::fs::remove_file(data_path);
+    let _ = std::fs::remove_file(wal_path);
+}
+
+#[test]
 fn repaired_database_page_uses_the_committed_wal_image() {
     let data_path =
         std::env::temp_dir().join(format!("dodb-phase2-page-repair-{}.db", std::process::id()));

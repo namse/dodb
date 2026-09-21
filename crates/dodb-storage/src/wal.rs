@@ -27,6 +27,7 @@ const PAYLOAD_CHECKSUM_OFFSET: usize = 44;
 const LEGACY_WAL_FORMAT_VERSION: u16 = 1;
 const LEGACY_INIT_PAYLOAD_SIZE: usize = 44;
 const INIT_PAYLOAD_SIZE: usize = 52;
+const INIT_FRAME_SIZE: usize = WAL_HEADER_SIZE + INIT_PAYLOAD_SIZE + WAL_TRAILER_SIZE;
 const PAGE_IMAGE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE;
 const COMMIT_PAYLOAD_SIZE: usize = 16;
 
@@ -180,33 +181,19 @@ impl<F: DurableFile> WalLog<F> {
     ) -> Result<Self> {
         let length = file.len()?;
         if length == 0 {
-            let next_lsn = start_after_lsn
-                .get()
-                .checked_add(1)
-                .map(Lsn::new)
-                .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
-            let mut wal = Self {
-                file,
-                identity,
-                format_version: WAL_FORMAT_VERSION,
-                next_lsn,
-                next_batch_id: 1,
-                history_start_lsn: start_after_lsn,
-                committed: Vec::new(),
-                scan_report: WalScanReport::default(),
-                sync_count: 0,
-                page_images: 0,
-                append_nanos: 0,
-                sync_nanos: 0,
-            };
-            let payload = wal.identity_payload(start_after_lsn);
-            wal.append_frame(WalRecordType::Init, Lsn::ZERO, 0, 0, &payload, &mut None)?;
-            wal.file
-                .sync_data()
-                .map_err(|error| Error::durability(format!("initial WAL sync failed: {error}")))?;
-            wal.sync_count = 1;
-            wal.scan_report.records_scanned = 1;
-            return Ok(wal);
+            return Self::initialize_empty(file, identity, start_after_lsn);
+        }
+        if usize::try_from(length)
+            .ok()
+            .is_some_and(|length| length < INIT_FRAME_SIZE)
+            && is_torn_initialization_prefix(&mut file, &identity, start_after_lsn, length)?
+        {
+            file.set_len(0)
+                .map_err(|error| Error::recovery(format!("WAL torn INIT reset failed: {error}")))?;
+            file.sync_data().map_err(|error| {
+                Error::durability(format!("WAL torn INIT reset sync failed: {error}"))
+            })?;
+            return Self::initialize_empty(file, identity, start_after_lsn);
         }
 
         let (
@@ -243,6 +230,36 @@ impl<F: DurableFile> WalLog<F> {
             append_nanos: 0,
             sync_nanos: 0,
         })
+    }
+
+    fn initialize_empty(file: F, identity: WalIdentity, start_after_lsn: Lsn) -> Result<Self> {
+        let next_lsn = start_after_lsn
+            .get()
+            .checked_add(1)
+            .map(Lsn::new)
+            .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
+        let mut wal = Self {
+            file,
+            identity,
+            format_version: WAL_FORMAT_VERSION,
+            next_lsn,
+            next_batch_id: 1,
+            history_start_lsn: start_after_lsn,
+            committed: Vec::new(),
+            scan_report: WalScanReport::default(),
+            sync_count: 0,
+            page_images: 0,
+            append_nanos: 0,
+            sync_nanos: 0,
+        };
+        let payload = wal.identity_payload(start_after_lsn);
+        wal.append_frame(WalRecordType::Init, Lsn::ZERO, 0, 0, &payload, &mut None)?;
+        wal.file
+            .sync_data()
+            .map_err(|error| Error::durability(format!("initial WAL sync failed: {error}")))?;
+        wal.sync_count = 1;
+        wal.scan_report.records_scanned = 1;
+        Ok(wal)
     }
 
     pub fn into_file(self) -> F {
@@ -570,70 +587,41 @@ impl<F: DurableFile> WalLog<F> {
         payload: &[u8],
         injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
     ) -> Result<usize> {
-        if payload.len() > WAL_MAX_PAYLOAD_SIZE {
-            return Err(Error::invalid_input("WAL payload exceeds maximum size"));
-        }
-        let frame_length = WAL_HEADER_SIZE
-            .checked_add(payload.len())
-            .and_then(|length| length.checked_add(WAL_TRAILER_SIZE))
-            .ok_or_else(|| Error::invalid_input("WAL frame length overflows"))?;
-        let mut header = [0u8; WAL_HEADER_SIZE];
-        header[0..4].copy_from_slice(&WAL_MAGIC);
-        header[4..6].copy_from_slice(&self.format_version.to_le_bytes());
-        header[6] = record_type as u8;
-        header[8..12].copy_from_slice(
-            &u32::try_from(frame_length)
-                .map_err(|_| Error::invalid_input("WAL frame length does not fit u32"))?
-                .to_le_bytes(),
-        );
-        header[12..16].copy_from_slice(
-            &u32::try_from(payload.len())
-                .map_err(|_| Error::invalid_input("WAL payload length does not fit u32"))?
-                .to_le_bytes(),
-        );
-        header[16..24].copy_from_slice(&record_lsn.get().to_le_bytes());
-        header[24..32].copy_from_slice(&batch_id.to_le_bytes());
-        header[32..36].copy_from_slice(&record_index.to_le_bytes());
-        let payload_checksum = crc32c::crc32c(payload);
-        header[PAYLOAD_CHECKSUM_OFFSET..PAYLOAD_CHECKSUM_OFFSET + 4]
-            .copy_from_slice(&payload_checksum.to_le_bytes());
-        let header_checksum = header_checksum(&header);
-        header[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_OFFSET + 4]
-            .copy_from_slice(&header_checksum.to_le_bytes());
+        let frame = encode_frame(
+            self.format_version,
+            record_type,
+            record_lsn,
+            batch_id,
+            record_index,
+            payload,
+        )?;
+        let frame_length = frame.len();
+        let payload_end = WAL_HEADER_SIZE + payload.len();
 
         let offset = self.file.len()?;
         hit(injector, "during_wal_header_write")?;
-        write_all_at(&mut self.file, offset, &header)?;
+        write_all_at(&mut self.file, offset, &frame[..WAL_HEADER_SIZE])?;
         hit(injector, "during_wal_payload_write")?;
         write_all_at(
             &mut self.file,
             offset
                 .checked_add(WAL_HEADER_SIZE as u64)
                 .ok_or_else(|| Error::invalid_input("WAL offset overflows"))?,
-            payload,
+            &frame[WAL_HEADER_SIZE..payload_end],
         )?;
         hit(injector, "during_wal_trailer_write")?;
         write_all_at(
             &mut self.file,
             offset
-                .checked_add((WAL_HEADER_SIZE + payload.len()) as u64)
+                .checked_add(payload_end as u64)
                 .ok_or_else(|| Error::invalid_input("WAL offset overflows"))?,
-            &u32::try_from(frame_length)
-                .map_err(|_| Error::invalid_input("WAL frame length does not fit u32"))?
-                .to_le_bytes(),
+            &frame[payload_end..],
         )?;
         Ok(frame_length)
     }
 
     fn identity_payload(&self, start_after_lsn: Lsn) -> [u8; INIT_PAYLOAD_SIZE] {
-        let mut payload = [0u8; INIT_PAYLOAD_SIZE];
-        payload[0..16].copy_from_slice(&self.identity.database_uuid);
-        payload[16..24].copy_from_slice(&self.identity.tenant_id.get().to_le_bytes());
-        payload[24..32].copy_from_slice(&self.identity.shard_id.get().to_le_bytes());
-        payload[32..40].copy_from_slice(&self.identity.shard_epoch.get().to_le_bytes());
-        payload[40..44].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
-        payload[44..52].copy_from_slice(&start_after_lsn.get().to_le_bytes());
-        payload
+        identity_payload(&self.identity, start_after_lsn)
     }
 }
 
@@ -642,6 +630,90 @@ fn hit(injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>, point: &str)
         injector.hit(point)?;
     }
     Ok(())
+}
+
+fn is_torn_initialization_prefix<F: DurableFile>(
+    file: &mut F,
+    identity: &WalIdentity,
+    start_after_lsn: Lsn,
+    length: u64,
+) -> Result<bool> {
+    let length = usize::try_from(length)
+        .map_err(|_| Error::recovery("WAL torn INIT length does not fit usize"))?;
+    let expected = encode_frame(
+        WAL_FORMAT_VERSION,
+        WalRecordType::Init,
+        Lsn::ZERO,
+        0,
+        0,
+        &identity_payload(identity, start_after_lsn),
+    )?;
+    if length >= expected.len() {
+        return Ok(false);
+    }
+    let prefix = read_exact_at(file, 0, length)?;
+    Ok(prefix == expected[..length])
+}
+
+fn identity_payload(identity: &WalIdentity, start_after_lsn: Lsn) -> [u8; INIT_PAYLOAD_SIZE] {
+    let mut payload = [0u8; INIT_PAYLOAD_SIZE];
+    payload[0..16].copy_from_slice(&identity.database_uuid);
+    payload[16..24].copy_from_slice(&identity.tenant_id.get().to_le_bytes());
+    payload[24..32].copy_from_slice(&identity.shard_id.get().to_le_bytes());
+    payload[32..40].copy_from_slice(&identity.shard_epoch.get().to_le_bytes());
+    payload[40..44].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    payload[44..52].copy_from_slice(&start_after_lsn.get().to_le_bytes());
+    payload
+}
+
+fn encode_frame(
+    format_version: u16,
+    record_type: WalRecordType,
+    record_lsn: Lsn,
+    batch_id: u64,
+    record_index: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if payload.len() > WAL_MAX_PAYLOAD_SIZE {
+        return Err(Error::invalid_input("WAL payload exceeds maximum size"));
+    }
+    let frame_length = WAL_HEADER_SIZE
+        .checked_add(payload.len())
+        .and_then(|length| length.checked_add(WAL_TRAILER_SIZE))
+        .ok_or_else(|| Error::invalid_input("WAL frame length overflows"))?;
+    let mut header = [0u8; WAL_HEADER_SIZE];
+    header[0..4].copy_from_slice(&WAL_MAGIC);
+    header[4..6].copy_from_slice(&format_version.to_le_bytes());
+    header[6] = record_type as u8;
+    header[8..12].copy_from_slice(
+        &u32::try_from(frame_length)
+            .map_err(|_| Error::invalid_input("WAL frame length does not fit u32"))?
+            .to_le_bytes(),
+    );
+    header[12..16].copy_from_slice(
+        &u32::try_from(payload.len())
+            .map_err(|_| Error::invalid_input("WAL payload length does not fit u32"))?
+            .to_le_bytes(),
+    );
+    header[16..24].copy_from_slice(&record_lsn.get().to_le_bytes());
+    header[24..32].copy_from_slice(&batch_id.to_le_bytes());
+    header[32..36].copy_from_slice(&record_index.to_le_bytes());
+    let payload_checksum = crc32c::crc32c(payload);
+    header[PAYLOAD_CHECKSUM_OFFSET..PAYLOAD_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&payload_checksum.to_le_bytes());
+    let header_checksum = header_checksum(&header);
+    header[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_OFFSET + 4]
+        .copy_from_slice(&header_checksum.to_le_bytes());
+
+    let mut frame = Vec::with_capacity(frame_length);
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(
+        &u32::try_from(frame_length)
+            .map_err(|_| Error::invalid_input("WAL frame length does not fit u32"))?
+            .to_le_bytes(),
+    );
+    Ok(frame)
 }
 
 fn elapsed_nanos(started: Instant) -> Result<u64> {

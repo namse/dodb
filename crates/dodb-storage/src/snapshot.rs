@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dodb_core::{Error, Lsn, Result};
 
@@ -173,21 +175,22 @@ pub(crate) fn create_snapshot<F: DurableFile>(
             "snapshot destination parent is not a directory",
         ));
     }
-    let temporary = temporary_path(destination, "snapshot")?;
-    fs::create_dir(&temporary).map_err(|error| {
-        Error::snapshot(format!(
-            "cannot create temporary snapshot directory: {error}"
-        ))
-    })?;
+    let temporary = create_temporary_directory(destination, "snapshot")?;
     let result = create_snapshot_in_directory(file, superblock, &temporary, &mut injector);
     match result {
         Ok(report) => {
             let finalize_result = (|| {
+                hit(&mut injector, "before_snapshot_directory_sync")?;
+                sync_directory(&temporary)?;
+                hit(&mut injector, "after_snapshot_directory_sync")?;
                 hit(&mut injector, "before_snapshot_finalize")?;
                 fs::rename(&temporary, destination).map_err(|error| {
                     Error::snapshot(format!("cannot finalize snapshot directory: {error}"))
                 })?;
                 hit(&mut injector, "after_snapshot_finalize")?;
+                hit(&mut injector, "before_snapshot_parent_sync")?;
+                sync_directory(parent)?;
+                hit(&mut injector, "after_snapshot_parent_sync")?;
                 Ok(report)
             })();
             if finalize_result.is_err() {
@@ -302,16 +305,13 @@ pub fn restore_snapshot_with_injector(
             "restore destination parent is not a directory",
         ));
     }
-    let temporary = temporary_path(destination, "restore")?;
+    let mut temporary_path = None;
     let result = (|| {
         hit(&mut injector, "before_restore_copy")?;
         let mut source_file = File::open(source.join(SNAPSHOT_DATABASE_NAME))
             .map_err(|error| Error::snapshot(format!("cannot open snapshot database: {error}")))?;
-        let mut destination_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|error| Error::snapshot(format!("cannot create restore file: {error}")))?;
+        let (created_path, mut destination_file) = create_temporary_file(destination, "restore")?;
+        temporary_path = Some(created_path.clone());
         let mut buffer = vec![0u8; PAGE_SIZE * 16];
         loop {
             let count = source_file
@@ -331,15 +331,23 @@ pub fn restore_snapshot_with_injector(
             .map_err(|error| Error::snapshot(format!("restore sync failed: {error}")))?;
         drop(destination_file);
         hit(&mut injector, "after_restore_sync")?;
-        validate_database_file(&temporary, &manifest)?;
+        let temporary = temporary_path
+            .as_ref()
+            .ok_or_else(|| Error::snapshot("restore temporary path was not created"))?;
+        validate_database_file(temporary, &manifest)?;
         hit(&mut injector, "before_restore_finalize")?;
-        fs::rename(&temporary, destination)
+        fs::rename(temporary, destination)
             .map_err(|error| Error::snapshot(format!("restore finalize failed: {error}")))?;
         hit(&mut injector, "after_restore_finalize")?;
+        hit(&mut injector, "before_restore_parent_sync")?;
+        sync_directory(parent)?;
+        hit(&mut injector, "after_restore_parent_sync")?;
         Ok(manifest.clone())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    if let Some(temporary) = temporary_path
+        && result.is_err()
+    {
+        let _ = fs::remove_file(temporary);
     }
     result
 }
@@ -354,18 +362,29 @@ fn validate_database_file(path: &Path, manifest: &SnapshotManifest) -> Result<()
     }
     let mut file = File::open(path)
         .map_err(|error| Error::snapshot(format!("cannot open snapshot database: {error}")))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| Error::snapshot(format!("cannot read snapshot database: {error}")))?;
-    if crc32c::crc32c(&bytes) != manifest.database_checksum {
+    let mut checksum = 0u32;
+    let mut buffer = vec![0u8; PAGE_SIZE * 16];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| Error::snapshot(format!("cannot read snapshot database: {error}")))?;
+        if count == 0 {
+            break;
+        }
+        checksum = crc32c::crc32c_append(checksum, &buffer[..count]);
+    }
+    if checksum != manifest.database_checksum {
         return Err(Error::snapshot("snapshot database checksum mismatch"));
     }
-    if bytes.len() < PAGE_SIZE * 2 {
-        return Err(Error::snapshot(
-            "snapshot database is shorter than its superblocks",
-        ));
-    }
-    let selected = choose_superblock(&bytes[..PAGE_SIZE], &bytes[PAGE_SIZE..PAGE_SIZE * 2])
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| Error::snapshot(format!("cannot seek snapshot database: {error}")))?;
+    let mut superblocks = [0u8; PAGE_SIZE * 2];
+    file.read_exact(&mut superblocks).map_err(|error| {
+        Error::snapshot(format!(
+            "snapshot database is shorter than its superblocks: {error}"
+        ))
+    })?;
+    let selected = choose_superblock(&superblocks[..PAGE_SIZE], &superblocks[PAGE_SIZE..])
         .map_err(|error| Error::snapshot(format!("snapshot superblock is invalid: {error}")))?;
     let superblock = selected.superblock;
     if superblock.database_uuid != manifest.database_uuid
@@ -402,12 +421,79 @@ fn validate_database_file(path: &Path, manifest: &SnapshotManifest) -> Result<()
     Ok(())
 }
 
+fn create_temporary_directory(path: &Path, suffix: &str) -> Result<PathBuf> {
+    for _ in 0..64 {
+        let temporary = temporary_path(path, suffix)?;
+        match fs::create_dir(&temporary) {
+            Ok(()) => return Ok(temporary),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::snapshot(format!(
+                    "cannot create temporary snapshot directory: {error}"
+                )));
+            }
+        }
+    }
+    Err(Error::snapshot(
+        "could not allocate a unique temporary snapshot directory",
+    ))
+}
+
+fn create_temporary_file(path: &Path, suffix: &str) -> Result<(PathBuf, File)> {
+    for _ in 0..64 {
+        let temporary = temporary_path(path, suffix)?;
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::snapshot(format!(
+                    "cannot create restore file: {error}"
+                )));
+            }
+        }
+    }
+    Err(Error::snapshot(
+        "could not allocate a unique temporary restore file",
+    ))
+}
+
 fn temporary_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+    static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .ok_or_else(|| Error::snapshot("snapshot path has no final component"))?
         .to_string_lossy();
-    Ok(path.with_file_name(format!(".{name}.{suffix}")))
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::snapshot(format!("system clock is before UNIX epoch: {error}")))?
+        .as_nanos();
+    let counter = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(path.with_file_name(format!(
+        ".{name}.{suffix}.{}-{timestamp:x}-{counter:x}",
+        std::process::id()
+    )))
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .map_err(|error| Error::snapshot(format!("cannot open directory for sync: {error}")))?
+            .sync_all()
+            .map_err(|error| Error::snapshot(format!("directory sync failed: {error}")))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(Error::snapshot(
+            "directory synchronization is unsupported on this platform",
+        ))
+    }
 }
 
 fn read_exact_at<F: DurableFile>(file: &mut F, offset: u64, buffer: &mut [u8]) -> Result<()> {

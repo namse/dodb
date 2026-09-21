@@ -3,7 +3,8 @@ use dodb_core::{
     TransactionMutation, TransactionRequest,
 };
 use dodb_storage::{
-    BTreeStore, DatabaseConfig, DurableFile, restore_snapshot, restore_snapshot_with_injector,
+    BTreeStore, DatabaseConfig, DurableFile, ProductionFile, restore_snapshot,
+    restore_snapshot_with_injector,
 };
 use std::fs;
 
@@ -233,10 +234,57 @@ fn checkpoint_fault_matrix_preserves_the_last_successful_commit() {
 }
 
 #[test]
+fn torn_wal_reset_init_prefixes_recover_the_checkpointed_database() {
+    let document_key = DocumentKey::new(b"torn-init", b"key".to_vec());
+    let mut base = BTreeStore::open_with_wal(
+        CrashableFile::new(),
+        CrashableFile::new(),
+        DatabaseConfig::default(),
+    )
+    .unwrap();
+    let successful_revision = base.put(document_key.clone(), b"durable").unwrap();
+    base.set_fault_injector(CrashInjector::at("after_wal_reset_write", 1));
+    assert!(base.checkpoint().is_err());
+    let (data, wal) = base.into_files().unwrap();
+    let init_frame_length = wal.volatile_bytes().len();
+    let mut lengths = vec![
+        1,
+        dodb_storage::WAL_HEADER_SIZE - 1,
+        dodb_storage::WAL_HEADER_SIZE,
+        dodb_storage::WAL_HEADER_SIZE + 1,
+        init_frame_length / 2,
+        init_frame_length - 1,
+    ];
+    lengths.sort_unstable();
+    lengths.dedup();
+    let data_bytes = data.volatile_bytes().to_vec();
+    let wal_bytes = wal.volatile_bytes().to_vec();
+
+    for length in lengths {
+        let mut partial_data = CrashableFile::from_durable(data_bytes.clone());
+        let mut partial_wal = CrashableFile::from_durable(wal_bytes.clone());
+        partial_data.crash();
+        partial_wal.crash_with_persisted_prefix(length);
+        let mut reopened =
+            BTreeStore::open_with_wal(partial_data, partial_wal, DatabaseConfig::default())
+                .unwrap();
+        assert_eq!(
+            reopened.get(&document_key).unwrap(),
+            RevisionState::present(b"durable", successful_revision)
+        );
+        reopened.check_invariants().unwrap();
+        let next_revision = reopened.put(document_key.clone(), b"after").unwrap();
+        assert!(next_revision > successful_revision);
+        reopened.check_invariants().unwrap();
+    }
+}
+
+#[test]
 fn failed_snapshot_is_cleaned_up_without_affecting_live_reads() {
     let root = std::env::temp_dir().join(format!("dodb-snapshot-failure-{}", std::process::id()));
     let snapshot_path = root.join("snapshot");
     fs::create_dir_all(&root).unwrap();
+    fs::create_dir(root.join(".snapshot.snapshot")).unwrap();
     let result = {
         let mut store = BTreeStore::open_with_wal(
             CrashableFile::new(),
@@ -257,6 +305,7 @@ fn failed_snapshot_is_cleaned_up_without_affecting_live_reads() {
         store.create_snapshot(&snapshot_path).unwrap();
         assert!(dodb_storage::validate_snapshot(&snapshot_path).is_ok());
         let restored_path = root.join("restored.db");
+        fs::write(root.join(".restored.db.restore"), b"stale").unwrap();
         let mut restore_injector = CrashInjector::at("during_restore_copy", 1);
         assert!(
             restore_snapshot_with_injector(
@@ -268,6 +317,149 @@ fn failed_snapshot_is_cleaned_up_without_affecting_live_reads() {
         );
         assert!(!restored_path.exists());
         restore_snapshot(&snapshot_path, &restored_path).unwrap();
+        Ok::<(), dodb_core::Error>(())
+    };
+    let _ = fs::remove_dir_all(&root);
+    result.unwrap();
+}
+
+#[test]
+fn snapshot_finalization_faults_leave_only_a_valid_final_or_clean_destination() {
+    let root = std::env::temp_dir().join(format!(
+        "dodb-snapshot-finalization-faults-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let fault_points = [
+        ("before_snapshot_file_create", false),
+        ("after_snapshot_file_create", false),
+        ("during_snapshot_copy", false),
+        ("after_snapshot_copy", false),
+        ("before_snapshot_sync", false),
+        ("during_snapshot_sync", false),
+        ("after_snapshot_sync", false),
+        ("before_snapshot_manifest_write", false),
+        ("after_snapshot_manifest_write", false),
+        ("before_snapshot_manifest_sync", false),
+        ("during_snapshot_manifest_sync", false),
+        ("after_snapshot_manifest_sync", false),
+        ("before_snapshot_directory_sync", false),
+        ("after_snapshot_directory_sync", false),
+        ("before_snapshot_finalize", false),
+        ("after_snapshot_finalize", true),
+        ("before_snapshot_parent_sync", true),
+        ("after_snapshot_parent_sync", true),
+    ];
+    for (fault_point, finalized) in fault_points {
+        let snapshot_path = root.join(format!("snapshot-{fault_point}"));
+        let document_key =
+            DocumentKey::new(b"snapshot-finalization", fault_point.as_bytes().to_vec());
+        let mut store = BTreeStore::open_with_wal(
+            CrashableFile::new(),
+            CrashableFile::new(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        store.put(document_key, b"value").unwrap();
+        store.set_fault_injector(CrashInjector::at(fault_point, 1));
+        assert!(store.create_snapshot(&snapshot_path).is_err());
+        assert_eq!(
+            snapshot_path.exists(),
+            finalized,
+            "fault point {fault_point}"
+        );
+        if finalized {
+            assert!(dodb_storage::validate_snapshot(&snapshot_path).is_ok());
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn restore_finalization_faults_leave_only_a_valid_final_or_clean_destination() {
+    let root = std::env::temp_dir().join(format!(
+        "dodb-restore-finalization-faults-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("source");
+    let document_key = DocumentKey::new(b"restore-finalization", b"key");
+    let source_revision = {
+        let mut store = BTreeStore::open_with_wal(
+            CrashableFile::new(),
+            CrashableFile::new(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        let revision = store.put(document_key.clone(), b"value").unwrap();
+        store.create_snapshot(&snapshot_path).unwrap();
+        revision
+    };
+    let fault_points = [
+        ("before_restore_copy", false),
+        ("during_restore_copy", false),
+        ("before_restore_sync", false),
+        ("after_restore_sync", false),
+        ("before_restore_finalize", false),
+        ("after_restore_finalize", true),
+        ("before_restore_parent_sync", true),
+        ("after_restore_parent_sync", true),
+    ];
+    for (fault_point, finalized) in fault_points {
+        let destination = root.join(format!("restored-{fault_point}.db"));
+        let mut injector = CrashInjector::at(fault_point, 1);
+        assert!(
+            restore_snapshot_with_injector(&snapshot_path, &destination, Some(&mut injector))
+                .is_err()
+        );
+        assert_eq!(destination.exists(), finalized, "fault point {fault_point}");
+        if finalized {
+            let mut restored = BTreeStore::open(
+                ProductionFile::open(&destination).unwrap(),
+                DatabaseConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                restored.get(&document_key).unwrap(),
+                RevisionState::present(b"value", source_revision)
+            );
+            restored.check_invariants().unwrap();
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn large_snapshot_validation_preserves_the_snapshot_checksum() {
+    let root = std::env::temp_dir().join(format!(
+        "dodb-large-snapshot-validation-{}",
+        std::process::id()
+    ));
+    let snapshot_path = root.join("snapshot");
+    fs::create_dir_all(&root).unwrap();
+    let result = {
+        let mut store = BTreeStore::open_with_wal(
+            CrashableFile::new(),
+            CrashableFile::new(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        for index in 0..3_000u32 {
+            store
+                .put(
+                    DocumentKey::new(b"large-snapshot".to_vec(), index.to_le_bytes().to_vec()),
+                    vec![(index & 0xff) as u8; 64],
+                )
+                .unwrap();
+        }
+        let report = store.create_snapshot(&snapshot_path).unwrap();
+        assert!(report.bytes_copied > dodb_storage::PAGE_SIZE as u64 * 16);
+        assert_eq!(
+            dodb_storage::validate_snapshot(&snapshot_path).unwrap(),
+            report.manifest
+        );
         Ok::<(), dodb_core::Error>(())
     };
     let _ = fs::remove_dir_all(&root);

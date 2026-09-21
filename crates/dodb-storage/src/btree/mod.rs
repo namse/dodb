@@ -361,7 +361,10 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             config.shard_id,
             config.shard_epoch,
         );
-        let checkpoint_hint = checkpoint_lsn_hint(&mut file).unwrap_or(Lsn::ZERO);
+        let wal_length = wal_file.len()?;
+        let checkpoint_hint =
+            validate_existing_identity_before_wal(&mut file, &identity, wal_length)?
+                .unwrap_or(Lsn::ZERO);
         let wal = WalLog::open_with_fault_injector_and_start_lsn(
             wal_file,
             identity.clone(),
@@ -800,14 +803,21 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         }
         let metadata_changed = checkpoint_lsn > self.current_superblock.checkpoint_lsn;
         let dirty_page_count = self.dirty_pages.len();
+        let dirty_superblock_bytes = if self.dirty_superblock.is_some() {
+            PAGE_SIZE as u64
+        } else {
+            0
+        };
         let bytes_written = u64::try_from(dirty_page_count)
             .ok()
             .and_then(|count| count.checked_mul(PAGE_SIZE as u64))
             .and_then(|bytes| {
-                bytes.checked_add(if metadata_changed {
-                    PAGE_SIZE as u64
-                } else {
-                    0
+                bytes.checked_add(dirty_superblock_bytes).and_then(|bytes| {
+                    bytes.checked_add(if metadata_changed {
+                        PAGE_SIZE as u64
+                    } else {
+                        0
+                    })
                 })
             })
             .ok_or_else(|| Error::checkpoint("checkpoint byte count overflows"))?;
@@ -2208,16 +2218,32 @@ fn recover_data_file<F: DurableFile>(
     Ok(())
 }
 
-fn checkpoint_lsn_hint<F: DurableFile>(file: &mut F) -> Result<Lsn> {
+fn validate_existing_identity_before_wal<F: DurableFile>(
+    file: &mut F,
+    identity: &WalIdentity,
+    wal_length: u64,
+) -> Result<Option<Lsn>> {
     let length = file.len()?;
-    if length < (FIRST_DATA_PAGE * PAGE_SIZE as u64) {
-        return Ok(Lsn::ZERO);
+    if length == 0 {
+        return Ok(None);
+    }
+    if length < (FIRST_DATA_PAGE * PAGE_SIZE as u64) || !length.is_multiple_of(PAGE_SIZE as u64) {
+        if wal_length == 0 {
+            return Err(Error::corruption(
+                "database file is not a complete existing database",
+            ));
+        }
+        return Ok(None);
     }
     let slot_a = read_exact_at(file, SUPERBLOCK_A_OFFSET, PAGE_SIZE)?;
     let slot_b = read_exact_at(file, SUPERBLOCK_B_OFFSET, PAGE_SIZE)?;
-    Ok(choose_superblock(&slot_a, &slot_b)?
-        .superblock
-        .checkpoint_lsn)
+    let selected = match choose_superblock(&slot_a, &slot_b) {
+        Ok(selected) => selected,
+        Err(_error) if wal_length > 0 => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    validate_superblock_identity(&selected.superblock, identity)?;
+    Ok(Some(selected.superblock.checkpoint_lsn))
 }
 
 fn hit_fault(
