@@ -21,8 +21,9 @@ use dodb_core::{
     TransactionRequest, TransactionResult,
 };
 use dodb_storage::{
-    AsyncShard, BTreeStore, BatchRequest, BatchResponse, BlinkSplitMetrics, BlinkStore,
-    CoordinatorConfig, DatabaseConfig, DurableFile, ProductionFile, StorageMetrics, WalMetrics,
+    AsyncShard, BTreeStore, BatchRequest, BatchResponse, BlinkReadHandle, BlinkSplitMetrics,
+    BlinkStore, BlinkVersionedReadMetrics, CoordinatorConfig, DatabaseConfig, DurableFile,
+    ProductionFile, StorageMetrics, WalMetrics,
 };
 
 const BASELINE_COMMIT: &str = "1ff96e1b3d205074d4c1b820f5f2680bd3226a8b";
@@ -170,6 +171,7 @@ enum SyncMode {
 enum EngineKind {
     MainBtree,
     SerialBlink,
+    VersionedBlink,
 }
 
 impl EngineKind {
@@ -177,6 +179,7 @@ impl EngineKind {
         match value {
             "main-btree" | "btree" | "main" => Self::MainBtree,
             "serial-blink" | "blink" => Self::SerialBlink,
+            "versioned-blink" | "blink-versioned" | "phase2" => Self::VersionedBlink,
             other => panic!("unknown engine {other:?}"),
         }
     }
@@ -185,6 +188,7 @@ impl EngineKind {
         match self {
             Self::MainBtree => "main-btree",
             Self::SerialBlink => "serial-blink",
+            Self::VersionedBlink => "versioned-blink",
         }
     }
 }
@@ -454,7 +458,7 @@ fn print_help() {
     println!(
         "phase0-bench sustained baseline\n\n\
          Usage: cargo run --release -p dodb-storage --bin phase0-bench -- [options]\n\n\
-         --engine main-btree|serial-blink\n\
+         --engine main-btree|serial-blink|versioned-blink\n\
          Suites: write, read, mixed, delay-sweep, sync-sweep, all\n\
          Options: --writers 1,4 --readers 1,4 --widths 1,16\n\
          --distributions uniform,same-leaf-heavy,different-leaf-heavy\n\
@@ -969,6 +973,7 @@ struct EngineSnapshot {
     storage: Option<StorageMetrics>,
     wal: Option<WalMetrics>,
     blink: Option<BlinkSplitMetrics>,
+    versioned: Option<BlinkVersionedReadMetrics>,
 }
 
 trait EngineAdapter: Send + Sync {
@@ -1003,6 +1008,7 @@ impl EngineAdapter for BaselineAdapter {
             storage: self.shard.storage_metrics(),
             wal: self.shard.wal_metrics(),
             blink: None,
+            versioned: None,
         }
     }
 
@@ -1021,10 +1027,24 @@ struct BlinkAdapter {
     sender: tokio::sync::mpsc::Sender<BlinkWork>,
     store: Arc<Mutex<BlinkStore<BenchFile, BenchFile>>>,
     coordinator_metrics: Arc<Mutex<dodb_storage::CoordinatorMetrics>>,
+    read_handle: Option<BlinkReadHandle>,
 }
 
 impl BlinkAdapter {
     fn start(store: BlinkStore<BenchFile, BenchFile>, config: CoordinatorConfig) -> Self {
+        Self::start_with_read_handle(store, config, None)
+    }
+
+    fn start_versioned(store: BlinkStore<BenchFile, BenchFile>, config: CoordinatorConfig) -> Self {
+        let read_handle = store.versioned_read_handle();
+        Self::start_with_read_handle(store, config, Some(read_handle))
+    }
+
+    fn start_with_read_handle(
+        store: BlinkStore<BenchFile, BenchFile>,
+        config: CoordinatorConfig,
+        read_handle: Option<BlinkReadHandle>,
+    ) -> Self {
         let store = Arc::new(Mutex::new(store));
         let coordinator_metrics = Arc::new(Mutex::new(dodb_storage::CoordinatorMetrics::default()));
         let (sender, mut receiver) =
@@ -1102,6 +1122,7 @@ impl BlinkAdapter {
             sender,
             store,
             coordinator_metrics,
+            read_handle,
         }
     }
 }
@@ -1135,6 +1156,34 @@ impl EngineAdapter for BlinkAdapter {
     }
 
     fn execute<'a>(&'a self, request: BatchRequest) -> BoxFuture<'a, Result<BatchResponse>> {
+        if let Some(read_handle) = &self.read_handle {
+            let read_handle = read_handle.clone();
+            return Box::pin(async move {
+                match request {
+                    BatchRequest::Get { key } => Ok(BatchResponse::Get(read_handle.get(&key)?)),
+                    BatchRequest::Query {
+                        pk,
+                        exclusive_after_sk,
+                        limit,
+                    } => Ok(BatchResponse::Query(read_handle.query(
+                        &pk,
+                        exclusive_after_sk.as_ref(),
+                        limit,
+                    )?)),
+                    BatchRequest::Scan {
+                        exclusive_after_key,
+                        limit,
+                    } => Ok(BatchResponse::Scan(
+                        read_handle.scan(exclusive_after_key.as_ref(), limit)?,
+                    )),
+                    BatchRequest::Put { .. } | BatchRequest::Delete { .. } => {
+                        Err(Error::invalid_request(
+                            "versioned Blink benchmark read adapter received a mutation",
+                        ))
+                    }
+                }
+            });
+        }
         let store = Arc::clone(&self.store);
         Box::pin(async move {
             let mut store = store
@@ -1155,6 +1204,7 @@ impl EngineAdapter for BlinkAdapter {
                 storage: None,
                 wal: None,
                 blink: None,
+                versioned: None,
             };
         };
         EngineSnapshot {
@@ -1166,6 +1216,10 @@ impl EngineAdapter for BlinkAdapter {
             storage: Some(store.storage_metrics()),
             wal: store.wal_metrics().ok().flatten(),
             blink: Some(store.split_metrics()),
+            versioned: self
+                .read_handle
+                .as_ref()
+                .map(|_| store.versioned_read_metrics()),
         }
     }
 
@@ -1335,6 +1389,16 @@ struct MetricDelta {
     internal_splits_total: u64,
     root_splits_total: u64,
     right_link_corrections_total: u64,
+    generation_pins: u64,
+    read_operations: u64,
+    page_version_installs: u64,
+    versions_retained: u64,
+    versions_reclaimed: u64,
+    active_generation_pins: u64,
+    max_concurrent_pins: u64,
+    retired_page_ids: u64,
+    reusable_page_ids: u64,
+    versioned_right_link_corrections: u64,
 }
 
 impl MetricDelta {
@@ -1346,6 +1410,8 @@ impl MetricDelta {
         let wal_after = after.wal.clone().unwrap_or_default();
         let blink_before = before.blink.clone().unwrap_or_default();
         let blink_after = after.blink.clone().unwrap_or_default();
+        let versioned_before = before.versioned.clone().unwrap_or_default();
+        let versioned_after = after.versioned.clone().unwrap_or_default();
         Self {
             groups: subtraction(after.coordinator.groups, before.coordinator.groups),
             queued_requests: subtraction(
@@ -1404,6 +1470,31 @@ impl MetricDelta {
             internal_splits_total: blink_after.internal_splits,
             root_splits_total: blink_after.root_splits,
             right_link_corrections_total: blink_after.right_link_corrections,
+            generation_pins: subtraction(
+                versioned_after.generation_pins,
+                versioned_before.generation_pins,
+            ),
+            read_operations: subtraction(
+                versioned_after.read_operations,
+                versioned_before.read_operations,
+            ),
+            page_version_installs: subtraction(
+                versioned_after.page_version_installs,
+                versioned_before.page_version_installs,
+            ),
+            versions_retained: versioned_after.versions_retained,
+            versions_reclaimed: subtraction(
+                versioned_after.versions_reclaimed,
+                versioned_before.versions_reclaimed,
+            ),
+            active_generation_pins: versioned_after.active_generation_pins,
+            max_concurrent_pins: versioned_after.max_concurrent_pins,
+            retired_page_ids: versioned_after.retired_page_ids,
+            reusable_page_ids: versioned_after.reusable_page_ids,
+            versioned_right_link_corrections: subtraction(
+                versioned_after.right_link_corrections,
+                versioned_before.right_link_corrections,
+            ),
         }
     }
 
@@ -1843,6 +1934,20 @@ async fn open_adapter(
             let adapter = BlinkAdapter::start(store, benchmark_config(args, scenario));
             Ok((Arc::new(adapter), data_path, seeded))
         }
+        EngineKind::VersionedBlink => {
+            let mut store = BlinkStore::open_with_wal(
+                BenchFile::open(&data_path, sync_delay)?,
+                BenchFile::open(&wal_path, sync_delay)?,
+                config,
+            )?;
+            let requests = seed_requests(args, scenario);
+            let seeded = requests.iter().map(|request| request.mutations.len()).sum();
+            for chunk in requests.chunks(64) {
+                store.apply_transaction_group(chunk)?;
+            }
+            let adapter = BlinkAdapter::start_versioned(store, benchmark_config(args, scenario));
+            Ok((Arc::new(adapter), data_path, seeded))
+        }
     }
 }
 
@@ -2094,6 +2199,19 @@ fn build_record(
     json.u64(
         "right_link_corrections_total",
         delta.right_link_corrections_total,
+    );
+    json.u64("generation_pins", delta.generation_pins);
+    json.u64("read_operations_metric", delta.read_operations);
+    json.u64("page_version_installs", delta.page_version_installs);
+    json.u64("versions_retained", delta.versions_retained);
+    json.u64("versions_reclaimed", delta.versions_reclaimed);
+    json.u64("active_generation_pins", delta.active_generation_pins);
+    json.u64("max_concurrent_pins", delta.max_concurrent_pins);
+    json.u64("retired_page_ids", delta.retired_page_ids);
+    json.u64("reusable_page_ids", delta.reusable_page_ids);
+    json.u64(
+        "versioned_right_link_corrections",
+        delta.versioned_right_link_corrections,
     );
     json.string(
         "component_timing_scope",

@@ -8,7 +8,10 @@ pub mod page;
 pub mod superblock;
 pub mod wal;
 
-pub use blink::{BlinkCheckpointReport, BlinkSplitMetrics, BlinkStore};
+pub use blink::{
+    BlinkCheckpointReport, BlinkReadHandle, BlinkSplitMetrics, BlinkStore,
+    BlinkVersionedReadMetrics,
+};
 pub use btree::{
     AsyncShard, BTreeStore, BatchRequest, BatchResponse, CheckpointReport, CoordinatorConfig,
     CoordinatorMetrics, DatabaseConfig, Document, EngineRequest, EngineResponse, InvariantReport,

@@ -8,6 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use dodb_core::{
@@ -286,6 +288,288 @@ struct BlinkState {
     root_page_id: PageId,
     free_list_head: Option<PageId>,
     high_water_page_id: PageId,
+    allow_page_reuse: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PageVersion {
+    epoch: u64,
+    page: Arc<BlinkPage>,
+}
+
+/// A generation-scoped immutable page cell. A later generation may replace the
+/// cell for the same logical PageId, but a pinned older generation retains this
+/// cell and therefore the old page object until its last reader releases it.
+#[derive(Debug)]
+struct PageCell {
+    version: PageVersion,
+    metrics: Arc<PublicationMetrics>,
+}
+
+impl PageCell {
+    fn page_at(&self, epoch: u64) -> Result<Arc<BlinkPage>> {
+        if self.version.epoch > epoch {
+            return Err(Error::corruption(
+                "published page version is newer than its generation",
+            ));
+        }
+        Ok(Arc::clone(&self.version.page))
+    }
+}
+
+impl Drop for PageCell {
+    fn drop(&mut self) {
+        self.metrics
+            .versions_reclaimed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct PageCatalog {
+    pages: BTreeMap<PageId, Arc<PageCell>>,
+}
+
+#[derive(Debug)]
+struct PublishedGeneration {
+    epoch: u64,
+    root_page_id: PageId,
+    high_water_page_id: PageId,
+    catalog: Arc<PageCatalog>,
+}
+
+#[derive(Debug, Default)]
+struct PublicationMetrics {
+    generation_pins: AtomicU64,
+    active_generation_pins: AtomicU64,
+    max_concurrent_pins: AtomicU64,
+    page_version_installs: AtomicU64,
+    versions_reclaimed: AtomicU64,
+    published_generations: AtomicU64,
+    right_link_corrections: AtomicU64,
+    read_operations: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlinkVersionedReadMetrics {
+    pub published_generations: u64,
+    pub active_generation_pins: u64,
+    pub max_concurrent_pins: u64,
+    pub generation_pins: u64,
+    pub page_version_installs: u64,
+    pub versions_retained: u64,
+    pub versions_reclaimed: u64,
+    pub retired_page_ids: u64,
+    pub reusable_page_ids: u64,
+    pub read_operations: u64,
+    pub right_link_corrections: u64,
+}
+
+impl PublicationMetrics {
+    fn snapshot(&self, retired_page_ids: u64, reusable_page_ids: u64) -> BlinkVersionedReadMetrics {
+        let installed = self.page_version_installs.load(Ordering::Relaxed);
+        let reclaimed = self.versions_reclaimed.load(Ordering::Relaxed);
+        BlinkVersionedReadMetrics {
+            published_generations: self.published_generations.load(Ordering::Relaxed),
+            active_generation_pins: self.active_generation_pins.load(Ordering::Relaxed),
+            max_concurrent_pins: self.max_concurrent_pins.load(Ordering::Relaxed),
+            generation_pins: self.generation_pins.load(Ordering::Relaxed),
+            page_version_installs: installed,
+            versions_retained: installed.saturating_sub(reclaimed),
+            versions_reclaimed: reclaimed,
+            retired_page_ids,
+            reusable_page_ids,
+            read_operations: self.read_operations.load(Ordering::Relaxed),
+            right_link_corrections: self.right_link_corrections.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GenerationPublisher {
+    current: RwLock<Arc<PublishedGeneration>>,
+    metrics: Arc<PublicationMetrics>,
+}
+
+impl GenerationPublisher {
+    fn new(state: &BlinkState, epoch: u64) -> Arc<Self> {
+        let metrics = Arc::new(PublicationMetrics::default());
+        let mut pages = BTreeMap::new();
+        for (page_id, page) in &state.pages {
+            pages.insert(
+                *page_id,
+                Arc::new(PageCell {
+                    version: PageVersion {
+                        epoch,
+                        page: Arc::new(page.clone()),
+                    },
+                    metrics: Arc::clone(&metrics),
+                }),
+            );
+            metrics
+                .page_version_installs
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let generation = Arc::new(PublishedGeneration {
+            epoch,
+            root_page_id: state.root_page_id,
+            high_water_page_id: state.high_water_page_id,
+            catalog: Arc::new(PageCatalog { pages }),
+        });
+        Arc::new(Self {
+            current: RwLock::new(generation),
+            metrics,
+        })
+    }
+
+    fn pin(&self) -> GenerationPin {
+        let generation = Arc::clone(&self.current.read().expect("generation lock poisoned"));
+        let active = self
+            .metrics
+            .active_generation_pins
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.metrics.generation_pins.fetch_add(1, Ordering::Relaxed);
+        let mut observed = self.metrics.max_concurrent_pins.load(Ordering::Relaxed);
+        while active > observed {
+            match self.metrics.max_concurrent_pins.compare_exchange_weak(
+                observed,
+                active,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => observed = next,
+            }
+        }
+        GenerationPin {
+            generation,
+            metrics: Arc::clone(&self.metrics),
+        }
+    }
+
+    fn prepare(
+        &self,
+        state: &BlinkState,
+        superblock: &BlinkSuperblock,
+        dirty: &BTreeSet<PageId>,
+    ) -> Result<Arc<PublishedGeneration>> {
+        let base = self.pin();
+        let mut pages = base.generation.catalog.pages.clone();
+        for (page_id, page) in &state.pages {
+            if dirty.contains(page_id) || !pages.contains_key(page_id) {
+                pages.insert(
+                    *page_id,
+                    Arc::new(PageCell {
+                        version: PageVersion {
+                            epoch: superblock.generation,
+                            page: Arc::new(page.clone()),
+                        },
+                        metrics: Arc::clone(&self.metrics),
+                    }),
+                );
+                self.metrics
+                    .page_version_installs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(Arc::new(PublishedGeneration {
+            epoch: superblock.generation,
+            root_page_id: state.root_page_id,
+            high_water_page_id: state.high_water_page_id,
+            catalog: Arc::new(PageCatalog { pages }),
+        }))
+    }
+
+    fn publish(&self, generation: Arc<PublishedGeneration>) {
+        *self.current.write().expect("generation lock poisoned") = generation;
+        self.metrics
+            .published_generations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn can_reuse_pages(&self) -> bool {
+        self.metrics.active_generation_pins.load(Ordering::Acquire) == 0
+    }
+
+    fn metrics(&self, retired_page_ids: u64, reusable_page_ids: u64) -> BlinkVersionedReadMetrics {
+        self.metrics.snapshot(retired_page_ids, reusable_page_ids)
+    }
+}
+
+#[derive(Debug)]
+struct GenerationPin {
+    generation: Arc<PublishedGeneration>,
+    metrics: Arc<PublicationMetrics>,
+}
+
+impl Drop for GenerationPin {
+    fn drop(&mut self) {
+        self.metrics
+            .active_generation_pins
+            .fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BlinkReadHandle {
+    publisher: Arc<GenerationPublisher>,
+}
+
+impl BlinkReadHandle {
+    pub fn get(&self, key: &DocumentKey) -> Result<RevisionState> {
+        let pin = self.publisher.pin();
+        self.publisher
+            .metrics
+            .read_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let mut corrections = 0;
+        let result = read_state(&pin, key, &mut corrections);
+        self.publisher
+            .metrics
+            .right_link_corrections
+            .fetch_add(corrections, Ordering::Relaxed);
+        result
+    }
+
+    pub fn query(
+        &self,
+        pk: &PrimaryKey,
+        exclusive_after_sk: Option<&SortKey>,
+        limit: usize,
+    ) -> Result<Vec<Document>> {
+        let pin = self.publisher.pin();
+        self.publisher
+            .metrics
+            .read_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let mut corrections = 0;
+        let result = query_state(&pin, pk, exclusive_after_sk, limit, &mut corrections);
+        self.publisher
+            .metrics
+            .right_link_corrections
+            .fetch_add(corrections, Ordering::Relaxed);
+        result
+    }
+
+    pub fn scan(&self, cursor: Option<&DocumentKey>, limit: usize) -> Result<Vec<Document>> {
+        let pin = self.publisher.pin();
+        self.publisher
+            .metrics
+            .read_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let mut corrections = 0;
+        let result = scan_state(&pin, cursor, limit, &mut corrections);
+        self.publisher
+            .metrics
+            .right_link_corrections
+            .fetch_add(corrections, Ordering::Relaxed);
+        result
+    }
+
+    pub fn metrics(&self) -> BlinkVersionedReadMetrics {
+        self.publisher.metrics(0, 0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +596,7 @@ pub struct BlinkStore<F: DurableFile, W: DurableFile = crate::btree::NoWal> {
     file: F,
     wal: Option<WalLog<W>>,
     state: BlinkState,
+    publisher: Arc<GenerationPublisher>,
     current_superblock: BlinkSuperblock,
     active_slot: SuperblockSlot,
     next_revision: Revision,
@@ -418,6 +703,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             root_page_id: root,
             free_list_head: None,
             high_water_page_id: root,
+            allow_page_reuse: true,
         };
         let sb = BlinkSuperblock::new(&config, root);
         let sb_bytes = encode_blink_superblock(&sb)?;
@@ -427,10 +713,12 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         write_all_at(&mut file, PAGE_SIZE as u64, &sb_bytes)?;
         write_all_at(&mut file, root.get() * PAGE_SIZE as u64, &root_bytes)?;
         file.sync_all()?;
+        let publisher = GenerationPublisher::new(&state, sb.generation);
         Ok(Self {
             file,
             wal: None,
             state,
+            publisher,
             current_superblock: sb,
             active_slot: SuperblockSlot::B,
             next_revision: Revision::new(1),
@@ -488,11 +776,14 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             root_page_id: sb.root_page_id,
             free_list_head: sb.free_list_head,
             high_water_page_id: sb.high_water_page_id,
+            allow_page_reuse: true,
         };
+        let publisher = GenerationPublisher::new(&state, sb.generation);
         let store = Self {
             file,
             wal: None,
             state,
+            publisher,
             current_superblock: sb.clone(),
             active_slot,
             next_revision: Revision::new(1),
@@ -524,6 +815,25 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
 
     pub fn current_superblock_generation(&self) -> u64 {
         self.current_superblock.generation
+    }
+
+    /// Returns a read-only handle whose operations pin one immutable committed
+    /// generation for their full duration. The handle does not borrow or lock
+    /// the serial writer store while traversing the tree.
+    pub fn versioned_read_handle(&self) -> BlinkReadHandle {
+        BlinkReadHandle {
+            publisher: Arc::clone(&self.publisher),
+        }
+    }
+
+    pub fn versioned_read_metrics(&self) -> BlinkVersionedReadMetrics {
+        let retired_page_ids = count_free_pages(&self.state).unwrap_or(0);
+        let reusable_page_ids = if self.publisher.can_reuse_pages() {
+            retired_page_ids
+        } else {
+            0
+        };
+        self.publisher.metrics(retired_page_ids, reusable_page_ids)
     }
 
     pub fn set_fault_injector<I>(&mut self, injector: I)
@@ -600,13 +910,14 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             return Ok(Vec::new());
         }
         let mut responses = Vec::with_capacity(requests.len());
+        let mut right_link_corrections = 0;
         let started = Instant::now();
         for request in requests {
             match request {
                 BatchRequest::Get { key } => responses.push(BatchResponse::Get(read_state(
                     &self.state,
                     key,
-                    &mut self.split_metrics,
+                    &mut right_link_corrections,
                 )?)),
                 BatchRequest::Query {
                     pk,
@@ -617,7 +928,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                     pk,
                     exclusive_after_sk.as_ref(),
                     *limit,
-                    &mut self.split_metrics,
+                    &mut right_link_corrections,
                 )?)),
                 BatchRequest::Scan {
                     exclusive_after_key,
@@ -626,7 +937,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                     &self.state,
                     exclusive_after_key.as_ref(),
                     *limit,
-                    &mut self.split_metrics,
+                    &mut right_link_corrections,
                 )?)),
                 BatchRequest::Put { key, value } => {
                     let result = self.transact(TransactionRequest::new(
@@ -647,6 +958,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 }
             }
         }
+        self.split_metrics.right_link_corrections = self
+            .split_metrics
+            .right_link_corrections
+            .saturating_add(right_link_corrections);
         self.storage_metrics.btree_preparation_nanos = self
             .storage_metrics
             .btree_preparation_nanos
@@ -678,6 +993,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         }
         let started = Instant::now();
         let mut working = self.state.clone();
+        // A free page is reusable only when no reader can still reference the
+        // generation that contains its previous contents. Otherwise the
+        // allocator conservatively grows the file and leaves the ID retired.
+        working.allow_page_reuse = self.publisher.can_reuse_pages();
         let mut working_sb = self.current_superblock.clone();
         let mut working_slot = self.active_slot;
         let mut next_lsn = self.wal.as_ref().map_or(self.next_lsn, WalLog::next_lsn);
@@ -799,6 +1118,19 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             return Ok(results);
         }
 
+        let final_candidate = candidates.last().unwrap();
+        // Build the immutable catalog before WAL append. It is not visible
+        // until the durable append/sync below succeeds.
+        let all_dirty = candidates
+            .iter()
+            .flat_map(|candidate| candidate.dirty.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let published_generation = self.publisher.prepare(
+            &final_candidate.state,
+            &final_candidate.superblock,
+            &all_dirty,
+        )?;
+
         let mut wal_commits = Vec::with_capacity(candidates.len());
         let mut final_images = BTreeMap::new();
         for candidate in &candidates {
@@ -845,7 +1177,6 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             }
             self.file.sync_data()?;
         }
-        let final_candidate = candidates.last().unwrap();
         let final_sb = encode_blink_superblock(&final_candidate.superblock)?;
         self.state = final_candidate.state.clone();
         self.current_superblock = final_candidate.superblock.clone();
@@ -853,6 +1184,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         self.next_revision = final_candidate.next_revision;
         self.next_lsn = final_candidate.next_lsn;
         self.next_batch_id = final_candidate.next_batch_id;
+        self.publisher.publish(published_generation);
         self.dirty_pages.extend(
             final_images
                 .iter()
@@ -975,7 +1307,49 @@ fn validate_encoded_key(key: &[u8]) -> Result<()> {
         .map_err(|error| Error::invalid_input(format!("document key is not canonical: {error}")))
 }
 
-fn validate_conditions(state: &BlinkState, conditions: &[TransactionCondition]) -> Result<()> {
+trait ReadPageSource {
+    fn root_page_id(&self) -> PageId;
+    fn page(&self, page_id: PageId) -> Result<Arc<BlinkPage>>;
+}
+
+impl ReadPageSource for BlinkState {
+    fn root_page_id(&self) -> PageId {
+        self.root_page_id
+    }
+
+    fn page(&self, page_id: PageId) -> Result<Arc<BlinkPage>> {
+        self.pages
+            .get(&page_id)
+            .cloned()
+            .map(Arc::new)
+            .ok_or_else(|| Error::corruption("Blink page is missing"))
+    }
+}
+
+impl ReadPageSource for GenerationPin {
+    fn root_page_id(&self) -> PageId {
+        self.generation.root_page_id
+    }
+
+    fn page(&self, page_id: PageId) -> Result<Arc<BlinkPage>> {
+        if page_id > self.generation.high_water_page_id {
+            return Err(Error::corruption(
+                "published Blink page exceeds high-water mark",
+            ));
+        }
+        self.generation
+            .catalog
+            .pages
+            .get(&page_id)
+            .ok_or_else(|| Error::corruption("published Blink page is missing"))?
+            .page_at(self.generation.epoch)
+    }
+}
+
+fn validate_conditions<S: ReadPageSource>(
+    state: &S,
+    conditions: &[TransactionCondition],
+) -> Result<()> {
     for condition in conditions {
         let actual = observed_state(state, condition.key())?;
         let matches = match condition {
@@ -996,7 +1370,7 @@ fn validate_conditions(state: &BlinkState, conditions: &[TransactionCondition]) 
     Ok(())
 }
 
-fn observed_state(state: &BlinkState, key: &DocumentKey) -> Result<ObservedState> {
+fn observed_state<S: ReadPageSource>(state: &S, key: &DocumentKey) -> Result<ObservedState> {
     match find_entry(state, &key.encode())? {
         Some(entry) if entry.value.is_some() => Ok(ObservedState::present(entry.revision)),
         Some(entry) => Ok(ObservedState::missing(entry.revision)),
@@ -1004,14 +1378,14 @@ fn observed_state(state: &BlinkState, key: &DocumentKey) -> Result<ObservedState
     }
 }
 
-fn read_state(
-    state: &BlinkState,
+fn read_state<S: ReadPageSource>(
+    state: &S,
     key: &DocumentKey,
-    metrics: &mut BlinkSplitMetrics,
+    right_link_corrections: &mut u64,
 ) -> Result<RevisionState> {
     let encoded = key.encode();
     validate_encoded_key(&encoded)?;
-    let Some(entry) = find_entry_with_metrics(state, &encoded, metrics)? else {
+    let Some(entry) = find_entry_with_metrics(state, &encoded, right_link_corrections)? else {
         return Ok(RevisionState::missing(Revision::ZERO));
     };
     match &entry.value {
@@ -1023,12 +1397,12 @@ fn read_state(
     }
 }
 
-fn query_state(
-    state: &BlinkState,
+fn query_state<S: ReadPageSource>(
+    state: &S,
     pk: &PrimaryKey,
     exclusive_after_sk: Option<&SortKey>,
     limit: usize,
-    metrics: &mut BlinkSplitMetrics,
+    right_link_corrections: &mut u64,
 ) -> Result<Vec<Document>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -1036,7 +1410,7 @@ fn query_state(
     let start = DocumentKey::new(pk.as_bytes().to_vec(), Vec::new());
     let cursor = exclusive_after_sk
         .map(|sk| DocumentKey::new(pk.as_bytes().to_vec(), sk.as_bytes().to_vec()));
-    let mut leaf_id = find_leaf_with_metrics(state, &start.encode(), metrics)?;
+    let mut leaf_id = find_leaf_with_metrics(state, &start.encode(), right_link_corrections)?;
     let mut first = true;
     let mut visited = HashSet::new();
     let mut output = Vec::new();
@@ -1044,14 +1418,12 @@ fn query_state(
         if !visited.insert(leaf_id) {
             return Err(Error::corruption("Blink leaf chain cycle during query"));
         }
+        let page = state.page(leaf_id)?;
         let BlinkPage::Leaf {
             entries,
             right_sibling,
             ..
-        } = state
-            .pages
-            .get(&leaf_id)
-            .ok_or_else(|| Error::corruption("Blink query leaf is missing"))?
+        } = page.as_ref()
         else {
             return Err(Error::corruption("Blink query reached non-leaf page"));
         };
@@ -1089,17 +1461,17 @@ fn query_state(
     Ok(output)
 }
 
-fn scan_state(
-    state: &BlinkState,
+fn scan_state<S: ReadPageSource>(
+    state: &S,
     cursor: Option<&DocumentKey>,
     limit: usize,
-    metrics: &mut BlinkSplitMetrics,
+    right_link_corrections: &mut u64,
 ) -> Result<Vec<Document>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
     let mut leaf_id = match cursor {
-        Some(key) => find_leaf_with_metrics(state, &key.encode(), metrics)?,
+        Some(key) => find_leaf_with_metrics(state, &key.encode(), right_link_corrections)?,
         None => leftmost_leaf(state)?,
     };
     let cursor = cursor.map(DocumentKey::encode);
@@ -1109,14 +1481,12 @@ fn scan_state(
         if !visited.insert(leaf_id) {
             return Err(Error::corruption("Blink leaf chain cycle during scan"));
         }
+        let page = state.page(leaf_id)?;
         let BlinkPage::Leaf {
             entries,
             right_sibling,
             ..
-        } = state
-            .pages
-            .get(&leaf_id)
-            .ok_or_else(|| Error::corruption("Blink scan leaf is missing"))?
+        } = page.as_ref()
         else {
             return Err(Error::corruption("Blink scan reached non-leaf page"));
         };
@@ -1143,43 +1513,37 @@ fn scan_state(
     Ok(output)
 }
 
-fn find_entry<'a>(state: &'a BlinkState, key: &[u8]) -> Result<Option<&'a LeafEntry>> {
-    let mut metrics = BlinkSplitMetrics::default();
-    find_entry_with_metrics(state, key, &mut metrics)
+fn find_entry<S: ReadPageSource>(state: &S, key: &[u8]) -> Result<Option<LeafEntry>> {
+    let mut corrections = 0;
+    find_entry_with_metrics(state, key, &mut corrections)
 }
 
-fn find_entry_with_metrics<'a>(
-    state: &'a BlinkState,
+fn find_entry_with_metrics<S: ReadPageSource>(
+    state: &S,
     key: &[u8],
-    metrics: &mut BlinkSplitMetrics,
-) -> Result<Option<&'a LeafEntry>> {
-    let leaf_id = find_leaf_with_metrics(state, key, metrics)?;
-    let BlinkPage::Leaf { entries, .. } = state
-        .pages
-        .get(&leaf_id)
-        .ok_or_else(|| Error::corruption("Blink leaf is missing"))?
-    else {
+    right_link_corrections: &mut u64,
+) -> Result<Option<LeafEntry>> {
+    let leaf_id = find_leaf_with_metrics(state, key, right_link_corrections)?;
+    let page = state.page(leaf_id)?;
+    let BlinkPage::Leaf { entries, .. } = page.as_ref() else {
         return Err(Error::corruption("Blink route ended at non-leaf"));
     };
-    Ok(entries.iter().find(|entry| entry.key == key))
+    Ok(entries.iter().find(|entry| entry.key == key).cloned())
 }
 
-fn find_leaf_with_metrics(
-    state: &BlinkState,
+fn find_leaf_with_metrics<S: ReadPageSource>(
+    state: &S,
     key: &[u8],
-    metrics: &mut BlinkSplitMetrics,
+    right_link_corrections: &mut u64,
 ) -> Result<PageId> {
-    let mut page_id = state.root_page_id;
+    let mut page_id = state.root_page_id();
     let mut guard = HashSet::new();
     loop {
         if !guard.insert(page_id) {
             return Err(Error::corruption("Blink tree route contains a cycle"));
         }
-        let page = state
-            .pages
-            .get(&page_id)
-            .ok_or_else(|| Error::corruption("Blink route page is missing"))?;
-        let (high_key, right_sibling) = match page {
+        let page = state.page(page_id)?;
+        let (high_key, right_sibling) = match page.as_ref() {
             BlinkPage::Leaf {
                 high_key,
                 right_sibling,
@@ -1196,11 +1560,11 @@ fn find_leaf_with_metrics(
             let Some(next) = *right_sibling else {
                 return Err(Error::corruption("Blink finite fence has no right sibling"));
             };
-            metrics.right_link_corrections = metrics.right_link_corrections.saturating_add(1);
+            *right_link_corrections = right_link_corrections.saturating_add(1);
             page_id = next;
             continue;
         }
-        match page {
+        match page.as_ref() {
             BlinkPage::Leaf { .. } => return Ok(page_id),
             BlinkPage::Internal {
                 leftmost_child,
@@ -1219,18 +1583,18 @@ fn find_leaf_with_metrics(
     }
 }
 
-fn leftmost_leaf(state: &BlinkState) -> Result<PageId> {
-    let mut page_id = state.root_page_id;
+fn leftmost_leaf<S: ReadPageSource>(state: &S) -> Result<PageId> {
+    let mut page_id = state.root_page_id();
     loop {
-        match state.pages.get(&page_id) {
-            Some(BlinkPage::Leaf { .. }) => return Ok(page_id),
-            Some(BlinkPage::Internal { leftmost_child, .. }) => page_id = *leftmost_child,
+        match state.page(page_id)?.as_ref() {
+            BlinkPage::Leaf { .. } => return Ok(page_id),
+            BlinkPage::Internal { leftmost_child, .. } => page_id = *leftmost_child,
             _ => return Err(Error::corruption("Blink leftmost path is invalid")),
         }
     }
 }
 
-fn materialize_value(state: &BlinkState, value: &BlinkValueRef) -> Result<Vec<u8>> {
+fn materialize_value<S: ReadPageSource>(state: &S, value: &BlinkValueRef) -> Result<Vec<u8>> {
     match value {
         BlinkValueRef::Inline(value) => Ok(value.clone()),
         BlinkValueRef::Overflow { head, length } => {
@@ -1241,11 +1605,8 @@ fn materialize_value(state: &BlinkState, value: &BlinkValueRef) -> Result<Vec<u8
                 if !visited.insert(id) {
                     return Err(Error::corruption("Blink overflow cycle"));
                 }
-                let BlinkPage::Overflow { next, chunk, .. } = state
-                    .pages
-                    .get(&id)
-                    .ok_or_else(|| Error::corruption("Blink overflow page is missing"))?
-                else {
+                let page = state.page(id)?;
+                let BlinkPage::Overflow { next, chunk, .. } = page.as_ref() else {
                     return Err(Error::corruption(
                         "Blink overflow reference has wrong page type",
                     ));
@@ -1488,7 +1849,9 @@ fn free_value(
 }
 
 fn allocate_page(state: &mut BlinkState, dirty: &mut BTreeSet<PageId>) -> PageId {
-    if let Some(id) = state.free_list_head {
+    if state.allow_page_reuse
+        && let Some(id) = state.free_list_head
+    {
         let next = match state.pages.get(&id) {
             Some(BlinkPage::Free { next, .. }) => *next,
             _ => None,
@@ -2326,6 +2689,25 @@ fn page_level(state: &BlinkState, page_id: PageId) -> Result<u16> {
     }
 }
 
+fn count_free_pages(state: &BlinkState) -> Result<u64> {
+    let mut count = 0;
+    let mut current = state.free_list_head;
+    let mut visited = HashSet::new();
+    while let Some(page_id) = current {
+        if !visited.insert(page_id) {
+            return Err(Error::corruption("Blink free list cycle"));
+        }
+        let Some(BlinkPage::Free { next, .. }) = state.pages.get(&page_id) else {
+            return Err(Error::corruption(
+                "Blink free list points to a non-free page",
+            ));
+        };
+        count += 1;
+        current = *next;
+    }
+    Ok(count)
+}
+
 fn check_state(state: &BlinkState) -> Result<InvariantReport> {
     if state.root_page_id.get() < FIRST_DATA_PAGE
         || state.high_water_page_id.get() < state.root_page_id.get()
@@ -2890,11 +3272,12 @@ mod tests {
             root_page_id: left,
             free_list_head: None,
             high_water_page_id: right,
+            allow_page_reuse: true,
         };
-        let mut metrics = BlinkSplitMetrics::default();
-        let value = read_state(&state, &key, &mut metrics).unwrap();
+        let mut corrections = 0;
+        let value = read_state(&state, &key, &mut corrections).unwrap();
         assert_eq!(value.value(), Some(&[2][..]));
-        assert_eq!(metrics.right_link_corrections, 1);
+        assert_eq!(corrections, 1);
     }
 
     #[test]
@@ -3034,6 +3417,335 @@ mod tests {
         assert!(reopened.get(&first).unwrap().is_missing());
         assert_eq!(reopened.scan(None, 10).unwrap(), query);
         reopened.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn versioned_generation_is_atomic_for_multi_page_transaction() {
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        let a = DocumentKey::new(b"atomic".to_vec(), b"a".to_vec());
+        let b = DocumentKey::new(b"atomic".to_vec(), b"b".to_vec());
+        store.put(a.clone(), b"old-a".to_vec()).unwrap();
+        store.put(b.clone(), b"old-b".to_vec()).unwrap();
+        let old_pin = store.publisher.pin();
+        let handle = store.versioned_read_handle();
+        store
+            .apply_transaction_group(&[
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: a.clone(),
+                        value: b"new-a".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: b.clone(),
+                        value: b"new-b".to_vec(),
+                    }],
+                ),
+            ])
+            .unwrap();
+
+        let mut corrections = 0;
+        assert_eq!(
+            read_state(&old_pin, &a, &mut corrections).unwrap().value(),
+            Some(&b"old-a"[..])
+        );
+        assert_eq!(
+            read_state(&old_pin, &b, &mut corrections).unwrap().value(),
+            Some(&b"old-b"[..])
+        );
+        assert_eq!(handle.get(&a).unwrap().value(), Some(&b"new-a"[..]));
+        assert_eq!(handle.get(&b).unwrap().value(), Some(&b"new-b"[..]));
+        assert_eq!(store.versioned_read_metrics().active_generation_pins, 1);
+    }
+
+    #[test]
+    fn reader_during_unpublished_install_sees_only_old_generation() {
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        let key = DocumentKey::new(b"install".to_vec(), b"key".to_vec());
+        store.put(key.clone(), b"old".to_vec()).unwrap();
+        let old_pin = store.publisher.pin();
+        let handle = store.versioned_read_handle();
+
+        let mut candidate = store.state.clone();
+        candidate.allow_page_reuse = false;
+        let mut dirty = BTreeSet::new();
+        let mut split_metrics = BlinkSplitMetrics::default();
+        apply_mutation(
+            &mut candidate,
+            &mut dirty,
+            &mut split_metrics,
+            &TransactionMutation::Put {
+                key: key.clone(),
+                value: b"prepared-but-not-published".to_vec(),
+            },
+            Revision::new(2),
+        )
+        .unwrap();
+        let prepared_sb = BlinkSuperblock {
+            generation: store.current_superblock.generation + 1,
+            root_page_id: candidate.root_page_id,
+            free_list_head: candidate.free_list_head,
+            high_water_page_id: candidate.high_water_page_id,
+            ..store.current_superblock.clone()
+        };
+        let unpublished = store
+            .publisher
+            .prepare(&candidate, &prepared_sb, &dirty)
+            .unwrap();
+
+        // The immutable page cells exist, but the generation pointer has not
+        // moved. This is the install-before-publication window.
+        assert_eq!(handle.get(&key).unwrap().value(), Some(&b"old"[..]));
+        let mut corrections = 0;
+        assert_eq!(
+            read_state(&old_pin, &key, &mut corrections)
+                .unwrap()
+                .value(),
+            Some(&b"old"[..])
+        );
+        store.publisher.publish(unpublished);
+        assert_eq!(
+            handle.get(&key).unwrap().value(),
+            Some(&b"prepared-but-not-published"[..])
+        );
+    }
+
+    #[test]
+    fn root_split_and_leaf_links_are_safe_for_pinned_reader() {
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        let first = DocumentKey::new(b"root".to_vec(), 0u64.to_be_bytes().to_vec());
+        store.put(first.clone(), b"before".to_vec()).unwrap();
+        let old_pin = store.publisher.pin();
+        let old_root = old_pin.generation.root_page_id;
+        let handle = store.versioned_read_handle();
+        for index in 1..600u64 {
+            store
+                .put(
+                    DocumentKey::new(b"root".to_vec(), index.to_be_bytes().to_vec()),
+                    vec![(index & 0xff) as u8; 32],
+                )
+                .unwrap();
+        }
+        assert_ne!(store.current_superblock.root_page_id, old_root);
+        let mut corrections = 0;
+        assert_eq!(
+            read_state(&old_pin, &first, &mut corrections)
+                .unwrap()
+                .value(),
+            Some(&b"before"[..])
+        );
+        assert_eq!(handle.scan(None, 1_000).unwrap().len(), 600);
+        store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn page_reuse_is_delayed_until_pinned_generation_releases() {
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        let old_key = DocumentKey::new(b"reuse".to_vec(), b"old".to_vec());
+        let new_key = DocumentKey::new(b"reuse".to_vec(), b"new".to_vec());
+        let value = vec![7; 2_000];
+        store.put(old_key.clone(), value.clone()).unwrap();
+        let old_head = match find_entry(&store.state, &old_key.encode())
+            .unwrap()
+            .unwrap()
+            .value
+        {
+            Some(BlinkValueRef::Overflow { head, .. }) => head,
+            _ => panic!("expected overflow value"),
+        };
+        let old_pin = store.publisher.pin();
+        store.delete(old_key.clone()).unwrap();
+        store.put(new_key.clone(), value.clone()).unwrap();
+        let new_head = match find_entry(&store.state, &new_key.encode())
+            .unwrap()
+            .unwrap()
+            .value
+        {
+            Some(BlinkValueRef::Overflow { head, .. }) => head,
+            _ => panic!("expected overflow value"),
+        };
+        assert_ne!(old_head, new_head);
+        assert_eq!(store.versioned_read_metrics().reusable_page_ids, 0);
+        let mut corrections = 0;
+        assert_eq!(
+            read_state(&old_pin, &old_key, &mut corrections)
+                .unwrap()
+                .value(),
+            Some(&value[..])
+        );
+        drop(old_pin);
+        assert_eq!(store.versioned_read_metrics().active_generation_pins, 0);
+        assert!(store.versioned_read_metrics().versions_reclaimed > 0);
+        let after_key = DocumentKey::new(b"reuse".to_vec(), b"after".to_vec());
+        store.put(after_key.clone(), value).unwrap();
+        let after_head = match find_entry(&store.state, &after_key.encode())
+            .unwrap()
+            .unwrap()
+            .value
+        {
+            Some(BlinkValueRef::Overflow { head, .. }) => head,
+            _ => panic!("expected overflow value"),
+        };
+        assert_eq!(after_head, old_head);
+    }
+
+    #[test]
+    fn query_and_scan_keep_one_generation_during_publication() {
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        for index in 0..40u64 {
+            store
+                .put(
+                    DocumentKey::new(b"query".to_vec(), index.to_be_bytes().to_vec()),
+                    vec![1],
+                )
+                .unwrap();
+        }
+        let old_pin = store.publisher.pin();
+        let handle = store.versioned_read_handle();
+        store
+            .transact(TransactionRequest::new(
+                Vec::new(),
+                vec![TransactionMutation::Put {
+                    key: DocumentKey::new(b"query".to_vec(), 10u64.to_be_bytes().to_vec()),
+                    value: vec![9],
+                }],
+            ))
+            .unwrap();
+        let mut corrections = 0;
+        let old_query = query_state(
+            &old_pin,
+            &PrimaryKey::new(b"query".to_vec()),
+            None,
+            40,
+            &mut corrections,
+        )
+        .unwrap();
+        let old_scan = scan_state(&old_pin, None, 40, &mut corrections).unwrap();
+        assert!(old_query.iter().all(|row| row.value == vec![1]));
+        assert!(old_scan.iter().all(|row| row.value == vec![1]));
+        assert_eq!(
+            handle
+                .query(&PrimaryKey::new(b"query".to_vec()), None, 40)
+                .unwrap()
+                .iter()
+                .find(|row| row.key.sk == SortKey::new(10u64.to_be_bytes().to_vec()))
+                .unwrap()
+                .value,
+            vec![9]
+        );
+    }
+
+    struct FailOnce {
+        point: &'static str,
+        fired: bool,
+    }
+
+    impl FaultInjector for FailOnce {
+        fn hit(&mut self, point: &str) -> Result<()> {
+            if !self.fired && point == self.point {
+                self.fired = true;
+                return Err(Error::recovery(format!("injected failure at {point}")));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wal_sync_failure_does_not_publish_a_generation() {
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        let handle = store.versioned_read_handle();
+        store.set_fault_injector(FailOnce {
+            point: "before_wal_sync",
+            fired: false,
+        });
+        let key = DocumentKey::new(b"wal".to_vec(), b"failed".to_vec());
+        assert!(store.put(key.clone(), b"not-visible".to_vec()).is_err());
+        assert!(handle.get(&key).unwrap().is_missing());
+        assert_eq!(store.versioned_read_metrics().published_generations, 0);
+    }
+
+    #[test]
+    fn concurrent_versioned_readers_survive_serial_writer_publications() {
+        use std::sync::Mutex as StdMutex;
+        use std::thread;
+
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        let key = DocumentKey::new(b"stress".to_vec(), b"key".to_vec());
+        store.put(key.clone(), vec![0]).unwrap();
+        let handle = store.versioned_read_handle();
+        let writer = Arc::new(StdMutex::new(store));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let handle = handle.clone();
+            let key = key.clone();
+            readers.push(thread::spawn(move || {
+                for _ in 0..500 {
+                    assert!(handle.get(&key).unwrap().value().is_some());
+                    assert_eq!(handle.scan(None, 1).unwrap().len(), 1);
+                }
+            }));
+        }
+        for value in 1..100u8 {
+            writer
+                .lock()
+                .unwrap()
+                .put(key.clone(), vec![value])
+                .unwrap();
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        let store = match Arc::try_unwrap(writer) {
+            Ok(writer) => writer.into_inner().unwrap(),
+            Err(_) => panic!("writer Arc should have no remaining references"),
+        };
+        assert_eq!(store.versioned_read_metrics().active_generation_pins, 0);
+        store.check_invariants().unwrap();
     }
 
     #[test]
