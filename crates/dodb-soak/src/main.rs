@@ -253,7 +253,7 @@ fn print_help() {
          --phase all|growth|bounded|contention|crash\n\
          --duration 10s|10m (override each selected phase)\n\
          --output DIR --data-dir DIR --tenants N --concurrency N\n\
-         --hot-percent N --weights GET,PUT,DELETE,QUERY,SCAN,TRANSACT_GET,TRANSACT\n\
+         --hot-percent N --weights GET,PUT,DELETE,QUERY,SCAN,CONCURRENT_GET,TRANSACT\n\
          --checkpoint-ms N --no-connection-churn\n\
          \nExamples:\n\
          dodb-soak --profile smoke --seed 1\n\
@@ -1017,6 +1017,12 @@ fn is_overload(error: &ClientError) -> bool {
     )
 }
 
+fn is_allowed_transport_error(error: &ClientError, allow_transport_errors: bool) -> bool {
+    allow_transport_errors
+        && (matches!(error, ClientError::Transport(_) | ClientError::Protocol(_))
+            || matches!(error, ClientError::Endpoint(detail) if detail.contains("explicitly closed")))
+}
+
 async fn execute_operation(
     state: &Arc<RunState>,
     client: &DodbClient,
@@ -1234,9 +1240,7 @@ fn handle_non_mutation_error(
             .response_budget_errors
             .fetch_add(1, Ordering::Relaxed);
         Ok("response_budget".to_owned())
-    } else if allow_transport_errors
-        && matches!(error, ClientError::Transport(_) | ClientError::Protocol(_))
-    {
+    } else if is_allowed_transport_error(&error, allow_transport_errors) {
         state
             .counters
             .transport_errors
@@ -1271,9 +1275,7 @@ fn handle_mutation_error(
         }
         return Ok("unknown".to_owned());
     }
-    if allow_transport_errors
-        && matches!(error, ClientError::Transport(_) | ClientError::Protocol(_))
-    {
+    if is_allowed_transport_error(&error, allow_transport_errors) {
         state
             .counters
             .transport_errors
@@ -1304,7 +1306,7 @@ async fn spawn_workload(
         );
         let receiver = Arc::new(AsyncMutex::new(receiver));
         let generated_workload = workload_config(&config, &phase);
-        let mut workers = Vec::new();
+        let mut workers = JoinSet::new();
         for _ in 0..config.concurrency {
             let worker_receiver = Arc::clone(&receiver);
             let worker_clients = Arc::clone(&clients);
@@ -1313,7 +1315,7 @@ async fn spawn_workload(
             let worker_phase = phase.clone();
             let worker_seed = config.seed;
             let worker_workload = generated_workload.clone();
-            workers.push(tokio::spawn(async move {
+            workers.spawn(async move {
                 loop {
                     let item = tokio::select! {
                         changed = worker_stop.changed() => {
@@ -1357,7 +1359,7 @@ async fn spawn_workload(
                         break;
                     }
                 }
-            }));
+            });
         }
         let generator_seed = config.seed ^ phase_seed(&phase);
         let mut generator = OperationGenerator::new(generator_seed, generated_workload)
@@ -1386,9 +1388,7 @@ async fn spawn_workload(
         }
         drop(sender);
         let _ = stop_for_task.send(true);
-        for worker in workers {
-            let _ = worker.await;
-        }
+        while workers.join_next().await.is_some() {}
     });
     WorkloadHandle {
         stop,
@@ -1751,14 +1751,26 @@ async fn verify_full(
                 break;
             }
             let end = (offset + page.len()).min(expected.len());
-            if end - offset != page.len()
-                || page
-                    .iter()
-                    .zip(&expected[offset..end])
-                    .any(|(actual, expected)| !expected_document_matches(actual, expected))
+            if end - offset != page.len() {
+                return Err(format!(
+                    "full scan mismatch for tenant {tenant_number} at offset {offset}: expected {} rows, got {}",
+                    end - offset,
+                    page.len()
+                ));
+            }
+            if let Some((actual, expected)) = page
+                .iter()
+                .zip(&expected[offset..end])
+                .find(|(actual, expected)| !expected_document_matches(actual, expected))
             {
                 return Err(format!(
-                    "full scan mismatch for tenant {tenant_number} at offset {offset}"
+                    "full scan mismatch for tenant {tenant_number} at offset {offset}: key {:?} expected revision {} value length {} but got key {:?} revision {} value length {}",
+                    expected.key,
+                    expected.revision,
+                    expected.value.length(),
+                    actual.key,
+                    actual.revision,
+                    actual.value.len()
                 ));
             }
             cursor = page.last().map(|document| document.key.clone());
@@ -2915,6 +2927,17 @@ mod tests {
                 .is_err()
         );
         assert!(validate_post_quiescence_samples(&[]).is_err());
+    }
+
+    #[test]
+    fn explicit_close_is_expected_only_during_crash_quiescence() {
+        let closed = ClientError::Endpoint("client connection is explicitly closed".to_owned());
+        assert!(is_allowed_transport_error(&closed, true));
+        assert!(!is_allowed_transport_error(&closed, false));
+        assert!(!is_allowed_transport_error(
+            &ClientError::Endpoint("other endpoint error".to_owned()),
+            true
+        ));
     }
 
     #[test]

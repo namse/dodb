@@ -450,6 +450,96 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
 }
 
 #[tokio::test]
+async fn lazy_connection_dials_on_first_use_and_recovers_after_initial_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+    let address = server.local_addr().unwrap();
+    let connection = DodbConnection::connect_lazy(
+        "0.0.0.0:0".parse().unwrap(),
+        address,
+        "localhost",
+        ClientTlsConfig::from_der(vec![tls.certificate.clone()]).unwrap(),
+        dodb_protocol::ProtocolLimits::default(),
+    )
+    .unwrap();
+    let client = connection.for_tenant(TenantId::new(42));
+
+    assert_eq!(server.metrics().snapshot().connections_total, 0);
+    assert_eq!(
+        client.get(key(b"lazy", b"available")).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    let connections_after_first_request = server.metrics().snapshot().connections_total;
+    assert_eq!(connections_after_first_request, 1);
+    assert_eq!(
+        client.get(key(b"lazy", b"reused")).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    assert_eq!(
+        server.metrics().snapshot().connections_total,
+        connections_after_first_request
+    );
+
+    connection.close();
+    server.shutdown().await;
+    task.await.unwrap().unwrap();
+
+    let wrong_tls = test_tls();
+    let initial_failure_directory = tempfile::tempdir().unwrap();
+    let (initial_failure_server, initial_failure_task) = start_server_with_limits(
+        initial_failure_directory.path().to_owned(),
+        &wrong_tls,
+        dodb_protocol::ProtocolLimits::default(),
+        64,
+    )
+    .await;
+    let unavailable_address = initial_failure_server.local_addr().unwrap();
+    let retry_connection = DodbConnection::connect_lazy(
+        "0.0.0.0:0".parse().unwrap(),
+        unavailable_address,
+        "localhost",
+        ClientTlsConfig::from_der(vec![tls.certificate.clone()]).unwrap(),
+        dodb_protocol::ProtocolLimits::default(),
+    )
+    .unwrap();
+    let retry_client = retry_connection.for_tenant(TenantId::new(43));
+    let initial_failure = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        retry_client.get(key(b"lazy", b"initial-failure")),
+    )
+    .await
+    .expect("initial lazy dial did not finish promptly")
+    .unwrap_err();
+    assert!(matches!(
+        initial_failure,
+        ClientError::Transport(_) | ClientError::Endpoint(_)
+    ));
+    initial_failure_server.shutdown().await;
+    initial_failure_task.await.unwrap().unwrap();
+    drop(initial_failure_server);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let retry_directory = tempfile::tempdir().unwrap();
+    let (retry_server, retry_task) = start_server_with_limits_at(
+        retry_directory.path().to_owned(),
+        &tls,
+        dodb_protocol::ProtocolLimits::default(),
+        64,
+        unavailable_address,
+    )
+    .await;
+    assert_eq!(
+        retry_client
+            .get(key(b"lazy", b"after-recovery"))
+            .await
+            .unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    stop_server(retry_client, retry_server, retry_task).await;
+}
+
+#[tokio::test]
 async fn concurrent_streams_and_tenant_isolation_are_preserved() {
     let directory = tempfile::tempdir().unwrap();
     let tls = test_tls();
