@@ -3411,11 +3411,21 @@ mod tests {
         assert_eq!(query.len(), 1);
         assert_eq!(query[0].key, second);
         assert_eq!(store.scan(None, 10).unwrap(), query);
+        let checkpoint_pin = store.publisher.pin();
         store.checkpoint().unwrap();
+        let mut corrections = 0;
+        assert_eq!(
+            scan_state(&checkpoint_pin, None, 10, &mut corrections).unwrap(),
+            query
+        );
         let (file, wal) = store.into_files();
         let mut reopened = BlinkStore::open_with_wal(file, wal.unwrap(), config).unwrap();
         assert!(reopened.get(&first).unwrap().is_missing());
         assert_eq!(reopened.scan(None, 10).unwrap(), query);
+        assert_eq!(
+            reopened.versioned_read_handle().scan(None, 10).unwrap(),
+            query
+        );
         reopened.check_invariants().unwrap();
     }
 
@@ -3736,6 +3746,78 @@ mod tests {
                 .unwrap()
                 .put(key.clone(), vec![value])
                 .unwrap();
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        let store = match Arc::try_unwrap(writer) {
+            Ok(writer) => writer.into_inner().unwrap(),
+            Err(_) => panic!("writer Arc should have no remaining references"),
+        };
+        assert_eq!(store.versioned_read_metrics().active_generation_pins, 0);
+        store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn randomized_concurrent_reads_and_serial_writes_preserve_ordering() {
+        use std::sync::Mutex as StdMutex;
+        use std::thread;
+
+        let seed = 0x2a02_2026_u64;
+        let config = DatabaseConfig::default();
+        let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            config,
+        )
+        .unwrap();
+        for index in 0..128u64 {
+            store
+                .put(
+                    DocumentKey::new(b"random".to_vec(), index.to_be_bytes().to_vec()),
+                    vec![index as u8],
+                )
+                .unwrap();
+        }
+        let handle = store.versioned_read_handle();
+        let writer = Arc::new(StdMutex::new(store));
+        let mut readers = Vec::new();
+        for reader_id in 0..6u64 {
+            let handle = handle.clone();
+            readers.push(thread::spawn(move || {
+                let mut state = seed ^ reader_id;
+                for _ in 0..1_000 {
+                    state = splitmix_for_test(state);
+                    let key =
+                        DocumentKey::new(b"random".to_vec(), (state % 128).to_be_bytes().to_vec());
+                    match state % 3 {
+                        0 => {
+                            let _ = handle.get(&key).unwrap();
+                        }
+                        1 => {
+                            let rows = handle.scan(None, 16).unwrap();
+                            assert!(rows.windows(2).all(|pair| pair[0].key < pair[1].key));
+                        }
+                        _ => {
+                            let rows = handle
+                                .query(&PrimaryKey::new(b"random".to_vec()), None, 16)
+                                .unwrap();
+                            assert!(rows.windows(2).all(|pair| pair[0].key < pair[1].key));
+                        }
+                    }
+                }
+            }));
+        }
+        let mut state = seed;
+        for operation in 0..300u64 {
+            state = splitmix_for_test(state);
+            let key = DocumentKey::new(b"random".to_vec(), (state % 128).to_be_bytes().to_vec());
+            let mut store = writer.lock().unwrap();
+            if state & 1 == 0 {
+                store.put(key, vec![(operation & 0xff) as u8]).unwrap();
+            } else {
+                store.delete(key).unwrap();
+            }
         }
         for reader in readers {
             reader.join().unwrap();
