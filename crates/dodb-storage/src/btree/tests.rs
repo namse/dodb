@@ -159,6 +159,102 @@ fn large_value_replacement_reclaims_overflow_pages() {
     assert!(store.check_invariants().unwrap().free_pages < 3);
 }
 
+fn split_update_key(index: u16) -> DocumentKey {
+    key(b"split-update", index.to_be_bytes().to_vec())
+}
+
+#[test]
+fn growing_existing_value_splits_leaf_and_preserves_order() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(0)).unwrap();
+    let original_value = vec![0x31; 300];
+    for index in 0..11 {
+        store
+            .put(split_update_key(index), original_value.clone())
+            .unwrap();
+    }
+    assert_eq!(store.check_invariants().unwrap().reachable_pages, 1);
+
+    let replacement = vec![0x42; 500];
+    store.put(split_update_key(5), replacement.clone()).unwrap();
+
+    assert!(store.check_invariants().unwrap().reachable_pages >= 3);
+    let rows = store.scan(None, usize::MAX).unwrap();
+    assert_eq!(rows.len(), 11);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.key, split_update_key(index as u16));
+        let expected = if index == 5 {
+            replacement.as_slice()
+        } else {
+            original_value.as_slice()
+        };
+        assert_eq!(row.value, expected);
+    }
+    let queried = store
+        .query(&PrimaryKey::new(b"split-update".to_vec()), None, usize::MAX)
+        .unwrap();
+    assert_eq!(queried, rows);
+    store.check_invariants().unwrap();
+}
+
+#[test]
+fn growing_overflow_value_splits_leaf_and_reclaims_old_chain() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(0)).unwrap();
+    let large = vec![0x71; 10_000];
+    let neighbor = vec![0x72; 300];
+    for index in 0..11 {
+        let value = if index == 5 {
+            large.clone()
+        } else {
+            neighbor.clone()
+        };
+        store.put(split_update_key(index), value).unwrap();
+    }
+    let before = store.check_invariants().unwrap();
+    assert_eq!(before.reachable_pages, 4);
+
+    store.put(split_update_key(5), vec![0x73; 500]).unwrap();
+
+    let after = store.check_invariants().unwrap();
+    assert!(after.reachable_pages >= 3);
+    assert!(after.free_pages >= 3);
+    assert!(after.leaked_pages.is_empty());
+    assert_eq!(
+        store.get(&split_update_key(5)).unwrap().value(),
+        Some(&vec![0x73; 500][..])
+    );
+}
+
+#[test]
+fn wal_recovery_preserves_existing_value_leaf_split() {
+    let mut store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(0)).unwrap();
+    let original_value = vec![0x51; 300];
+    for index in 0..11 {
+        store
+            .put(split_update_key(index), original_value.clone())
+            .unwrap();
+    }
+    let replacement = vec![0x62; 500];
+    let revision = store.put(split_update_key(5), replacement.clone()).unwrap();
+    let (data, wal) = store.into_files().unwrap();
+
+    let mut reopened = BTreeStore::open_with_wal(data, wal, config(0)).unwrap();
+    assert_eq!(
+        reopened.get(&split_update_key(5)).unwrap(),
+        RevisionState::present(replacement, revision)
+    );
+    let rows = reopened.scan(None, usize::MAX).unwrap();
+    assert_eq!(rows.len(), 11);
+    assert_eq!(
+        rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>(),
+        (0..11).map(split_update_key).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        reopened.check_invariants().unwrap().leaked_pages,
+        Vec::new()
+    );
+}
+
 #[test]
 fn deleting_all_entries_keeps_empty_leaves_searchable() {
     let mut store = BTreeStore::open(MemoryFile::default(), config(1)).unwrap();

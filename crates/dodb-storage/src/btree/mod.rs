@@ -1644,19 +1644,12 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
                     revision,
                     value: Some(value_ref),
                 };
-                if !leaf_fits(&entries) {
-                    return Err(Error::invalid_input(
-                        "document key and value cannot fit in a leaf",
-                    ));
-                }
-                self.replace_page(
+                self.insert_leaf_entries(
                     leaf_id,
-                    PageData::Leaf {
-                        lsn: Lsn::new(revision.get()),
-                        next_leaf,
-                        entries,
-                    },
-                );
+                    route,
+                    LeafPage { next_leaf, entries },
+                    revision,
+                )?;
                 self.free_value(old_value, revision)?;
             }
             Err(index) => {

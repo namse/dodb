@@ -64,6 +64,45 @@ fn assert_documents_equal(actual: &[dodb_storage::Document], expected: &[dodb_te
 }
 
 #[test]
+fn crash_recovery_preserves_existing_value_leaf_split() {
+    let mut store = BTreeStore::open_with_wal(
+        CrashableFile::new(),
+        CrashableFile::new(),
+        DatabaseConfig::default().with_cache_capacity(0),
+    )
+    .unwrap();
+    let original_value = vec![0x31; 300];
+    let keys = (0u16..11)
+        .map(|index| DocumentKey::new(b"split-recovery", index.to_be_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    for document_key in &keys {
+        store
+            .put(document_key.clone(), original_value.clone())
+            .unwrap();
+    }
+    let replacement = vec![0x42; 500];
+    let revision = store.put(keys[5].clone(), replacement.clone()).unwrap();
+
+    let (mut data, mut wal) = store.into_files().unwrap();
+    data.crash();
+    wal.crash();
+    let mut reopened =
+        BTreeStore::open_with_wal(data, wal, DatabaseConfig::default().with_cache_capacity(0))
+            .unwrap();
+    assert_eq!(
+        reopened.get(&keys[5]).unwrap(),
+        RevisionState::present(replacement, revision)
+    );
+    let rows = reopened.scan(None, usize::MAX).unwrap();
+    assert_eq!(rows.len(), keys.len());
+    assert_eq!(
+        rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>(),
+        keys
+    );
+    reopened.check_invariants().unwrap();
+}
+
+#[test]
 fn deterministic_differential_sequences_match_reference() {
     // These seeds are part of the reproducible Phase 1 test corpus.
     for seed in [0x5eed_cafe_u64, 0x0123_4567_89ab_cdef, 0xd0db_2026_0001] {
