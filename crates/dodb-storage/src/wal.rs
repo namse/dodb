@@ -34,6 +34,18 @@ const COMMIT_PAYLOAD_SIZE: usize = 16;
 const SUPERBLOCK_A_PAGE: PageId = PageId::ZERO;
 const SUPERBLOCK_B_PAGE: PageId = PageId::new(1);
 
+/// Identifies the data-page decoder used to validate WAL page images.
+///
+/// The WAL frame protocol is intentionally shared by the baseline and the
+/// experimental engine.  Their page/superblock bodies are not shared, so the
+/// validator must be selected explicitly at open time instead of guessing
+/// from an image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalPageImageFormat {
+    Baseline,
+    ExperimentalBlink,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum WalRecordType {
@@ -158,6 +170,7 @@ pub struct WalLog<F: DurableFile> {
     page_images: usize,
     append_nanos: u64,
     sync_nanos: u64,
+    page_image_format: WalPageImageFormat,
 }
 
 impl<F: DurableFile> WalLog<F> {
@@ -174,14 +187,44 @@ impl<F: DurableFile> WalLog<F> {
     }
 
     pub fn open_with_fault_injector_and_start_lsn(
+        file: F,
+        identity: WalIdentity,
+        start_after_lsn: Lsn,
+        injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Self> {
+        Self::open_with_page_image_format_and_fault_injector_and_start_lsn(
+            file,
+            identity,
+            WalPageImageFormat::Baseline,
+            start_after_lsn,
+            injector,
+        )
+    }
+
+    pub fn open_with_page_image_format(
+        file: F,
+        identity: WalIdentity,
+        page_image_format: WalPageImageFormat,
+    ) -> Result<Self> {
+        Self::open_with_page_image_format_and_fault_injector_and_start_lsn(
+            file,
+            identity,
+            page_image_format,
+            Lsn::ZERO,
+            None,
+        )
+    }
+
+    pub fn open_with_page_image_format_and_fault_injector_and_start_lsn(
         mut file: F,
         identity: WalIdentity,
+        page_image_format: WalPageImageFormat,
         start_after_lsn: Lsn,
         mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
     ) -> Result<Self> {
         let length = file.len()?;
         if length == 0 {
-            return Self::initialize_empty(file, identity, start_after_lsn);
+            return Self::initialize_empty(file, identity, start_after_lsn, page_image_format);
         }
         if usize::try_from(length)
             .ok()
@@ -193,7 +236,7 @@ impl<F: DurableFile> WalLog<F> {
             file.sync_data().map_err(|error| {
                 Error::durability(format!("WAL torn INIT reset sync failed: {error}"))
             })?;
-            return Self::initialize_empty(file, identity, start_after_lsn);
+            return Self::initialize_empty(file, identity, start_after_lsn, page_image_format);
         }
 
         let (
@@ -204,7 +247,7 @@ impl<F: DurableFile> WalLog<F> {
             committed,
             mut report,
             valid_length,
-        ) = scan_wal(&mut file, &identity)?;
+        ) = scan_wal(&mut file, &identity, page_image_format)?;
         if valid_length < length {
             hit(&mut injector, "before_wal_tail_truncate")?;
             file.set_len(valid_length)?;
@@ -229,10 +272,16 @@ impl<F: DurableFile> WalLog<F> {
             page_images,
             append_nanos: 0,
             sync_nanos: 0,
+            page_image_format,
         })
     }
 
-    fn initialize_empty(file: F, identity: WalIdentity, start_after_lsn: Lsn) -> Result<Self> {
+    fn initialize_empty(
+        file: F,
+        identity: WalIdentity,
+        start_after_lsn: Lsn,
+        page_image_format: WalPageImageFormat,
+    ) -> Result<Self> {
         let next_lsn = start_after_lsn
             .get()
             .checked_add(1)
@@ -251,6 +300,7 @@ impl<F: DurableFile> WalLog<F> {
             page_images: 0,
             append_nanos: 0,
             sync_nanos: 0,
+            page_image_format,
         };
         let payload = wal.identity_payload(start_after_lsn);
         wal.append_frame(WalRecordType::Init, Lsn::ZERO, 0, 0, &payload, &mut None)?;
@@ -521,7 +571,7 @@ impl<F: DurableFile> WalLog<F> {
         let mut bytes_written = 0usize;
         for (index, page) in pages.iter().enumerate() {
             validate_page_image_lsn(page, commit.commit_lsn)?;
-            let payload = encode_page_image(page)?;
+            let payload = encode_page_image(page, self.page_image_format)?;
             digest_input.extend_from_slice(&payload);
             let record_lsn = Lsn::new(
                 first_record_lsn
@@ -731,7 +781,11 @@ type WalScanResult = (
     u64,
 );
 
-fn scan_wal<F: DurableFile>(file: &mut F, identity: &WalIdentity) -> Result<WalScanResult> {
+fn scan_wal<F: DurableFile>(
+    file: &mut F,
+    identity: &WalIdentity,
+    page_image_format: WalPageImageFormat,
+) -> Result<WalScanResult> {
     let length = file.len()?;
     let mut offset = 0u64;
     let mut previous_lsn = None;
@@ -846,7 +900,7 @@ fn scan_wal<F: DurableFile>(file: &mut F, identity: &WalIdentity) -> Result<WalS
             }
             WalRecordType::PageImage => {
                 let page = decode_page_image(&frame.payload)?;
-                validate_page_image(&page)?;
+                validate_page_image(&page, page_image_format)?;
                 if pending
                     .as_ref()
                     .is_none_or(|pending| pending.batch_id != frame.batch_id)
@@ -970,11 +1024,14 @@ fn verify_payload_checksum(header: &[u8], payload: &[u8], offset: u64) -> Result
     Ok(())
 }
 
-fn encode_page_image(page: &WalPageImage) -> Result<Vec<u8>> {
+fn encode_page_image(
+    page: &WalPageImage,
+    page_image_format: WalPageImageFormat,
+) -> Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(PAGE_IMAGE_PAYLOAD_SIZE);
     payload.extend_from_slice(&page.page_id.get().to_le_bytes());
     payload.extend_from_slice(&page.image);
-    validate_page_image(page)?;
+    validate_page_image(page, page_image_format)?;
     Ok(payload)
 }
 
@@ -991,11 +1048,29 @@ fn decode_page_image(payload: &[u8]) -> Result<WalPageImage> {
     })
 }
 
-fn validate_page_image(page: &WalPageImage) -> Result<()> {
+fn validate_page_image(page: &WalPageImage, page_image_format: WalPageImageFormat) -> Result<()> {
     if page.page_id == SUPERBLOCK_A_PAGE || page.page_id == SUPERBLOCK_B_PAGE {
-        decode_superblock(&page.image)?;
+        match page_image_format {
+            WalPageImageFormat::Baseline => {
+                decode_superblock(&page.image)?;
+            }
+            WalPageImageFormat::ExperimentalBlink => {
+                if page.page_id == SUPERBLOCK_A_PAGE || page.page_id == SUPERBLOCK_B_PAGE {
+                    crate::blink::decode_blink_superblock_image(&page.image)?;
+                } else {
+                    crate::blink::validate_blink_page_image(&page.image, page.page_id)?;
+                }
+            }
+        }
     } else {
-        decode_page_at(&page.image, Some(page.page_id))?;
+        match page_image_format {
+            WalPageImageFormat::Baseline => {
+                decode_page_at(&page.image, Some(page.page_id))?;
+            }
+            WalPageImageFormat::ExperimentalBlink => {
+                crate::blink::validate_blink_page_image(&page.image, page.page_id)?;
+            }
+        }
     }
     Ok(())
 }

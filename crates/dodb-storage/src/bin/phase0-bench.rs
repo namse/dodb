@@ -12,8 +12,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dodb_core::{
@@ -21,8 +21,8 @@ use dodb_core::{
     TransactionRequest, TransactionResult,
 };
 use dodb_storage::{
-    AsyncShard, BTreeStore, BatchRequest, BatchResponse, CoordinatorConfig, DatabaseConfig,
-    DurableFile, ProductionFile, StorageMetrics, WalMetrics,
+    AsyncShard, BTreeStore, BatchRequest, BatchResponse, BlinkSplitMetrics, BlinkStore,
+    CoordinatorConfig, DatabaseConfig, DurableFile, ProductionFile, StorageMetrics, WalMetrics,
 };
 
 const BASELINE_COMMIT: &str = "1ff96e1b3d205074d4c1b820f5f2680bd3226a8b";
@@ -166,6 +166,29 @@ enum SyncMode {
     Injected,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EngineKind {
+    MainBtree,
+    SerialBlink,
+}
+
+impl EngineKind {
+    fn parse(value: &str) -> Self {
+        match value {
+            "main-btree" | "btree" | "main" => Self::MainBtree,
+            "serial-blink" | "blink" => Self::SerialBlink,
+            other => panic!("unknown engine {other:?}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MainBtree => "main-btree",
+            Self::SerialBlink => "serial-blink",
+        }
+    }
+}
+
 impl SyncMode {
     fn parse(value: &str) -> Self {
         match value {
@@ -220,6 +243,7 @@ impl Mix {
 
 #[derive(Clone, Debug)]
 struct Args {
+    engine: EngineKind,
     suite: Suite,
     writers: Option<Vec<usize>>,
     readers: Option<Vec<usize>>,
@@ -250,6 +274,7 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
+            engine: EngineKind::MainBtree,
             suite: Suite::Write,
             writers: None,
             readers: None,
@@ -291,6 +316,7 @@ impl Args {
                     std::process::exit(0);
                 }
                 "--suite" => args.suite = Suite::parse(&take_value(&mut values, &flag)),
+                "--engine" => args.engine = EngineKind::parse(&take_value(&mut values, &flag)),
                 "--writers" => args.writers = Some(parse_list(&take_value(&mut values, &flag))),
                 "--readers" => args.readers = Some(parse_list(&take_value(&mut values, &flag))),
                 "--widths" | "--transaction-widths" => {
@@ -428,6 +454,7 @@ fn print_help() {
     println!(
         "phase0-bench sustained baseline\n\n\
          Usage: cargo run --release -p dodb-storage --bin phase0-bench -- [options]\n\n\
+         --engine main-btree|serial-blink\n\
          Suites: write, read, mixed, delay-sweep, sync-sweep, all\n\
          Options: --writers 1,4 --readers 1,4 --widths 1,16\n\
          --distributions uniform,same-leaf-heavy,different-leaf-heavy\n\
@@ -941,6 +968,7 @@ struct EngineSnapshot {
     coordinator: dodb_storage::CoordinatorMetrics,
     storage: Option<StorageMetrics>,
     wal: Option<WalMetrics>,
+    blink: Option<BlinkSplitMetrics>,
 }
 
 trait EngineAdapter: Send + Sync {
@@ -974,11 +1002,181 @@ impl EngineAdapter for BaselineAdapter {
             coordinator: self.shard.coordinator_metrics(),
             storage: self.shard.storage_metrics(),
             wal: self.shard.wal_metrics(),
+            blink: None,
         }
     }
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
         Box::pin(self.shard.shutdown())
+    }
+}
+
+struct BlinkWork {
+    request: TransactionRequest,
+    enqueued: Instant,
+    response: tokio::sync::oneshot::Sender<Result<TransactionResult>>,
+}
+
+struct BlinkAdapter {
+    sender: tokio::sync::mpsc::Sender<BlinkWork>,
+    store: Arc<Mutex<BlinkStore<BenchFile, BenchFile>>>,
+    coordinator_metrics: Arc<Mutex<dodb_storage::CoordinatorMetrics>>,
+}
+
+impl BlinkAdapter {
+    fn start(store: BlinkStore<BenchFile, BenchFile>, config: CoordinatorConfig) -> Self {
+        let store = Arc::new(Mutex::new(store));
+        let coordinator_metrics = Arc::new(Mutex::new(dodb_storage::CoordinatorMetrics::default()));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<BlinkWork>(config.queue_capacity.max(1));
+        let worker_store = Arc::clone(&store);
+        let worker_metrics = Arc::clone(&coordinator_metrics);
+        tokio::spawn(async move {
+            while let Some(first) = receiver.recv().await {
+                let collection_started = Instant::now();
+                let mut batch = vec![first];
+                if config.max_collection_delay.is_zero() {
+                    while batch.len() < config.max_group_requests {
+                        match receiver.try_recv() {
+                            Ok(work) => batch.push(work),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                } else {
+                    let deadline = tokio::time::Instant::from_std(
+                        collection_started + config.max_collection_delay,
+                    );
+                    while batch.len() < config.max_group_requests {
+                        match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                            Ok(Some(work)) => batch.push(work),
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                }
+                let collection_nanos = collection_started.elapsed().as_nanos() as u64;
+                let requests = batch
+                    .iter()
+                    .map(|work| work.request.clone())
+                    .collect::<Vec<_>>();
+                let processing_started = Instant::now();
+                let results = match worker_store.lock() {
+                    Ok(mut store) => store.apply_transaction_group(&requests),
+                    Err(_) => Err(Error::invariant("serial Blink benchmark mutex poisoned")),
+                };
+                let processing_nanos = processing_started.elapsed().as_nanos() as u64;
+                if let Ok(mut metrics) = worker_metrics.lock() {
+                    metrics.groups = metrics.groups.saturating_add(1);
+                    metrics.queued_requests =
+                        metrics.queued_requests.saturating_add(batch.len() as u64);
+                    metrics.logical_transactions = metrics
+                        .logical_transactions
+                        .saturating_add(batch.len() as u64);
+                    metrics.batch_collection_nanos = metrics
+                        .batch_collection_nanos
+                        .saturating_add(collection_nanos);
+                    metrics.processing_nanos =
+                        metrics.processing_nanos.saturating_add(processing_nanos);
+                    metrics.max_group_requests = metrics.max_group_requests.max(batch.len());
+                }
+                let results = match results {
+                    Ok(results) => results,
+                    Err(error) => batch
+                        .iter()
+                        .map(|_| Err(Error::durability(error.to_string())))
+                        .collect(),
+                };
+                if let Ok(mut metrics) = worker_metrics.lock() {
+                    for work in &batch {
+                        metrics.queue_wait_nanos = metrics
+                            .queue_wait_nanos
+                            .saturating_add(work.enqueued.elapsed().as_nanos() as u64);
+                    }
+                }
+                for (work, result) in batch.into_iter().zip(results) {
+                    let _ = work.response.send(result);
+                }
+            }
+        });
+        Self {
+            sender,
+            store,
+            coordinator_metrics,
+        }
+    }
+}
+
+impl EngineAdapter for BlinkAdapter {
+    fn execute_transaction<'a>(
+        &'a self,
+        request: TransactionRequest,
+    ) -> BoxFuture<'a, Result<TransactionResult>> {
+        let sender = self.sender.clone();
+        Box::pin(async move {
+            let (response, receiver) = tokio::sync::oneshot::channel();
+            sender
+                .try_send(BlinkWork {
+                    request,
+                    enqueued: Instant::now(),
+                    response,
+                })
+                .map_err(|error| match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        Error::overloaded("serial Blink benchmark queue is full")
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        Error::invariant("serial Blink benchmark coordinator stopped")
+                    }
+                })?;
+            receiver
+                .await
+                .map_err(|_| Error::invariant("serial Blink benchmark response dropped"))?
+        })
+    }
+
+    fn execute<'a>(&'a self, request: BatchRequest) -> BoxFuture<'a, Result<BatchResponse>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let mut store = store
+                .lock()
+                .map_err(|_| Error::invariant("serial Blink benchmark mutex poisoned"))?;
+            store
+                .apply_batch(&[request])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::invariant("serial Blink returned no response"))
+        })
+    }
+
+    fn snapshot(&self) -> EngineSnapshot {
+        let Ok(store) = self.store.lock() else {
+            return EngineSnapshot {
+                coordinator: dodb_storage::CoordinatorMetrics::default(),
+                storage: None,
+                wal: None,
+                blink: None,
+            };
+        };
+        EngineSnapshot {
+            coordinator: self
+                .coordinator_metrics
+                .lock()
+                .map(|metrics| metrics.clone())
+                .unwrap_or_default(),
+            storage: Some(store.storage_metrics()),
+            wal: store.wal_metrics().ok().flatten(),
+            blink: Some(store.split_metrics()),
+        }
+    }
+
+    fn shutdown<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let mut store = store
+                .lock()
+                .map_err(|_| Error::invariant("serial Blink benchmark mutex poisoned"))?;
+            store.flush()
+        })
     }
 }
 
@@ -1127,6 +1325,16 @@ struct MetricDelta {
     page_images: u64,
     wal_append_nanos: u64,
     wal_sync_nanos: u64,
+    leaf_splits: u64,
+    internal_splits: u64,
+    root_splits: u64,
+    right_link_corrections: u64,
+    pages_touched: u64,
+    blink_page_images: u64,
+    leaf_splits_total: u64,
+    internal_splits_total: u64,
+    root_splits_total: u64,
+    right_link_corrections_total: u64,
 }
 
 impl MetricDelta {
@@ -1136,6 +1344,8 @@ impl MetricDelta {
         let storage_after = after.storage.clone().unwrap_or_default();
         let wal_before = before.wal.clone().unwrap_or_default();
         let wal_after = after.wal.clone().unwrap_or_default();
+        let blink_before = before.blink.clone().unwrap_or_default();
+        let blink_after = after.blink.clone().unwrap_or_default();
         Self {
             groups: subtraction(after.coordinator.groups, before.coordinator.groups),
             queued_requests: subtraction(
@@ -1181,6 +1391,19 @@ impl MetricDelta {
             page_images: subtraction(wal_after.page_images as u64, wal_before.page_images as u64),
             wal_append_nanos: subtraction(wal_after.append_nanos, wal_before.append_nanos),
             wal_sync_nanos: subtraction(wal_after.sync_nanos, wal_before.sync_nanos),
+            leaf_splits: subtraction(blink_after.leaf_splits, blink_before.leaf_splits),
+            internal_splits: subtraction(blink_after.internal_splits, blink_before.internal_splits),
+            root_splits: subtraction(blink_after.root_splits, blink_before.root_splits),
+            right_link_corrections: subtraction(
+                blink_after.right_link_corrections,
+                blink_before.right_link_corrections,
+            ),
+            pages_touched: subtraction(blink_after.pages_touched, blink_before.pages_touched),
+            blink_page_images: subtraction(blink_after.page_images, blink_before.page_images),
+            leaf_splits_total: blink_after.leaf_splits,
+            internal_splits_total: blink_after.internal_splits,
+            root_splits_total: blink_after.root_splits,
+            right_link_corrections_total: blink_after.right_link_corrections,
         }
     }
 
@@ -1519,6 +1742,15 @@ fn seed_store(
     args: &Args,
     scenario: &Scenario,
 ) -> Result<usize> {
+    let requests = seed_requests(args, scenario);
+    let seeded = requests.iter().map(|request| request.mutations.len()).sum();
+    for chunk in requests.chunks(64) {
+        store.apply_transaction_group(chunk)?;
+    }
+    Ok(seeded)
+}
+
+fn seed_requests(args: &Args, scenario: &Scenario) -> Vec<TransactionRequest> {
     let workload = WorkloadConfig {
         distribution: scenario.distribution,
         working_set: args.working_set,
@@ -1569,11 +1801,7 @@ fn seed_store(
         }
     }
 
-    let seeded = requests.iter().map(|request| request.mutations.len()).sum();
-    for chunk in requests.chunks(64) {
-        store.apply_transaction_group(chunk)?;
-    }
-    Ok(seeded)
+    requests
 }
 
 async fn open_adapter(
@@ -1586,17 +1814,36 @@ async fn open_adapter(
     let wal_path = data_path.with_extension("wal");
     remove_database_files(&data_path);
     let (_, sync_delay) = effective_sync(args, scenario);
-    let mut store = BTreeStore::open_with_wal(
-        BenchFile::open(&data_path, sync_delay)?,
-        BenchFile::open(&wal_path, sync_delay)?,
-        DatabaseConfig::default().with_cache_capacity(args.cache_capacity),
-    )?;
-    let seeded = seed_store(&mut store, args, scenario)?;
-    let shard = Arc::new(AsyncShard::start_with_config(
-        store,
-        benchmark_config(args, scenario),
-    ));
-    Ok((Arc::new(BaselineAdapter { shard }), data_path, seeded))
+    let config = DatabaseConfig::default().with_cache_capacity(args.cache_capacity);
+    match args.engine {
+        EngineKind::MainBtree => {
+            let mut store = BTreeStore::open_with_wal(
+                BenchFile::open(&data_path, sync_delay)?,
+                BenchFile::open(&wal_path, sync_delay)?,
+                config,
+            )?;
+            let seeded = seed_store(&mut store, args, scenario)?;
+            let shard = Arc::new(AsyncShard::start_with_config(
+                store,
+                benchmark_config(args, scenario),
+            ));
+            Ok((Arc::new(BaselineAdapter { shard }), data_path, seeded))
+        }
+        EngineKind::SerialBlink => {
+            let mut store = BlinkStore::open_with_wal(
+                BenchFile::open(&data_path, sync_delay)?,
+                BenchFile::open(&wal_path, sync_delay)?,
+                config,
+            )?;
+            let requests = seed_requests(args, scenario);
+            let seeded = requests.iter().map(|request| request.mutations.len()).sum();
+            for chunk in requests.chunks(64) {
+                store.apply_transaction_group(chunk)?;
+            }
+            let adapter = BlinkAdapter::start(store, benchmark_config(args, scenario));
+            Ok((Arc::new(adapter), data_path, seeded))
+        }
+    }
 }
 
 fn remove_database_files(data_path: &Path) {
@@ -1714,7 +1961,7 @@ fn build_record(
     json.u64("timestamp_unix_ms", unix_timestamp_ms() as u64);
     json.string("git_commit", &current_git_commit());
     json.string("baseline_commit", BASELINE_COMMIT);
-    json.string("engine", "main-btree");
+    json.string("engine", args.engine.as_str());
     json.string(
         "build_mode",
         if cfg!(debug_assertions) {
@@ -1835,6 +2082,19 @@ fn build_record(
     json.u64("wal_append_nanos_total", delta.wal_append_nanos);
     json.u64("wal_sync_nanos_total", delta.wal_sync_nanos);
     json.f64("transactions_per_sync", delta.transactions_per_sync());
+    json.u64("leaf_splits", delta.leaf_splits);
+    json.u64("internal_splits", delta.internal_splits);
+    json.u64("root_splits", delta.root_splits);
+    json.u64("right_link_corrections", delta.right_link_corrections);
+    json.u64("pages_touched", delta.pages_touched);
+    json.u64("blink_page_images", delta.blink_page_images);
+    json.u64("leaf_splits_total", delta.leaf_splits_total);
+    json.u64("internal_splits_total", delta.internal_splits_total);
+    json.u64("root_splits_total", delta.root_splits_total);
+    json.u64(
+        "right_link_corrections_total",
+        delta.right_link_corrections_total,
+    );
     json.string(
         "component_timing_scope",
         "existing cumulative coordinator/storage/WAL metrics; per-request component percentiles unavailable without production hot-path instrumentation",
@@ -1942,7 +2202,8 @@ fn open_output(path: &Path) -> std::fs::File {
 fn run(args: Args) -> Result<()> {
     let machine = MachineInfo::collect();
     println!(
-        "phase0-bench engine=main-btree build={} cpu={:?} logical_cpus={} tokio_workers={} duration={:?} warmup={:?} repetitions={}",
+        "phase0-bench engine={} build={} cpu={:?} logical_cpus={} tokio_workers={} duration={:?} warmup={:?} repetitions={}",
+        args.engine.as_str(),
         if cfg!(debug_assertions) {
             "debug"
         } else {
