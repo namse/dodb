@@ -2,10 +2,13 @@
 
 This record is the Phase 1 companion to
 [`b-link-batched-engine.md`](b-link-batched-engine.md). It describes the
-experimental engine at commit `0d023088f73fb0040e01a97c3897cf57dbd69773` and the
-focused serial control runs. It does not implement or claim Phase 2
-optimistic reads, epoch reclamation, multi-writer page workers, batch planning,
-same-leaf coalescing, concurrent SMO, or WAL redesign.
+experimental engine at the historical implementation commit
+`0d023088f73fb0040e01a97c3897cf57dbd69773` and the focused serial control
+runs. Phase 2 intentionally started from the later requested branch HEAD
+`23dc4b38b9249e2f7814c099866be100ef0a54a0`; this document is not the identity
+of the current branch. It does not implement or claim Phase 2 optimistic
+reads, epoch reclamation, multi-writer page workers, batch planning, same-leaf
+coalescing, concurrent SMO, or WAL redesign.
 
 ## Scope and identity
 

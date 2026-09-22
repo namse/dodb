@@ -1,12 +1,20 @@
 # B-link + Batched Storage Engine Experiment
 
-Status: design and experiment plan only. No experimental storage-engine implementation is part of this document or this branch yet.
+Status: Phase 2 implementation and benchmark complete. Phase 3 batching and
+coalescing work has not started.
 
 Baseline branch: `main`
 
 Baseline commit: `1ff96e1` (`storage: rely on crash-consistent storage snapshots`)
 
 Experiment branch: `experiment/b-link-batched-engine`
+
+Phase 2 result: [`phase2-results.md`](phase2-results.md)
+
+The Phase 1 implementation SHA recorded in the earlier result document is a
+historical identity only. Phase 2 started from the requested branch HEAD,
+`23dc4b38b9249e2f7814c099866be100ef0a54a0`, and its implementation and test
+commits are recorded in `phase2-results.md`.
 
 This document is the source of truth for the later implementation and for the
 benchmark that decides whether the experimental engine should be adopted. It
@@ -197,6 +205,26 @@ reads one coordinator state in input order.
 This is a useful baseline safety mechanism, but it is not the target read
 architecture: a global view lock is still present and ordinary read traversal
 is not a page-versioned, lock-free/optimistic path.
+
+### 3.6 Phase 2 versioned read implementation
+
+The Phase 1 `serial-blink` selector remains unchanged as the serial control.
+Phase 2 adds `versioned-blink`. Its writer is still the same one-coordinator,
+serial Blink mutation path, but `Get`, `Query`, and `Scan` use a separate
+`BlinkReadHandle` and never lock the writer store or enter its queue.
+
+The read handle pins an immutable `PublishedGeneration` through a short
+`std::sync::RwLock` snapshot. Traversal then uses an immutable
+`PageCatalog` (`PageId -> Arc<PageCell>`) and releases all publication
+synchronization before it reads the root, internal pages, leaf chain, or
+overflow values. A publication replaces cells only for pages changed by the
+whole physical group; old generation Arcs retain old cells until their last
+reader releases them. High-key/right-link correction is performed against the
+pinned catalog.
+
+The detailed architecture, ordering proof, reclamation rule, tests, and
+results are in [`phase2-results.md`](phase2-results.md). The benchmark
+selector accepts `main-btree`, `serial-blink`, and `versioned-blink`.
 
 ### 3.6 Current durability path
 
