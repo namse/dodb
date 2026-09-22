@@ -814,6 +814,11 @@ semantic/durability hardening phase.
 - Validate the harness against the existing phase benchmark and all current
   tests.
 
+The executed baseline record, raw-artifact paths, and the Phase 0 decisions are
+kept in [the Phase 0 result record](phase0-results.md). That record is part of
+this experiment's source of truth; its measurements must not be confused with
+the historical short-run `phase4-bench` numbers described in Section 3.7.
+
 ### Phase 1 — B-link format, invariants, and serial correctness
 
 - Add the experimental page/superblock format and decoder/checker in the
