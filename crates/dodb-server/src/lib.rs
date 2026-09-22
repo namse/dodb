@@ -19,8 +19,8 @@ use dodb_service::{
     TransactionOutcome,
 };
 use dodb_storage::{
-    AsyncShard, BTreeStore, BatchRequest, BatchResponse, CoordinatorConfig, DatabaseConfig,
-    FaultInjector, ProductionFile,
+    AsyncShard, BTreeStore, BatchRequest, BatchResponse, CheckpointReport, CoordinatorConfig,
+    DatabaseConfig, FaultInjector, InvariantReport, ProductionFile,
 };
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn::{Connection, Endpoint, Incoming, ServerConfig as QuinnServerConfig, VarInt};
@@ -605,6 +605,41 @@ impl LocalTenantService {
         for shard in shards {
             let _ = shard.shutdown().await;
         }
+    }
+
+    /// Checkpoints every currently open tenant shard. This is intentionally a
+    /// small administrative hook for validation tooling; the client protocol
+    /// does not expose checkpoints.
+    pub async fn checkpoint_all(&self) -> Result<Vec<(TenantId, CheckpointReport)>, Error> {
+        let shards = self.open_shard_handles().await;
+        let mut reports = Vec::with_capacity(shards.len());
+        for (tenant, shard) in shards {
+            reports.push((tenant, shard.checkpoint().await?));
+        }
+        Ok(reports)
+    }
+
+    /// Runs the storage invariant checker for every currently open shard.
+    /// Callers should use this after quiescing request traffic when they need a
+    /// stable logical verification point.
+    pub async fn check_invariants_all(&self) -> Result<Vec<(TenantId, InvariantReport)>, Error> {
+        let shards = self.open_shard_handles().await;
+        let mut reports = Vec::with_capacity(shards.len());
+        for (tenant, shard) in shards {
+            reports.push((tenant, shard.check_invariants().await?));
+        }
+        Ok(reports)
+    }
+
+    async fn open_shard_handles(
+        &self,
+    ) -> Vec<(TenantId, Arc<AsyncShard<ProductionFile, ProductionFile>>)> {
+        self.shards
+            .lock()
+            .await
+            .iter()
+            .map(|(tenant, shard)| (*tenant, Arc::clone(shard)))
+            .collect()
     }
 
     async fn execute_request(

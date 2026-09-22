@@ -9,7 +9,8 @@ use dodb_core::{
 
 use super::format::{MAX_OVERFLOW_PAGES, PageData, ValueRef};
 use super::{
-    BTreeStore, BatchRequest, BatchResponse, CheckpointReport, StorageMetrics, validate_encoded_key,
+    BTreeStore, BatchRequest, BatchResponse, CheckpointReport, InvariantReport, StorageMetrics,
+    validate_encoded_key,
 };
 use crate::DurableFile;
 use crate::wal::WalMetrics;
@@ -203,6 +204,18 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
         }
     }
 
+    /// Runs the storage invariant checker at the coordinator serialization
+    /// point. This is an explicit inspection hook for validation tools; it is
+    /// not part of the client protocol.
+    pub async fn check_invariants(&self) -> Result<InvariantReport> {
+        match self.send(CoordinatorOperation::CheckInvariants).await? {
+            CoordinatorResponse::Invariants(report) => Ok(report),
+            _ => Err(Error::invariant(
+                "coordinator returned the wrong invariant response",
+            )),
+        }
+    }
+
     fn try_read(
         &self,
         request: &BatchRequest,
@@ -327,6 +340,7 @@ enum CoordinatorResponse {
     TransactGet(Vec<RevisionState>),
     Observe(Vec<ObservedState>),
     Checkpoint(CheckpointReport),
+    Invariants(InvariantReport),
 }
 
 fn try_enqueue(
@@ -617,6 +631,9 @@ fn process_segment<F: DurableFile, W: DurableFile>(
             CoordinatorOperation::Checkpoint => {
                 store.checkpoint().map(CoordinatorResponse::Checkpoint)
             }
+            CoordinatorOperation::CheckInvariants => {
+                store.check_invariants().map(CoordinatorResponse::Invariants)
+            }
         })
         .collect();
     Ok(responses)
@@ -762,6 +779,7 @@ fn operation_size(operation: &CoordinatorOperation) -> usize {
             .map(|key| key.encode().len())
             .fold(0usize, usize::saturating_add),
         CoordinatorOperation::Checkpoint => 0,
+        CoordinatorOperation::CheckInvariants => 0,
     }
 }
 

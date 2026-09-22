@@ -8,6 +8,7 @@ members = [
     "crates/dodb-server",
     "crates/dodb-storage",
     "crates/dodb-testkit",
+    "crates/dodb-soak",
 ]
 
 [workspace.package]
@@ -17,7 +18,11 @@ version = "0.1.0"
 
 [workspace.dependencies]
 crc32c = "0.6"
+mimalloc = { version = "0.1", features = ["extended"] }
 quinn = "0.11.11"
 proptest = "1.6"
+rcgen = "0.14"
 rustls-pemfile = "2.2"
-tokio = { version = "1.48", features = ["macros", "rt", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
