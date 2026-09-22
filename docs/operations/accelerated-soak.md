@@ -30,10 +30,14 @@ resource and phase sizing explicit. Connection churn can be disabled with
 --no-connection-churn when isolating another failure.
 
 The generator is seeded and does not use thread-local entropy after startup.
-The seed, profile, phase, operation index, elapsed time, tenant, operation kind,
-and a bounded recent-operation ring are retained in the report. Repeating the
-same seed and profile repeats the logical generated operation sequence; task
-scheduling can still change the order in which concurrent requests commit.
+Recent and failing operation artifacts record the run seed, phase, phase-local
+operation index, global operation index, workload configuration, generated
+operation, elapsed time, tenant, and result in a bounded ring. Operation
+generation is deterministic for a recorded phase seed/index; wall-clock
+scheduling and the total number of operations completed by a timed phase are
+not deterministic. Replaying a failure therefore uses the recorded phase and
+index rather than depending on a previous run producing the same phase length.
+Task scheduling can still change the order in which concurrent requests commit.
 
 For a limited validation window, three independent short seeds are often more
 informative than one partially completed long run:
@@ -82,10 +86,13 @@ with the process termination operation used by Tokio; the same child-process
 kill path is used on other supported platforms.
 
 A lost mutation response is not treated as a failed mutation. Values contain a
-bounded, human-readable soak_operation_id marker. After restart, the harness
-reads the affected keys. A multi-key transaction is accepted only when all
-mutations are visible or none are visible; a partial result fails the run.
-Unknown outcomes, crash history, recent operations, server logs, resource
+bounded, human-readable soak_operation_id marker. At every quiescent boundary,
+the harness stops production, waits for workload and connection-churn tasks,
+reads the affected keys, and reconciles the complete overlapping pending set
+against the recovered final state. Several single-key mutations may have
+committed and overwritten one another; multi-key transactions are explored as
+atomic events and a true partial transaction fails the run. Unknown outcomes,
+checkpoint failures, crash history, recent operations, server logs, resource
 samples, and the last successful verification are included in artifacts.
 
 ## Metrics and artifacts
@@ -100,9 +107,14 @@ other platforms mark unavailable process metrics rather than fabricating them.
 
 Resource diagnostics ignore a warm-up window and compare later windows. A
 sustained late-window slope emits a warning; noisy RSS behavior is reported as
-a warning rather than a brittle single-sample failure. Semantic failures such
-as model mismatches, partial atomic transactions, recovery failures, invariant
-failures, and unreconciled outcomes fail immediately.
+a warning rather than a brittle single-sample failure. Normal phase cleanup is
+observed after reconciliation and full verification, after the workload QUIC
+connection is closed, and after a bounded settle window. Post-quiescence
+active streams must be zero and active connections must return to the idle
+baseline; the report records the post-quiescence stream, connection, and FD
+samples. Semantic failures such as model mismatches, partial atomic
+transactions, recovery failures, checkpoint or invariant failures, and
+unreconciled outcomes fail immediately.
 
 Each run writes a timestamped directory below target/dodb-soak by default.
 It contains report.json, recent operations, resource samples, per-child

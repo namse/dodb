@@ -11,10 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dodb_client::{ClientError, ClientTlsConfig, DodbClient, DodbConnection};
 use dodb_core::{
-    DocumentKey, PrimaryKey, Revision, RevisionState, TenantId, TransactionCondition,
-    TransactionMutation, TransactionRequest,
+    ConditionExpectation, DocumentKey, ObservedState, PrimaryKey, Revision, RevisionState,
+    TenantId, TransactionCondition, TransactionMutation, TransactionRequest,
 };
-use dodb_protocol::{ApplicationErrorKind, ProtocolLimits};
+use dodb_protocol::{ApplicationErrorKind, ConflictDetails, ProtocolLimits};
 use dodb_server::{
     DodbServer, DodbServerConfig, LocalTenantService, LocalTenantServiceConfig, ServerTlsConfig,
 };
@@ -27,8 +27,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use dodb_soak::{
     DeterministicRng, GeneratedOperation, LatencyStats, OperationGenerator, OperationRecord,
     PlannedMutation, PlannedMutationKind, RecentOperations, ReferenceModel, ResourceSample,
-    TrendDiagnostic, UnknownMutationResolution, WorkloadConfig, classify_unknown_mutation,
-    trend_diagnostic,
+    TrendDiagnostic, UnknownMutationResolution, WorkloadConfig, parse_event_lines,
+    reconcile_unknown_operations, trend_diagnostic,
 };
 
 #[global_allocator]
@@ -298,6 +298,8 @@ async fn run_server_child(args: &[String]) -> Result<(), BoxError> {
     let event_file = PathBuf::from(argument(args, "--event-file")?);
     let shutdown_file = PathBuf::from(argument(args, "--shutdown-file")?);
     let checkpoint_ms: u64 = argument(args, "--checkpoint-ms")?.parse()?;
+    let cycle: u64 = argument(args, "--cycle")?.parse()?;
+    let event_writer = EventWriter::new(event_file.clone(), cycle);
     let service_data_dir = data_dir.clone();
     let service = Arc::new(LocalTenantService::new(LocalTenantServiceConfig {
         data_dir,
@@ -322,15 +324,14 @@ async fn run_server_child(args: &[String]) -> Result<(), BoxError> {
         },
     )?);
     fs::write(&ready_file, server.local_addr()?.to_string())?;
-    append_event(
-        &event_file,
-        &serde_json::json!({"kind":"ready", "pid":std::process::id()}),
-    )?;
+    event_writer.append(&serde_json::json!({"kind":"ready", "pid":std::process::id()}))?;
 
     let checkpoint_service = Arc::clone(&service);
-    let checkpoint_events = event_file.clone();
+    let checkpoint_events = event_writer.clone();
     let checkpoint_shutdown = shutdown_file.clone();
     let checkpoint_data_dir = service_data_dir.clone();
+    let event_error = Arc::new(Mutex::new(None::<String>));
+    let checkpoint_event_error = Arc::clone(&event_error);
     let checkpoint_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(checkpoint_ms.max(1)));
         loop {
@@ -356,35 +357,42 @@ async fn run_server_child(args: &[String]) -> Result<(), BoxError> {
                     let invariant = checkpoint_service.check_invariants_all().await;
                     let invariant_count = invariant.as_ref().map_or(0, Vec::len);
                     let wal_after = directory_bytes(&checkpoint_data_dir, "wal");
-                    let _ = append_event(
-                        &checkpoint_events,
-                        &serde_json::json!({
-                            "kind":"checkpoint",
-                            "checkpoint_lsn":checkpoint_lsn,
-                            "pages_flushed":pages_flushed,
-                            "bytes_written":bytes_written,
-                            "wal_bytes_reclaimed":wal_reclaimed,
-                            "wal_bytes_before":wal_before,
-                            "wal_bytes_after":wal_after,
-                            "duration_nanos":duration_nanos,
-                            "invariant_shards":invariant_count,
-                            "invariant_error":invariant.err().map(|error| error.to_string())
-                        }),
-                    );
+                    if let Err(error) = checkpoint_events.append(&serde_json::json!({
+                        "kind":"checkpoint",
+                        "checkpoint_lsn":checkpoint_lsn,
+                        "pages_flushed":pages_flushed,
+                        "bytes_written":bytes_written,
+                        "wal_bytes_reclaimed":wal_reclaimed,
+                        "wal_bytes_before":wal_before,
+                        "wal_bytes_after":wal_after,
+                        "duration_nanos":duration_nanos,
+                        "invariant_shards":invariant_count,
+                        "invariant_error":invariant.err().map(|error| error.to_string())
+                    })) {
+                        if let Ok(mut event_error) = checkpoint_event_error.lock() {
+                            *event_error = Some(error.to_string());
+                        }
+                        break;
+                    }
                 }
                 Err(error) => {
-                    let _ = append_event(
-                        &checkpoint_events,
+                    if let Err(event_error) = checkpoint_events.append(
                         &serde_json::json!({"kind":"checkpoint_error", "error":error.to_string()}),
-                    );
+                    ) {
+                        if let Ok(mut recorded) = checkpoint_event_error.lock() {
+                            *recorded = Some(event_error.to_string());
+                        }
+                        break;
+                    }
                 }
             }
         }
     });
 
     let metrics_server = Arc::clone(&server);
-    let metrics_events = event_file.clone();
+    let metrics_events = event_writer;
     let metrics_shutdown = shutdown_file.clone();
+    let metrics_event_error = Arc::clone(&event_error);
     let metrics_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -396,20 +404,22 @@ async fn run_server_child(args: &[String]) -> Result<(), BoxError> {
             let allocator = mimalloc::MiMalloc::stats_json()
                 .ok()
                 .map(|stats| stats.to_string_lossy().into_owned());
-            let _ = append_event(
-                &metrics_events,
-                &serde_json::json!({
-                    "kind":"metrics",
-                    "active_connections":metrics.active_connections,
-                    "active_streams":metrics.active_streams,
-                    "requests_total":metrics.requests_total,
-                    "connections_total":metrics.connections_total,
-                    "transport_errors":metrics.transport_errors,
-                    "application_errors":metrics.application_errors,
-                    "overloaded_responses":metrics.overloaded_responses,
-                    "allocator":allocator
-                }),
-            );
+            if let Err(error) = metrics_events.append(&serde_json::json!({
+                "kind":"metrics",
+                "active_connections":metrics.active_connections,
+                "active_streams":metrics.active_streams,
+                "requests_total":metrics.requests_total,
+                "connections_total":metrics.connections_total,
+                "transport_errors":metrics.transport_errors,
+                "application_errors":metrics.application_errors,
+                "overloaded_responses":metrics.overloaded_responses,
+                "allocator":allocator
+            })) {
+                if let Ok(mut event_error) = metrics_event_error.lock() {
+                    *event_error = Some(error.to_string());
+                }
+                break;
+            }
         }
     });
 
@@ -432,12 +442,56 @@ async fn run_server_child(args: &[String]) -> Result<(), BoxError> {
     }
     checkpoint_task.abort();
     metrics_task.abort();
+    if let Ok(event_error) = event_error.lock()
+        && let Some(error) = event_error.clone()
+    {
+        return Err(format!("event writer failed: {error}").into());
+    }
     Ok(())
 }
 
-fn append_event(path: &Path, value: &serde_json::Value) -> io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{value}")
+#[derive(Clone)]
+struct EventWriter {
+    path: PathBuf,
+    cycle: u64,
+    lock: Arc<Mutex<()>>,
+}
+
+impl EventWriter {
+    fn new(path: PathBuf, cycle: u64) -> Self {
+        Self {
+            path,
+            cycle,
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn append(&self, value: &serde_json::Value) -> io::Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| io::Error::other("event writer lock poisoned"))?;
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "timestamp_ms".to_owned(),
+                serde_json::json!(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                ),
+            );
+            object.insert("cycle".to_owned(), serde_json::json!(self.cycle));
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        serde_json::to_writer(&mut file, &value).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.flush()
+    }
 }
 
 async fn start_server(
@@ -471,6 +525,8 @@ async fn start_server(
         .arg(&event_file)
         .arg("--shutdown-file")
         .arg(&shutdown_file)
+        .arg("--cycle")
+        .arg(cycle.to_string())
         .arg("--checkpoint-ms")
         .arg(checkpoint_interval.as_millis().max(1).to_string())
         .stdout(Stdio::from(stdout))
@@ -537,10 +593,13 @@ struct Counters {
     transport_errors: AtomicU64,
     application_errors: AtomicU64,
     checkpoints: AtomicU64,
+    checkpoint_failures: AtomicU64,
     crashes: AtomicU64,
     recoveries: AtomicU64,
     verifications: AtomicU64,
+    invariant_checks: AtomicU64,
     invariant_passes: AtomicU64,
+    invariant_failures: AtomicU64,
     connection_churn: AtomicU64,
 }
 
@@ -593,7 +652,15 @@ impl RunState {
 struct PendingMutation {
     index: u64,
     operation: GeneratedOperation,
-    before: Vec<(DocumentKey, RevisionState)>,
+}
+
+#[derive(Clone, Copy)]
+struct OperationIdentity<'a> {
+    global_index: u64,
+    phase: &'a str,
+    phase_index: u64,
+    seed: u64,
+    workload_config: &'a WorkloadConfig,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -716,7 +783,7 @@ fn apply_planned_mutations(
 
 fn record_operation(
     state: &Arc<RunState>,
-    index: u64,
+    identity: OperationIdentity<'_>,
     operation: &GeneratedOperation,
     status: &str,
     started: Instant,
@@ -733,12 +800,72 @@ fn record_operation(
     }
     if let Ok(mut recent) = state.recent.lock() {
         recent.push(OperationRecord {
-            index,
+            index: identity.global_index,
+            global_index: identity.global_index,
+            phase: identity.phase.to_owned(),
+            phase_index: identity.phase_index,
+            seed: identity.seed,
+            workload_config: identity.workload_config.clone(),
             elapsed_ms: elapsed as u128 / 1_000_000,
             tenant: operation.tenant().get(),
             operation: operation.kind().name().to_owned(),
+            generated_operation: operation_summary(operation),
             status: status.to_owned(),
         });
+    }
+}
+
+fn operation_summary(operation: &GeneratedOperation) -> String {
+    match operation {
+        GeneratedOperation::Get { tenant, key } => {
+            format!("Get {{ tenant: {}, key: {key:?} }}", tenant.get())
+        }
+        GeneratedOperation::Put { tenant, key, value } => format!(
+            "Put {{ tenant: {}, key: {key:?}, value_len: {} }}",
+            tenant.get(),
+            value.len()
+        ),
+        GeneratedOperation::Delete { tenant, key } => {
+            format!("Delete {{ tenant: {}, key: {key:?} }}", tenant.get())
+        }
+        GeneratedOperation::Query {
+            tenant,
+            pk,
+            exclusive_after_sk,
+            limit,
+        } => format!(
+            "Query {{ tenant: {}, pk: {pk:?}, exclusive_after_sk: {exclusive_after_sk:?}, limit: {limit} }}",
+            tenant.get()
+        ),
+        GeneratedOperation::Scan {
+            tenant,
+            exclusive_after_key,
+            limit,
+        } => format!(
+            "Scan {{ tenant: {}, exclusive_after_key: {exclusive_after_key:?}, limit: {limit} }}",
+            tenant.get()
+        ),
+        GeneratedOperation::TransactGet { tenant, keys } => {
+            format!("TransactGet {{ tenant: {}, keys: {keys:?} }}", tenant.get())
+        }
+        GeneratedOperation::Transact { tenant, mutations } => {
+            let mutations = mutations
+                .iter()
+                .map(|mutation| {
+                    format!(
+                        "{{ key: {:?}, kind: {:?}, value_len: {} }}",
+                        mutation.key,
+                        mutation.kind,
+                        mutation.value.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Transact {{ tenant: {}, mutations: [{mutations}] }}",
+                tenant.get()
+            )
+        }
     }
 }
 
@@ -780,6 +907,31 @@ fn is_expected_conflict(error: &ClientError) -> bool {
     )
 }
 
+fn validate_conflict_details(
+    request: &TransactionRequest,
+    conflict: &ConflictDetails,
+) -> Result<(), String> {
+    let condition = request
+        .conditions
+        .iter()
+        .find(|condition| condition.key() == &conflict.key)
+        .ok_or_else(|| "transaction conflict key was not one of the conditions".to_owned())?;
+    if condition.expectation() != conflict.expected {
+        return Err("transaction conflict returned the wrong expected condition".to_owned());
+    }
+    let condition_failed = match conflict.expected {
+        ConditionExpectation::RevisionEquals(expected) => conflict.actual.revision() != expected,
+        ConditionExpectation::Exists => matches!(conflict.actual, ObservedState::Missing { .. }),
+        ConditionExpectation::NotExists => {
+            matches!(conflict.actual, ObservedState::Present { .. })
+        }
+    };
+    if !condition_failed {
+        return Err("transaction conflict actual state satisfied the failed condition".to_owned());
+    }
+    Ok(())
+}
+
 fn is_overload(error: &ClientError) -> bool {
     matches!(
         &error,
@@ -791,7 +943,7 @@ fn is_overload(error: &ClientError) -> bool {
 async fn execute_operation(
     state: &Arc<RunState>,
     client: &DodbClient,
-    index: u64,
+    identity: OperationIdentity<'_>,
     operation: GeneratedOperation,
     allow_transport_errors: bool,
 ) -> Result<(), String> {
@@ -803,11 +955,6 @@ async fn execute_operation(
             Err(error) => handle_non_mutation_error(state, error, allow_transport_errors),
         },
         GeneratedOperation::Put { key, value, .. } => {
-            let before = state
-                .model
-                .lock()
-                .map(|model| before_states(&model, tenant, std::slice::from_ref(key)))
-                .unwrap_or_default();
             match client.put(key.clone(), value.clone()).await {
                 Ok(revision) => {
                     if let Ok(mut model) = state.model.lock() {
@@ -818,38 +965,29 @@ async fn execute_operation(
                 }
                 Err(error) => handle_mutation_error(
                     state,
-                    index,
+                    identity.global_index,
                     &operation,
-                    before,
                     error,
                     allow_transport_errors,
                 ),
             }
         }
-        GeneratedOperation::Delete { key, .. } => {
-            let before = state
-                .model
-                .lock()
-                .map(|model| before_states(&model, tenant, std::slice::from_ref(key)))
-                .unwrap_or_default();
-            match client.delete(key.clone()).await {
-                Ok(revision) => {
-                    if let Ok(mut model) = state.model.lock() {
-                        model.apply_delete(tenant, key.clone(), revision);
-                    }
-                    state.counters.commits.fetch_add(1, Ordering::Relaxed);
-                    Ok("commit".to_owned())
+        GeneratedOperation::Delete { key, .. } => match client.delete(key.clone()).await {
+            Ok(revision) => {
+                if let Ok(mut model) = state.model.lock() {
+                    model.apply_delete(tenant, key.clone(), revision);
                 }
-                Err(error) => handle_mutation_error(
-                    state,
-                    index,
-                    &operation,
-                    before,
-                    error,
-                    allow_transport_errors,
-                ),
+                state.counters.commits.fetch_add(1, Ordering::Relaxed);
+                Ok("commit".to_owned())
             }
-        }
+            Err(error) => handle_mutation_error(
+                state,
+                identity.global_index,
+                &operation,
+                error,
+                allow_transport_errors,
+            ),
+        },
         GeneratedOperation::Query {
             pk,
             exclusive_after_sk,
@@ -911,11 +1049,12 @@ async fn execute_operation(
             }
         }
         GeneratedOperation::Transact { mutations, .. } => {
-            let (request, before) = state
+            let (request, _before) = state
                 .model
                 .lock()
                 .map(|model| transaction_request(&model, tenant, mutations))
                 .map_err(|_| "reference model lock poisoned".to_owned())?;
+            let validation_request = request.clone();
             match client.transact(request).await {
                 Ok(TransactionOutcome {
                     commit_lsn: Some(lsn),
@@ -934,30 +1073,16 @@ async fn execute_operation(
                     if let ClientError::Application(application) = &error
                         && let Some(conflict) = &application.conflict
                     {
-                        let known = state
-                            .model
-                            .lock()
-                            .map(|model| {
-                                model.knows_revision(
-                                    tenant,
-                                    &conflict.key,
-                                    conflict.actual.revision(),
-                                )
-                            })
-                            .unwrap_or(false);
-                        if !known {
-                            return Err(
-                                "transaction conflict reported an unknown revision".to_owned()
-                            );
-                        }
+                        validate_conflict_details(&validation_request, conflict)?;
+                    } else {
+                        return Err("transaction conflict omitted structured details".to_owned());
                     }
                     Ok("conflict".to_owned())
                 }
                 Err(error) => handle_mutation_error(
                     state,
-                    index,
+                    identity.global_index,
                     &operation,
-                    before,
                     error,
                     allow_transport_errors,
                 ),
@@ -966,11 +1091,11 @@ async fn execute_operation(
     };
     match result {
         Ok(status) => {
-            record_operation(state, index, &operation, &status, started);
+            record_operation(state, identity, &operation, &status, started);
             Ok(())
         }
         Err(error) => {
-            record_operation(state, index, &operation, "error", started);
+            record_operation(state, identity, &operation, "error", started);
             Err(error)
         }
     }
@@ -1015,7 +1140,6 @@ fn handle_mutation_error(
     state: &RunState,
     index: u64,
     operation: &GeneratedOperation,
-    before: Vec<(DocumentKey, RevisionState)>,
     error: ClientError,
     allow_transport_errors: bool,
 ) -> Result<String, String> {
@@ -1028,7 +1152,6 @@ fn handle_mutation_error(
             pending.push(PendingMutation {
                 index,
                 operation: operation.clone(),
-                before,
             });
         }
         return Ok("unknown".to_owned());
@@ -1061,15 +1184,20 @@ async fn spawn_workload(
     let stop_for_task = stop.clone();
     let join = tokio::spawn(async move {
         let clients = Arc::new(make_clients(&connection, config.tenant_count));
-        let (sender, receiver) =
-            mpsc::channel::<(u64, GeneratedOperation)>(config.concurrency.saturating_mul(4).max(8));
+        let (sender, receiver) = mpsc::channel::<(u64, u64, GeneratedOperation)>(
+            config.concurrency.saturating_mul(4).max(8),
+        );
         let receiver = Arc::new(AsyncMutex::new(receiver));
+        let generated_workload = workload_config(&config, &phase);
         let mut workers = Vec::new();
         for _ in 0..config.concurrency {
             let worker_receiver = Arc::clone(&receiver);
             let worker_clients = Arc::clone(&clients);
             let worker_state = Arc::clone(&state);
             let mut worker_stop = stop_receiver.clone();
+            let worker_phase = phase.clone();
+            let worker_seed = config.seed;
+            let worker_workload = generated_workload.clone();
             workers.push(tokio::spawn(async move {
                 loop {
                     let item = tokio::select! {
@@ -1084,7 +1212,7 @@ async fn spawn_workload(
                             receiver.recv().await
                         } => item,
                     };
-                    let Some((index, operation)) = item else {
+                    let Some((global_index, phase_index, operation)) = item else {
                         break;
                     };
                     if worker_state.abort.load(Ordering::Relaxed) {
@@ -1092,31 +1220,36 @@ async fn spawn_workload(
                     }
                     let client = operation_client(&worker_clients, operation.tenant());
                     let kind = operation.kind();
-                    let description = format!("{operation:?}");
+                    let description = operation_summary(&operation);
                     if let Err(error) = execute_operation(
                         &worker_state,
                         client,
-                        index,
+                        OperationIdentity {
+                            global_index,
+                            phase: &worker_phase,
+                            phase_index,
+                            seed: worker_seed,
+                            workload_config: &worker_workload,
+                        },
                         operation,
                         allow_transport_errors,
                     )
                     .await
                     {
                         worker_state.fail(format!(
-                            "operation {index} {kind:?} {description} failed: {error}"
+                            "operation {global_index} {kind:?} {description} failed: {error}"
                         ));
                         break;
                     }
                 }
             }));
         }
-        let mut generator = OperationGenerator::new(
-            config.seed ^ phase_seed(&phase),
-            workload_config(&config, &phase),
-        )
-        .expect("validated workload configuration");
+        let generator_seed = config.seed ^ phase_seed(&phase);
+        let mut generator = OperationGenerator::new(generator_seed, generated_workload)
+            .expect("validated workload configuration");
         let deadline = Instant::now() + duration;
-        let producer_stop = stop_receiver.clone();
+        let mut producer_stop = stop_receiver.clone();
+        let mut phase_index = 0;
         loop {
             if *producer_stop.borrow()
                 || state.abort.load(Ordering::Relaxed)
@@ -1124,9 +1257,15 @@ async fn spawn_workload(
             {
                 break;
             }
-            let index = state.next_operation.fetch_add(1, Ordering::Relaxed);
-            let operation = generator.next(index);
-            if sender.send((index, operation)).await.is_err() {
+            let global_index = state.next_operation.fetch_add(1, Ordering::Relaxed);
+            let operation = generator.next(phase_index);
+            let item = (global_index, phase_index, operation);
+            phase_index += 1;
+            let sent = tokio::select! {
+                changed = producer_stop.changed() => changed.is_ok() && !*producer_stop.borrow(),
+                result = sender.send(item) => result.is_ok(),
+            };
+            if !sent {
                 break;
             }
         }
@@ -1158,13 +1297,14 @@ async fn connection_churn(
     tenant_count: u64,
     duration: Duration,
     enabled: bool,
+    mut stop: watch::Receiver<bool>,
 ) {
     if !enabled {
         return;
     }
     let mut rng = DeterministicRng::new(state.next_operation.load(Ordering::Relaxed) ^ 0xfeed);
     let deadline = Instant::now() + duration;
-    while Instant::now() < deadline && !state.abort.load(Ordering::Relaxed) {
+    while Instant::now() < deadline && !state.abort.load(Ordering::Relaxed) && !*stop.borrow() {
         let tenant = TenantId::new(1 + rng.next_u64() % tenant_count.max(1));
         match DodbConnection::connect(
             "0.0.0.0:0".parse().expect("bind address"),
@@ -1196,7 +1336,14 @@ async fn connection_churn(
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1205,39 +1352,96 @@ async fn sample_resources(
     pid: u32,
     data_dir: PathBuf,
     event_file: PathBuf,
-    duration: Duration,
     stop: watch::Receiver<bool>,
 ) {
-    let deadline = Instant::now() + duration;
     let mut stop = stop;
-    while Instant::now() < deadline && !*stop.borrow() && !state.abort.load(Ordering::Relaxed) {
-        let (rss, virtual_memory, threads) = proc_status(pid);
-        let active = latest_metrics(&event_file);
-        let sample = ResourceSample {
-            elapsed_ms: state.elapsed_ms(),
-            rss_bytes: rss,
-            virtual_bytes: virtual_memory,
-            fd_count: fd_count(pid),
-            thread_count: threads,
-            wal_bytes: directory_bytes(&data_dir, "wal"),
-            database_bytes: directory_bytes(&data_dir, "db"),
-            active_connections: active
-                .as_ref()
-                .and_then(|value| value.get("active_connections"))
-                .and_then(serde_json::Value::as_u64),
-            active_streams: active
-                .as_ref()
-                .and_then(|value| value.get("active_streams"))
-                .and_then(serde_json::Value::as_u64),
-        };
-        if let Ok(mut samples) = state.resources.lock() {
-            samples.push(sample);
-        }
+    while !*stop.borrow() && !state.abort.load(Ordering::Relaxed) {
+        push_resource_sample(&state, pid, &data_dir, &event_file, false);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             changed = stop.changed() => if changed.is_err() { break; },
         }
     }
+}
+
+fn push_resource_sample(
+    state: &Arc<RunState>,
+    pid: u32,
+    data_dir: &Path,
+    event_file: &Path,
+    post_quiescence: bool,
+) {
+    let (rss, virtual_memory, threads) = proc_status(pid);
+    let active = latest_metrics(event_file);
+    let sample = ResourceSample {
+        elapsed_ms: state.elapsed_ms(),
+        post_quiescence,
+        rss_bytes: rss,
+        virtual_bytes: virtual_memory,
+        fd_count: fd_count(pid),
+        thread_count: threads,
+        wal_bytes: directory_bytes(data_dir, "wal"),
+        database_bytes: directory_bytes(data_dir, "db"),
+        active_connections: active
+            .as_ref()
+            .and_then(|value| value.get("active_connections"))
+            .and_then(serde_json::Value::as_u64),
+        active_streams: active
+            .as_ref()
+            .and_then(|value| value.get("active_streams"))
+            .and_then(serde_json::Value::as_u64),
+    };
+    if let Ok(mut samples) = state.resources.lock() {
+        samples.push(sample);
+    }
+}
+
+async fn collect_post_quiescence_samples(
+    state: &Arc<RunState>,
+    pid: u32,
+    data_dir: &Path,
+    event_file: &Path,
+) -> Result<(), String> {
+    // The child publishes metrics once per second. The first wait gives that
+    // publisher time to observe the closed QUIC connection; later samples
+    // make the cleanup observation explicit rather than relying on one read.
+    for sample in 0..4 {
+        tokio::time::sleep(if sample == 0 {
+            Duration::from_millis(1_200)
+        } else {
+            Duration::from_millis(250)
+        })
+        .await;
+        push_resource_sample(state, pid, data_dir, event_file, true);
+    }
+    let samples = state
+        .resources
+        .lock()
+        .map_err(|_| "resource sample lock poisoned".to_owned())?
+        .iter()
+        .filter(|sample| sample.post_quiescence)
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_post_quiescence_samples(&samples)
+}
+
+fn validate_post_quiescence_samples(samples: &[ResourceSample]) -> Result<(), String> {
+    let final_sample = samples
+        .last()
+        .ok_or_else(|| "post-quiescence resources were not sampled".to_owned())?;
+    if final_sample.active_streams != Some(0) {
+        return Err(format!(
+            "post-quiescence active streams were not zero: {:?}",
+            final_sample.active_streams
+        ));
+    }
+    if final_sample.active_connections != Some(0) {
+        return Err(format!(
+            "post-quiescence active connections did not reach idle baseline: {:?}",
+            final_sample.active_connections
+        ));
+    }
+    Ok(())
 }
 
 fn proc_status(pid: u32) -> (Option<u64>, Option<u64>, Option<u64>) {
@@ -1299,32 +1503,46 @@ fn latest_metrics(path: &Path) -> Option<serde_json::Value> {
     })
 }
 
-fn child_event_counts(path: &Path) -> (u64, u64, Option<String>) {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return (0, 0, None);
-    };
-    let mut checkpoints = 0;
-    let mut invariants = 0;
-    let mut invariant_error = None;
-    for line in contents.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some("checkpoint") = value.get("kind").and_then(serde_json::Value::as_str) {
-            checkpoints += 1;
-            invariants += value
-                .get("invariant_shards")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if let Some(error) = value
-                .get("invariant_error")
-                .and_then(serde_json::Value::as_str)
-            {
-                invariant_error = Some(error.to_owned());
-            }
-        }
+fn process_child_events(
+    state: &Arc<RunState>,
+    path: &Path,
+    tolerate_trailing_partial: bool,
+) -> Result<(), String> {
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let summary = parse_event_lines(&contents, tolerate_trailing_partial)?;
+    state
+        .counters
+        .checkpoints
+        .fetch_add(summary.checkpoint_successes, Ordering::Relaxed);
+    state
+        .counters
+        .checkpoint_failures
+        .fetch_add(summary.checkpoint_failures.len() as u64, Ordering::Relaxed);
+    state
+        .counters
+        .invariant_checks
+        .fetch_add(summary.invariant_checks, Ordering::Relaxed);
+    state
+        .counters
+        .invariant_passes
+        .fetch_add(summary.invariant_passes, Ordering::Relaxed);
+    state
+        .counters
+        .invariant_failures
+        .fetch_add(summary.invariant_failures.len() as u64, Ordering::Relaxed);
+    if !summary.checkpoint_failures.is_empty() {
+        return Err(format!(
+            "checkpoint failed: {}",
+            summary.checkpoint_failures.join("; ")
+        ));
     }
-    (checkpoints, invariants, invariant_error)
+    if !summary.invariant_failures.is_empty() {
+        return Err(format!(
+            "invariant check failed: {}",
+            summary.invariant_failures.join("; ")
+        ));
+    }
+    Ok(())
 }
 
 async fn scan_page_resilient(
@@ -1485,14 +1703,47 @@ async fn reconcile_unknown(
         return Ok(());
     }
     let clients = make_clients(connection, tenant_count);
-    for pending_mutation in pending {
-        let tenant = pending_mutation.operation.tenant();
-        let keys = pending_mutation
-            .operation
-            .keys()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
+    let mut components = Vec::<Vec<usize>>::new();
+    let mut assigned = vec![false; pending.len()];
+    for start in 0..pending.len() {
+        if assigned[start] {
+            continue;
+        }
+        let mut component = vec![start];
+        assigned[start] = true;
+        let mut cursor = 0;
+        while cursor < component.len() {
+            let current = component[cursor];
+            let current_keys = pending[current].operation.keys();
+            for candidate in 0..pending.len() {
+                if assigned[candidate] {
+                    continue;
+                }
+                let overlaps = pending[candidate]
+                    .operation
+                    .keys()
+                    .iter()
+                    .any(|key| current_keys.iter().any(|candidate| candidate == key));
+                if overlaps {
+                    assigned[candidate] = true;
+                    component.push(candidate);
+                }
+            }
+            cursor += 1;
+        }
+        components.push(component);
+    }
+
+    for component in components {
+        let tenant = pending[component[0]].operation.tenant();
+        let mut keys = Vec::new();
+        for index in &component {
+            for key in pending[*index].operation.keys() {
+                if !keys.iter().any(|known: &DocumentKey| known == key) {
+                    keys.push(key.clone());
+                }
+            }
+        }
         let actual = transact_get_resilient(operation_client(&clients, tenant), &keys).await?;
         let model = state
             .model
@@ -1503,12 +1754,11 @@ async fn reconcile_unknown(
             .iter()
             .map(|key| model.state(tenant, key))
             .collect::<Vec<_>>();
-        let before = pending_mutation
-            .before
+        let operations = component
             .iter()
-            .map(|(_, value)| value.clone())
+            .map(|index| pending[*index].operation.clone())
             .collect::<Vec<_>>();
-        match classify_unknown_mutation(&pending_mutation.operation, &before, &actual, &current) {
+        match reconcile_unknown_operations(&operations, &keys, &current, &actual)? {
             UnknownMutationResolution::Applied => {
                 if let Ok(mut target) = state.model.lock() {
                     for (key, state_value) in keys.iter().zip(actual.iter()) {
@@ -1518,18 +1768,31 @@ async fn reconcile_unknown(
             }
             UnknownMutationResolution::NotApplied => {}
             UnknownMutationResolution::Partial => {
+                let indexes = component
+                    .iter()
+                    .map(|index| pending[*index].index.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 return Err(format!(
-                    "unknown mutation {} resolved to an impossible partial state",
-                    pending_mutation.index
+                    "unknown mutation set [{indexes}] resolved to an impossible partial state"
                 ));
             }
         }
         state
             .counters
             .unknown_resolved
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(component.len() as u64, Ordering::Relaxed);
     }
-    Ok(())
+    if state
+        .pending
+        .lock()
+        .map_err(|_| "pending lock poisoned".to_owned())?
+        .is_empty()
+    {
+        Ok(())
+    } else {
+        Err("unknown mutations remained after reconciliation".to_owned())
+    }
 }
 
 async fn run_aba_probe(
@@ -1648,7 +1911,6 @@ async fn run_normal_phase(
         server.pid,
         data_dir.to_owned(),
         server.event_file.clone(),
-        duration,
         sample_receiver,
     ));
     let workload = spawn_workload(
@@ -1660,6 +1922,7 @@ async fn run_normal_phase(
         false,
     )
     .await;
+    let (churn_stop, churn_receiver) = watch::channel(false);
     let churn = tokio::spawn(connection_churn(
         Arc::clone(state),
         server.address,
@@ -1667,29 +1930,32 @@ async fn run_normal_phase(
         config.tenant_count,
         duration,
         config.connection_churn,
+        churn_receiver,
     ));
     tokio::time::sleep(duration).await;
     stop_workload(workload).await;
+    let _ = churn_stop.send(true);
+    let _ = churn.await;
+    let reconciliation = reconcile_unknown(state, &connection, config.tenant_count).await;
+    let verification = if reconciliation.is_ok() {
+        verify_full(state, &connection, config.tenant_count).await
+    } else {
+        Ok(())
+    };
+    connection.close();
+    let post_quiescence =
+        collect_post_quiescence_samples(state, server.pid, data_dir, &server.event_file).await;
     let _ = sample_stop.send(true);
     let _ = sampler.await;
-    let _ = churn.await;
-    verify_full(state, &connection, config.tenant_count)
-        .await
-        .map_err(|error| -> BoxError { error.into() })?;
-    connection.close();
-    let (checkpoints, invariants, invariant_error) = child_event_counts(&server.event_file);
-    if let Some(error) = invariant_error {
-        return Err(format!("storage invariant check failed: {error}").into());
-    }
-    state
-        .counters
-        .checkpoints
-        .fetch_add(checkpoints, Ordering::Relaxed);
-    state
-        .counters
-        .invariant_passes
-        .fetch_add(invariants, Ordering::Relaxed);
-    stop_server(server, output, true).await?;
+    let server_result = stop_server(server, output, true).await;
+    let events = server_result.and_then(|_| {
+        process_child_events(state, &output.join(format!("server-{cycle}.jsonl")), false)
+            .map_err(Into::into)
+    });
+    events?;
+    reconciliation.map_err(|error| -> BoxError { error.into() })?;
+    verification.map_err(|error| -> BoxError { error.into() })?;
+    post_quiescence.map_err(|error| -> BoxError { error.into() })?;
     Ok(())
 }
 
@@ -1743,7 +2009,6 @@ async fn run_crash_phase(
             server.pid,
             data_dir.to_owned(),
             server.event_file.clone(),
-            cycle_duration,
             sample_receiver,
         ));
         let workload = spawn_workload(
@@ -1755,6 +2020,7 @@ async fn run_crash_phase(
             true,
         )
         .await;
+        let (churn_stop, churn_receiver) = watch::channel(false);
         let churn = tokio::spawn(connection_churn(
             Arc::clone(state),
             server.address,
@@ -1762,30 +2028,21 @@ async fn run_crash_phase(
             config.tenant_count,
             cycle_duration,
             config.connection_churn,
+            churn_receiver,
         ));
         tokio::time::sleep(cycle_duration.saturating_mul(7) / 10).await;
         let mut crashed_server = server;
         crashed_server.child.kill().await?;
         let _ = crashed_server.child.wait().await?;
-        let (checkpoints, invariants, invariant_error) =
-            child_event_counts(&crashed_server.event_file);
-        if let Some(error) = invariant_error {
-            return Err(format!("storage invariant check failed: {error}").into());
-        }
-        state
-            .counters
-            .checkpoints
-            .fetch_add(checkpoints, Ordering::Relaxed);
-        state
-            .counters
-            .invariant_passes
-            .fetch_add(invariants, Ordering::Relaxed);
         state.counters.crashes.fetch_add(1, Ordering::Relaxed);
         let _ = sample_stop.send(true);
         connection.close();
         stop_workload(workload).await;
         let _ = sampler.await;
+        let _ = churn_stop.send(true);
         let _ = churn.await;
+        process_child_events(state, &crashed_server.event_file, true)
+            .map_err(|error| -> BoxError { error.into() })?;
 
         let recovery_started = Instant::now();
         let recovered_server = start_server(
@@ -1822,20 +2079,19 @@ async fn run_crash_phase(
                 recovery_ms: Some(recovery_ms),
                 recovered: true,
             });
-        let (checkpoints, invariants, invariant_error) =
-            child_event_counts(&recovered_server.event_file);
-        if let Some(error) = invariant_error {
-            return Err(format!("storage invariant check failed: {error}").into());
-        }
-        state
-            .counters
-            .checkpoints
-            .fetch_add(checkpoints, Ordering::Relaxed);
-        state
-            .counters
-            .invariant_passes
-            .fetch_add(invariants, Ordering::Relaxed);
-        recovered_connection.close();
+        let post_quiescence = {
+            recovered_connection.close();
+            collect_post_quiescence_samples(
+                state,
+                recovered_server.pid,
+                data_dir,
+                &recovered_server.event_file,
+            )
+            .await
+        };
+        process_child_events(state, &recovered_server.event_file, false)
+            .map_err(|error| -> BoxError { error.into() })?;
+        post_quiescence.map_err(|error| -> BoxError { error.into() })?;
         stop_server(recovered_server, output, true).await?;
     }
     Ok(())
@@ -1867,13 +2123,17 @@ struct Report {
     overloads: u64,
     response_budget_errors: u64,
     unknown_outcomes_resolved: u64,
+    unresolved_unknown_mutations: u64,
     transport_errors: u64,
     application_errors: u64,
     checkpoints: u64,
+    checkpoint_failures: u64,
     crashes: u64,
     successful_recoveries: u64,
     full_verification_passes: u64,
+    invariant_checks: u64,
     invariant_passes: u64,
+    invariant_failures: u64,
     connection_churn: u64,
     latency_p50_ms: f64,
     latency_p95_ms: f64,
@@ -1885,6 +2145,9 @@ struct Report {
     file_descriptors: MetricSummary,
     active_connections: MetricSummary,
     active_streams: MetricSummary,
+    post_quiescence_active_streams: Option<u64>,
+    post_quiescence_active_connections: Option<u64>,
+    post_quiescence_fd_count: Option<u64>,
     wal_bytes: MetricSummary,
     database_bytes: MetricSummary,
     allocator_stats: Option<serde_json::Value>,
@@ -1949,6 +2212,12 @@ fn build_report(
         .lock()
         .map(|samples| samples.clone())
         .unwrap_or_default();
+    let post_quiescence = samples.iter().rev().find(|sample| sample.post_quiescence);
+    let unresolved_unknown_mutations = state
+        .pending
+        .lock()
+        .map(|pending| pending.len() as u64)
+        .unwrap_or(u64::MAX);
     let trend_warnings = [
         trend(&samples, "rss", |sample| sample.rss_bytes),
         trend(&samples, "virtual_memory", |sample| sample.virtual_bytes),
@@ -1990,13 +2259,17 @@ fn build_report(
             .response_budget_errors
             .load(Ordering::Relaxed),
         unknown_outcomes_resolved: state.counters.unknown_resolved.load(Ordering::Relaxed),
+        unresolved_unknown_mutations,
         transport_errors: state.counters.transport_errors.load(Ordering::Relaxed),
         application_errors: state.counters.application_errors.load(Ordering::Relaxed),
         checkpoints: state.counters.checkpoints.load(Ordering::Relaxed),
+        checkpoint_failures: state.counters.checkpoint_failures.load(Ordering::Relaxed),
         crashes: state.counters.crashes.load(Ordering::Relaxed),
         successful_recoveries: state.counters.recoveries.load(Ordering::Relaxed),
         full_verification_passes: state.counters.verifications.load(Ordering::Relaxed),
+        invariant_checks: state.counters.invariant_checks.load(Ordering::Relaxed),
         invariant_passes: state.counters.invariant_passes.load(Ordering::Relaxed),
+        invariant_failures: state.counters.invariant_failures.load(Ordering::Relaxed),
         connection_churn: state.counters.connection_churn.load(Ordering::Relaxed),
         latency_p50_ms: latency.0 as f64 / 1_000_000.0,
         latency_p95_ms: latency.1 as f64 / 1_000_000.0,
@@ -2008,6 +2281,10 @@ fn build_report(
         file_descriptors: metric_summary(&samples, |sample| sample.fd_count),
         active_connections: metric_summary(&samples, |sample| sample.active_connections),
         active_streams: metric_summary(&samples, |sample| sample.active_streams),
+        post_quiescence_active_streams: post_quiescence.and_then(|sample| sample.active_streams),
+        post_quiescence_active_connections: post_quiescence
+            .and_then(|sample| sample.active_connections),
+        post_quiescence_fd_count: post_quiescence.and_then(|sample| sample.fd_count),
         wal_bytes: metric_summary(&samples, |sample| Some(sample.wal_bytes)),
         database_bytes: metric_summary(&samples, |sample| Some(sample.database_bytes)),
         allocator_stats,
@@ -2140,16 +2417,20 @@ fn print_report(report: &Report) {
         report.operation_counts[6]
     );
     println!(
-        "commits={} conflicts={} overloads={} response_budget={} unknown_resolved={} checkpoints={} crashes={} recoveries={} verifications={} invariants={}",
+        "commits={} conflicts={} overloads={} response_budget={} unknown_resolved={} unresolved_unknowns={} checkpoints={} checkpoint_failures={} crashes={} recoveries={} verifications={} invariant_checks={} invariant_failures={} invariant_passes={}",
         report.commits,
         report.conflicts,
         report.overloads,
         report.response_budget_errors,
         report.unknown_outcomes_resolved,
+        report.unresolved_unknown_mutations,
         report.checkpoints,
+        report.checkpoint_failures,
         report.crashes,
         report.successful_recoveries,
         report.full_verification_passes,
+        report.invariant_checks,
+        report.invariant_failures,
         report.invariant_passes
     );
     println!(
@@ -2165,7 +2446,7 @@ fn print_report(report: &Report) {
         report.latency_p50_ms, report.latency_p95_ms, report.latency_p99_ms, report.latency_max_ms
     );
     println!(
-        "rss={:?}->{:?} peak={:?} threads_peak={:?} fd={:?}->{:?} peak={:?} streams_peak={:?} connections_peak={:?}",
+        "rss={:?}->{:?} peak={:?} threads_peak={:?} fd={:?}->{:?} peak={:?} streams_peak={:?} connections_peak={:?} post_quiescence_streams={:?} post_quiescence_connections={:?} post_quiescence_fd={:?}",
         report.rss.initial,
         report.rss.final_value,
         report.rss.peak,
@@ -2174,7 +2455,10 @@ fn print_report(report: &Report) {
         report.file_descriptors.final_value,
         report.file_descriptors.peak,
         report.active_streams.peak,
-        report.active_connections.peak
+        report.active_connections.peak,
+        report.post_quiescence_active_streams,
+        report.post_quiescence_active_connections,
+        report.post_quiescence_fd_count
     );
     if report.trend_warnings.is_empty() {
         println!("resource trends: no sustained late-window warnings");
@@ -2250,6 +2534,16 @@ async fn run(config: HarnessConfig) -> Result<(), BoxError> {
             break;
         }
     }
+    let pending_count = state
+        .pending
+        .lock()
+        .map(|pending| pending.len())
+        .unwrap_or(usize::MAX);
+    if pending_count != 0 {
+        state.fail(format!(
+            "successful run ended with {pending_count} unresolved unknown mutation(s)"
+        ));
+    }
     let (allocator_stats, _) = latest_allocator(&run_directory);
     let report = build_report(&state, &config, &run_directory, allocator_stats);
     write_failure_artifacts(&state, &report, &run_directory)?;
@@ -2261,33 +2555,55 @@ async fn run(config: HarnessConfig) -> Result<(), BoxError> {
     Ok(())
 }
 
+type AllocatorOrderKey = (u64, u64, u128, String, usize);
+type AllocatorCandidate = (AllocatorOrderKey, serde_json::Value, PathBuf);
+
 fn latest_allocator(directory: &Path) -> (Option<serde_json::Value>, Option<PathBuf>) {
-    let mut latest = None;
-    let mut latest_file = None;
+    let mut latest: Option<AllocatorCandidate> = None;
     if let Ok(entries) = fs::read_dir(directory) {
-        for entry in entries.flatten() {
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
             if entry
                 .path()
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
                 && let Ok(contents) = fs::read_to_string(entry.path())
             {
-                for line in contents.lines() {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
-                        && value.get("kind").and_then(serde_json::Value::as_str) == Some("metrics")
-                    {
-                        latest = value.get("allocator").and_then(|allocator| {
-                            allocator
-                                .as_str()
-                                .and_then(|allocator| serde_json::from_str(allocator).ok())
-                        });
-                        latest_file = Some(entry.path());
+                let Ok(summary) = parse_event_lines(&contents, false) else {
+                    continue;
+                };
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_nanos());
+                for sample in summary.metrics {
+                    if let Some(allocator) = sample.allocator {
+                        let file_name = entry.file_name().to_string_lossy().into_owned();
+                        let key = (
+                            sample.timestamp_ms,
+                            sample.cycle,
+                            modified,
+                            file_name,
+                            sample.sequence,
+                        );
+                        let candidate = (key, allocator, entry.path());
+                        if latest
+                            .as_ref()
+                            .is_none_or(|current| candidate.0 > current.0)
+                        {
+                            latest = Some(candidate);
+                        }
                     }
                 }
             }
         }
     }
-    (latest, latest_file)
+    latest
+        .map(|(_, allocator, path)| (Some(allocator), Some(path)))
+        .unwrap_or((None, None))
 }
 
 fn timestamp() -> u64 {
@@ -2306,4 +2622,107 @@ async fn main() -> Result<(), BoxError> {
     let mut config = HarnessConfig::parse().map_err(|error| -> BoxError { error.into() })?;
     config.normalize();
     run(config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource_sample(
+        streams: Option<u64>,
+        connections: Option<u64>,
+        fds: Option<u64>,
+    ) -> ResourceSample {
+        ResourceSample {
+            elapsed_ms: 1,
+            post_quiescence: true,
+            rss_bytes: None,
+            virtual_bytes: None,
+            fd_count: fds,
+            thread_count: None,
+            wal_bytes: 0,
+            database_bytes: 0,
+            active_connections: connections,
+            active_streams: streams,
+        }
+    }
+
+    #[test]
+    fn conflict_validation_does_not_require_model_history() {
+        let key = DocumentKey::new("p", "s");
+        let request = TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: key.clone(),
+                expected_revision: Revision::new(4),
+            }],
+            vec![TransactionMutation::Delete { key: key.clone() }],
+        );
+        let conflict = ConflictDetails {
+            key: key.clone(),
+            expected: ConditionExpectation::RevisionEquals(Revision::new(4)),
+            actual: ObservedState::present(Revision::new(5)),
+        };
+        assert!(validate_conflict_details(&request, &conflict).is_ok());
+        let satisfied = ConflictDetails {
+            actual: ObservedState::present(Revision::new(4)),
+            ..conflict
+        };
+        assert!(validate_conflict_details(&request, &satisfied).is_err());
+    }
+
+    #[test]
+    fn post_quiescence_cleanup_requires_zero_streams_and_connections() {
+        assert!(
+            validate_post_quiescence_samples(&[resource_sample(Some(0), Some(0), Some(12),)])
+                .is_ok()
+        );
+        assert!(
+            validate_post_quiescence_samples(&[resource_sample(Some(1), Some(0), Some(12),)])
+                .is_err()
+        );
+        assert!(
+            validate_post_quiescence_samples(&[resource_sample(Some(0), Some(1), Some(12),)])
+                .is_err()
+        );
+        assert!(validate_post_quiescence_samples(&[]).is_err());
+    }
+
+    #[test]
+    fn latest_allocator_uses_event_order_not_directory_iteration_order() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("server-2.jsonl"),
+            "{\"kind\":\"metrics\",\"timestamp_ms\":20,\"cycle\":2,\"allocator\":\"{\\\"sample\\\":2}\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("server-10.jsonl"),
+            "{\"kind\":\"metrics\",\"timestamp_ms\":10,\"cycle\":10,\"allocator\":\"{\\\"sample\\\":10}\"}\n",
+        )
+        .unwrap();
+        let (allocator, path) = latest_allocator(directory.path());
+        assert_eq!(allocator.unwrap()["sample"], serde_json::json!(2));
+        assert_eq!(path.unwrap().file_name().unwrap(), "server-2.jsonl");
+    }
+
+    #[test]
+    fn synchronized_event_writer_keeps_records_parseable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let writer = EventWriter::new(path.clone(), 7);
+        let mut threads = Vec::new();
+        for index in 0..8 {
+            let writer = writer.clone();
+            threads.push(std::thread::spawn(move || {
+                writer
+                    .append(&serde_json::json!({"kind":"metrics", "index":index}))
+                    .unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let parsed = parse_event_lines(&fs::read_to_string(path).unwrap(), false).unwrap();
+        assert_eq!(parsed.metrics.len(), 8);
+    }
 }

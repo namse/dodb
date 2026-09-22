@@ -1,13 +1,14 @@
 //! Deterministic workload, reference-model, and reporting primitives for the
 //! `dodb-soak` executable.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
 use dodb_core::{DocumentKey, PrimaryKey, Revision, RevisionState, TenantId};
 use dodb_service::Document;
 use serde::Serialize;
+use serde_json::Value;
 
 /// The operation mix is deliberately explicit so a run can be reproduced
 /// without relying on process-global or thread-local entropy.
@@ -155,7 +156,7 @@ impl GeneratedOperation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkloadConfig {
     pub tenant_count: u64,
     pub hot_key_count: u32,
@@ -486,37 +487,162 @@ pub enum UnknownMutationResolution {
     Partial,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum StateShape {
+    Missing,
+    Present(Vec<u8>),
+}
+
+fn state_shape(state: &RevisionState) -> StateShape {
+    match state {
+        RevisionState::Present { value, .. } => StateShape::Present(value.clone()),
+        RevisionState::Missing { .. } => StateShape::Missing,
+    }
+}
+
+fn operation_effects(
+    operation: &GeneratedOperation,
+    keys: &[DocumentKey],
+) -> Result<Vec<(usize, StateShape)>, String> {
+    let mut effects = Vec::new();
+    match operation {
+        GeneratedOperation::Put { key, value, .. } => {
+            let index = keys
+                .iter()
+                .position(|candidate| candidate == key)
+                .ok_or_else(|| {
+                    "unknown put key was not included in reconciliation set".to_owned()
+                })?;
+            effects.push((index, StateShape::Present(value.clone())));
+        }
+        GeneratedOperation::Delete { key, .. } => {
+            let index = keys
+                .iter()
+                .position(|candidate| candidate == key)
+                .ok_or_else(|| {
+                    "unknown delete key was not included in reconciliation set".to_owned()
+                })?;
+            effects.push((index, StateShape::Missing));
+        }
+        GeneratedOperation::Transact { mutations, .. } => {
+            for mutation in mutations {
+                let index = keys
+                    .iter()
+                    .position(|candidate| candidate == &mutation.key)
+                    .ok_or_else(|| {
+                        "unknown transaction key was not included in reconciliation set".to_owned()
+                    })?;
+                let shape = match mutation.kind {
+                    PlannedMutationKind::Put => StateShape::Present(mutation.value.clone()),
+                    PlannedMutationKind::Delete => StateShape::Missing,
+                };
+                effects.push((index, shape));
+            }
+        }
+        _ => return Err("non-mutation operation cannot have an unknown outcome".to_owned()),
+    }
+    Ok(effects)
+}
+
+/// Reconciles a complete overlapping set of unknown mutations against one
+/// final read. Presence and values are compared here; revisions are applied
+/// to the model only after the final semantic outcome has been accepted.
+pub fn reconcile_unknown_operations(
+    operations: &[GeneratedOperation],
+    keys: &[DocumentKey],
+    current: &[RevisionState],
+    actual: &[RevisionState],
+) -> Result<UnknownMutationResolution, String> {
+    if keys.len() != current.len() || keys.len() != actual.len() || operations.is_empty() {
+        return Err("unknown reconciliation input lengths are inconsistent".to_owned());
+    }
+    let current_shapes = current.iter().map(state_shape).collect::<Vec<_>>();
+    let actual_shapes = actual.iter().map(state_shape).collect::<Vec<_>>();
+    let effects = operations
+        .iter()
+        .map(|operation| operation_effects(operation, keys))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if actual == current {
+        return Ok(UnknownMutationResolution::NotApplied);
+    }
+
+    // Single-key mutations can commit in any order and overwrite one another.
+    // The final state only needs to be one of the states that could be left by
+    // the complete pending set, not an attribution of every intermediate
+    // commit to one response.
+    if effects.iter().all(|effect| effect.len() == 1) {
+        for key_index in 0..keys.len() {
+            let possible = effects
+                .iter()
+                .filter_map(|effect| (effect[0].0 == key_index).then_some(&effect[0].1));
+            if actual_shapes[key_index] != current_shapes[key_index]
+                && !possible
+                    .into_iter()
+                    .any(|shape| shape == &actual_shapes[key_index])
+            {
+                return Ok(UnknownMutationResolution::Partial);
+            }
+        }
+        return Ok(UnknownMutationResolution::Applied);
+    }
+
+    // Transactions are explored as atomic events. The state-space is bounded
+    // because the generator gives crash-phase multi-key transactions unique
+    // keys; the fallback still retains the strict all-or-none shape check for
+    // unusually large pending components.
+    if operations.len() > 12 {
+        let all_applied = effects.iter().all(|effect| {
+            effect
+                .iter()
+                .all(|(index, shape)| actual_shapes[*index] == *shape)
+        });
+        return if all_applied {
+            Ok(UnknownMutationResolution::Applied)
+        } else {
+            Ok(UnknownMutationResolution::Partial)
+        };
+    }
+    let mut frontier = vec![(0u16, current_shapes.clone())];
+    let mut visited = HashSet::new();
+    visited.insert((0u16, current_shapes));
+    let full_mask = (1u16 << operations.len()) - 1;
+    while let Some((mask, shapes)) = frontier.pop() {
+        if mask == full_mask && shapes == actual_shapes {
+            return Ok(UnknownMutationResolution::Applied);
+        }
+        for (operation_index, _) in effects.iter().enumerate() {
+            let bit = 1u16 << operation_index;
+            if mask & bit != 0 {
+                continue;
+            }
+            let next_mask = mask | bit;
+            let skipped = (next_mask, shapes.clone());
+            if visited.insert(skipped.clone()) {
+                frontier.push(skipped);
+            }
+            let mut applied = shapes.clone();
+            for (index, shape) in &effects[operation_index] {
+                applied[*index] = shape.clone();
+            }
+            let candidate = (next_mask, applied);
+            if visited.insert(candidate.clone()) {
+                frontier.push(candidate);
+            }
+        }
+    }
+    Ok(UnknownMutationResolution::Partial)
+}
+
 pub fn classify_unknown_mutation(
     operation: &GeneratedOperation,
-    before: &[RevisionState],
+    _before: &[RevisionState],
     actual: &[RevisionState],
     current: &[RevisionState],
 ) -> UnknownMutationResolution {
-    if actual == current {
-        return UnknownMutationResolution::NotApplied;
-    }
-    let applied = match operation {
-        GeneratedOperation::Put { value, .. } => {
-            actual.len() == 1
-                && matches!(&actual[0], RevisionState::Present { value: actual_value, .. } if actual_value == value)
-        }
-        GeneratedOperation::Delete { .. } => actual.len() == 1 && actual[0].is_missing(),
-        GeneratedOperation::Transact { mutations, .. } => {
-            actual.len() == mutations.len()
-                && mutations.iter().zip(actual.iter()).all(|(mutation, state)| match mutation.kind {
-                    PlannedMutationKind::Put => matches!(state, RevisionState::Present { value, .. } if value == &mutation.value),
-                    PlannedMutationKind::Delete => state.is_missing(),
-                })
-        }
-        _ => false,
-    };
-    if applied {
-        UnknownMutationResolution::Applied
-    } else if actual == before {
-        UnknownMutationResolution::NotApplied
-    } else {
-        UnknownMutationResolution::Partial
-    }
+    let keys = operation.keys().into_iter().cloned().collect::<Vec<_>>();
+    reconcile_unknown_operations(std::slice::from_ref(operation), &keys, current, actual)
+        .unwrap_or(UnknownMutationResolution::Partial)
 }
 
 impl ReferenceModel {
@@ -655,10 +781,126 @@ impl ReferenceModel {
 #[derive(Clone, Debug, Serialize)]
 pub struct OperationRecord {
     pub index: u64,
+    pub global_index: u64,
+    pub phase: String,
+    pub phase_index: u64,
+    pub seed: u64,
+    pub workload_config: WorkloadConfig,
     pub elapsed_ms: u128,
     pub tenant: u64,
     pub operation: String,
+    pub generated_operation: String,
     pub status: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ParsedMetricsSample {
+    pub timestamp_ms: u64,
+    pub cycle: u64,
+    pub sequence: usize,
+    pub allocator: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ParsedEventSummary {
+    pub checkpoint_successes: u64,
+    pub checkpoint_failures: Vec<String>,
+    pub invariant_checks: u64,
+    pub invariant_passes: u64,
+    pub invariant_failures: Vec<String>,
+    pub metrics: Vec<ParsedMetricsSample>,
+}
+
+/// Parses a completed child event log. A hard-killed child may leave one
+/// unterminated final line; callers may explicitly tolerate only that case.
+pub fn parse_event_lines(
+    contents: &str,
+    tolerate_trailing_partial: bool,
+) -> Result<ParsedEventSummary, String> {
+    let mut summary = ParsedEventSummary::default();
+    let trailing_partial = !contents.ends_with('\n');
+    for (sequence, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            return Err(format!("event line {sequence} is empty"));
+        }
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(error)
+                if tolerate_trailing_partial
+                    && trailing_partial
+                    && sequence + 1 == contents.lines().count() =>
+            {
+                let _ = error;
+                continue;
+            }
+            Err(error) => return Err(format!("malformed event line {sequence}: {error}")),
+        };
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("event line {sequence} has no kind"))?;
+        let timestamp_ms = value
+            .get("timestamp_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let cycle = value
+            .get("cycle")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        match kind {
+            "ready" => {}
+            "metrics" => {
+                let allocator = match value.get("allocator") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(allocator)) => {
+                        Some(serde_json::from_str(allocator).map_err(|error| {
+                            format!("invalid allocator JSON on event line {sequence}: {error}")
+                        })?)
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "metrics allocator on event line {sequence} is not a JSON string"
+                        ));
+                    }
+                };
+                summary.metrics.push(ParsedMetricsSample {
+                    timestamp_ms,
+                    cycle,
+                    sequence,
+                    allocator,
+                });
+            }
+            "checkpoint" => {
+                summary.checkpoint_successes += 1;
+                summary.invariant_checks += 1;
+                let invariant_error = match value.get("invariant_error") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(error)) => Some(error.as_str()),
+                    Some(_) => {
+                        return Err(format!(
+                            "checkpoint invariant_error on event line {sequence} is not a string"
+                        ));
+                    }
+                };
+                if let Some(error) = invariant_error {
+                    summary.invariant_failures.push(error.to_owned());
+                } else {
+                    summary.invariant_passes += value
+                        .get("invariant_shards")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                }
+            }
+            "checkpoint_error" => {
+                let error = value.get("error").and_then(Value::as_str).ok_or_else(|| {
+                    format!("checkpoint_error on event line {sequence} has no error")
+                })?;
+                summary.checkpoint_failures.push(error.to_owned());
+            }
+            other => return Err(format!("unknown event kind {other:?} on line {sequence}")),
+        }
+    }
+    Ok(summary)
 }
 
 #[derive(Clone, Debug)]
@@ -741,6 +983,7 @@ pub fn percentile_value(values: &[u64], percentile: f64) -> u64 {
 #[derive(Clone, Debug, Serialize)]
 pub struct ResourceSample {
     pub elapsed_ms: u128,
+    pub post_quiescence: bool,
     pub rss_bytes: Option<u64>,
     pub virtual_bytes: Option<u64>,
     pub fd_count: Option<u64>,
@@ -779,6 +1022,17 @@ pub fn trend_diagnostic(metric: &str, samples: &[(f64, u64)], warmup: Duration) 
         .iter()
         .filter(|sample| sample.0 >= cutoff)
         .collect::<Vec<_>>();
+    if late.len() < 3 {
+        return TrendDiagnostic {
+            metric: metric.to_owned(),
+            warning: false,
+            warmup_ignored: true,
+            first_late_window: late.first().map_or(0, |sample| sample.1),
+            last_late_window: late.last().map_or(0, |sample| sample.1),
+            slope_per_second: 0.0,
+            detail: "insufficient post-warmup samples".to_owned(),
+        };
+    }
     let window = (late.len() / 3).max(1);
     let means = [
         mean_window(&late[..window]),
@@ -851,6 +1105,23 @@ mod tests {
     }
 
     #[test]
+    fn phase_local_operation_index_replays_independently_of_global_offset() {
+        let config = WorkloadConfig {
+            tenant_count: 2,
+            ..WorkloadConfig::default()
+        };
+        let mut first = OperationGenerator::new(7 ^ 0x2222, config.clone()).unwrap();
+        let mut replay = OperationGenerator::new(7 ^ 0x2222, config).unwrap();
+        for phase_index in 0..32 {
+            assert_eq!(
+                first.next(phase_index),
+                replay.next(phase_index),
+                "phase-local operation index {phase_index} did not replay"
+            );
+        }
+    }
+
+    #[test]
     fn model_preserves_missing_delete_revision_and_aba_history() {
         let tenant = TenantId::new(1);
         let document = key(b"p", b"s");
@@ -915,15 +1186,214 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_unknown_puts_reconcile_to_the_final_writer() {
+        let tenant = TenantId::new(1);
+        let document = key(b"p", b"s");
+        let operations = vec![
+            GeneratedOperation::Put {
+                tenant,
+                key: document.clone(),
+                value: b"a".to_vec(),
+            },
+            GeneratedOperation::Put {
+                tenant,
+                key: document.clone(),
+                value: b"b".to_vec(),
+            },
+        ];
+        let current = vec![RevisionState::missing(Revision::ZERO)];
+        let actual = vec![RevisionState::present(b"b".to_vec(), Revision::new(8))];
+        assert_eq!(
+            reconcile_unknown_operations(
+                &operations,
+                std::slice::from_ref(&document),
+                &current,
+                &actual
+            )
+            .unwrap(),
+            UnknownMutationResolution::Applied
+        );
+    }
+
+    #[test]
+    fn unknown_put_delete_chains_reconcile_without_attribution() {
+        let tenant = TenantId::new(1);
+        let document = key(b"p", b"s");
+        let put = GeneratedOperation::Put {
+            tenant,
+            key: document.clone(),
+            value: b"a".to_vec(),
+        };
+        let delete = GeneratedOperation::Delete {
+            tenant,
+            key: document.clone(),
+        };
+        let current = vec![RevisionState::missing(Revision::ZERO)];
+        let present = vec![RevisionState::present(b"a".to_vec(), Revision::new(8))];
+        assert_eq!(
+            reconcile_unknown_operations(
+                &[put.clone(), delete.clone()],
+                std::slice::from_ref(&document),
+                &current,
+                &present,
+            )
+            .unwrap(),
+            UnknownMutationResolution::Applied
+        );
+        let delete_then_put = vec![delete, put];
+        assert_eq!(
+            reconcile_unknown_operations(
+                &delete_then_put,
+                std::slice::from_ref(&document),
+                &current,
+                &present,
+            )
+            .unwrap(),
+            UnknownMutationResolution::Applied
+        );
+    }
+
+    #[test]
+    fn known_later_state_can_hide_an_earlier_unknown() {
+        let tenant = TenantId::new(1);
+        let document = key(b"p", b"s");
+        let operation = GeneratedOperation::Put {
+            tenant,
+            key: document.clone(),
+            value: b"old".to_vec(),
+        };
+        let current = vec![RevisionState::present(b"new".to_vec(), Revision::new(10))];
+        let actual = current.clone();
+        assert_eq!(
+            reconcile_unknown_operations(
+                &[operation],
+                std::slice::from_ref(&document),
+                &current,
+                &actual,
+            )
+            .unwrap(),
+            UnknownMutationResolution::NotApplied
+        );
+    }
+
+    #[test]
+    fn normal_phase_unknowns_are_reconciled_before_exact_verification() {
+        let tenant = TenantId::new(1);
+        let document = key(b"p", b"s");
+        let operation = GeneratedOperation::Put {
+            tenant,
+            key: document.clone(),
+            value: b"normal-phase".to_vec(),
+        };
+        let current = vec![RevisionState::missing(Revision::ZERO)];
+        let actual = vec![RevisionState::present(
+            b"normal-phase".to_vec(),
+            Revision::new(11),
+        )];
+        let resolution = reconcile_unknown_operations(
+            std::slice::from_ref(&operation),
+            std::slice::from_ref(&document),
+            &current,
+            &actual,
+        )
+        .unwrap();
+        assert_eq!(resolution, UnknownMutationResolution::Applied);
+        // The exact verification model is only valid after this state update.
+        let mut model = ReferenceModel::default();
+        model.apply(tenant, document.clone(), actual[0].clone());
+        assert_eq!(model.state(tenant, &document), actual[0]);
+    }
+
+    #[test]
+    fn atomic_unknown_transaction_accepts_all_or_none_and_rejects_partial() {
+        let tenant = TenantId::new(1);
+        let first = key(b"p", b"a");
+        let second = key(b"p", b"b");
+        let operation = GeneratedOperation::Transact {
+            tenant,
+            mutations: vec![
+                PlannedMutation {
+                    key: first.clone(),
+                    kind: PlannedMutationKind::Put,
+                    value: b"first".to_vec(),
+                },
+                PlannedMutation {
+                    key: second.clone(),
+                    kind: PlannedMutationKind::Put,
+                    value: b"second".to_vec(),
+                },
+            ],
+        };
+        let keys = vec![first, second];
+        let current = vec![RevisionState::missing(Revision::ZERO); 2];
+        let all = vec![
+            RevisionState::present(b"first".to_vec(), Revision::new(10)),
+            RevisionState::present(b"second".to_vec(), Revision::new(10)),
+        ];
+        let partial = vec![all[0].clone(), current[1].clone()];
+        assert_eq!(
+            reconcile_unknown_operations(std::slice::from_ref(&operation), &keys, &current, &all)
+                .unwrap(),
+            UnknownMutationResolution::Applied
+        );
+        assert_eq!(
+            reconcile_unknown_operations(
+                std::slice::from_ref(&operation),
+                &keys,
+                &current,
+                &partial,
+            )
+            .unwrap(),
+            UnknownMutationResolution::Partial
+        );
+    }
+
+    #[test]
+    fn checkpoint_error_event_is_not_ignored() {
+        let parsed = parse_event_lines(
+            "{\"kind\":\"checkpoint\",\"invariant_shards\":2}\n{\"kind\":\"checkpoint_error\",\"error\":\"disk full\"}\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.checkpoint_successes, 1);
+        assert_eq!(parsed.checkpoint_failures, vec!["disk full"]);
+    }
+
+    #[test]
+    fn checkpoint_and_invariant_failures_are_distinguished() {
+        let parsed = parse_event_lines(
+            "{\"kind\":\"checkpoint\",\"invariant_shards\":0,\"invariant_error\":\"bad page\"}\n{\"kind\":\"checkpoint_error\",\"error\":\"io\"}\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.checkpoint_successes, 1);
+        assert_eq!(parsed.checkpoint_failures, vec!["io"]);
+        assert_eq!(parsed.invariant_failures, vec!["bad page"]);
+    }
+
+    #[test]
+    fn malformed_event_records_fail_unless_the_final_line_is_a_crash_partial() {
+        assert!(parse_event_lines("{\"kind\":\"metrics\"}\nnot-json\n", false).is_err());
+        assert!(parse_event_lines("{\"kind\":\"metrics\"}\nnot-json", true).is_ok());
+        assert!(parse_event_lines("{\"kind\":\"metrics\"}\nnot-json\n", true).is_err());
+    }
+
+    #[test]
     fn percentile_and_recent_operations_are_bounded() {
         assert_eq!(percentile_value(&[1, 2, 3, 4, 5], 50.0), 3);
         let mut recent = RecentOperations::new(2);
         for index in 0..5 {
             recent.push(OperationRecord {
                 index,
+                global_index: index,
+                phase: "test".to_owned(),
+                phase_index: index,
+                seed: 0,
+                workload_config: WorkloadConfig::default(),
                 elapsed_ms: 0,
                 tenant: 1,
                 operation: "get".to_owned(),
+                generated_operation: "Get".to_owned(),
                 status: "ok".to_owned(),
             });
         }
