@@ -139,7 +139,8 @@ several sequences may share one WAL sync. Recovery replays those committed
 units in order.
 
 OCC validation, MVCC, replication, networking, and background flush workers
-remain outside this WAL document. Phase 5 adds local checkpoint and physical
-snapshot boundaries; remote retention, replication, and public PITR remain
-outside the phase. A caller may invoke `flush` for a clean data-file image;
-successful writes do not depend on doing so.
+remain outside this WAL document. Phase 5 adds local checkpoint and WAL
+reclamation plus the contract for an external crash-consistent storage backup;
+remote retention, replication, and public PITR remain outside the phase. A
+caller may invoke `flush` for a clean data-file image; successful writes do not
+depend on doing so.

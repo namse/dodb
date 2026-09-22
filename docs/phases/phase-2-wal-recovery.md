@@ -36,7 +36,7 @@ paired `open_with_wal` constructor use the Phase 2 protocol.
 ## Non-goals
 
 Phase 2 does not add a user-facing multi-key transaction API, OCC, MVCC,
-snapshots, checkpoints, WAL compaction, replication, networking, or a
+application-level backup formats, checkpoints, WAL compaction, replication, networking, or a
 background flush service. The WAL API already treats a full set of page images
 as one commit unit so Phase 3 can use the same recovery format for a validated
 multi-key transaction.

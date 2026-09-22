@@ -6,7 +6,7 @@ Phase 6 exposes the existing local dodb semantics through raw QUIC and a
 first-party async Rust client. The implementation does not add HTTP/1.1,
 HTTP/2, HTTP/3, REST, SQL, fn0 integration, authentication, tenant
 authorization, replication, remote WAL, distributed transactions, or admin
-checkpoint/snapshot RPCs.
+checkpoint or backup RPCs.
 
 ## Dependency and service structure
 
@@ -68,7 +68,7 @@ application errors.
 Batch is an atomic condition-free collection of Put/Delete mutations. The
 existing transaction primitive remains the general atomic operation with
 conditions. The protocol does not expose B+Tree pages, WAL records, page LSNs,
-superblock slots, checkpoint state, or snapshot implementation details.
+superblock slots, checkpoint state, or storage-provider backup details.
 
 The default network limits are:
 
@@ -161,7 +161,7 @@ operation as independently observed ordinary Gets.
 
 Ordinary Query and Scan retain ordered results and exclusive cursors. TransactGet
 retains input order and one committed point-read state. It does not create a
-cross-key snapshot promise for ordinary independent Gets, Query, or Scan.
+cross-key read-snapshot promise for ordinary independent Gets, Query, or Scan.
 
 ## Errors and unknown outcomes
 
@@ -216,8 +216,8 @@ mutation outcome.
 The protocol intentionally leaves application authentication, tenant
 authorization, idempotency, distributed routing, ownership transfer,
 replication, secondary replicas, shard migration, distributed transactions,
-service discovery, load balancing, and operational checkpoint/snapshot/restore
-control surfaces for later phases.
+service discovery, load balancing, and operational checkpoint/backup control
+surfaces for later phases.
 Dropping or releasing a tenant handle does not close the shared transport.
 The connection owner explicitly calls `DodbConnection::close()` during
 shutdown. The original tenant-bound `DodbClient::connect` constructor remains

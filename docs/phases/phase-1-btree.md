@@ -8,7 +8,8 @@ upsert, delete, same-primary-key query, ordered scan, clean reopen, page
 cache, reusable overflow/free pages, and an offline invariant checker.
 
 It does not define the Phase 2 WAL or recovery protocol, transactional commit,
-MVCC, snapshotting, networking, or background compaction. The compatibility
+MVCC, application-level backup formats, networking, or background compaction.
+The compatibility
 single-file publisher remains synchronized for deterministic clean-reopen
 tests; crash-safe production opening is supplied by Phase 2's paired data/WAL
 path.

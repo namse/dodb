@@ -14,7 +14,6 @@ pub enum Error {
     DurabilityFailure(String),
     RecoveryFailure(String),
     CheckpointFailure(String),
-    SnapshotInvalid(String),
     InternalInvariantViolation(String),
 }
 
@@ -61,10 +60,6 @@ impl Error {
         Self::CheckpointFailure(message.into())
     }
 
-    pub fn snapshot(message: impl Into<String>) -> Self {
-        Self::SnapshotInvalid(message.into())
-    }
-
     pub fn invariant(message: impl Into<String>) -> Self {
         Self::InternalInvariantViolation(message.into())
     }
@@ -86,7 +81,6 @@ impl fmt::Display for Error {
             Self::CheckpointFailure(message) => {
                 write!(formatter, "checkpoint failure: {message}")
             }
-            Self::SnapshotInvalid(message) => write!(formatter, "invalid snapshot: {message}"),
             Self::InternalInvariantViolation(message) => {
                 write!(formatter, "internal invariant violation: {message}")
             }

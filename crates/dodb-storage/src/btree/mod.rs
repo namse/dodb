@@ -1043,19 +1043,6 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         })
     }
 
-    pub fn create_snapshot(
-        &mut self,
-        destination: impl AsRef<Path>,
-    ) -> Result<crate::SnapshotReport> {
-        self.checkpoint()?;
-        crate::snapshot::create_snapshot(
-            &mut self.file,
-            &self.current_superblock,
-            destination.as_ref(),
-            self.fault_injector.as_deref_mut(),
-        )
-    }
-
     pub fn check_invariants(&mut self) -> Result<InvariantReport> {
         if self.wal.is_some() {
             self.flush_dirty_pages()?;

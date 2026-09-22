@@ -4,7 +4,6 @@ pub mod btree;
 pub mod durable_file;
 pub mod fault;
 pub mod page;
-pub mod snapshot;
 pub mod superblock;
 pub mod wal;
 
@@ -18,11 +17,6 @@ pub use fault::FaultInjector;
 pub use page::{
     DecodedPage, PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageType, decode_page, decode_page_at,
     encode_page,
-};
-pub use snapshot::{
-    SNAPSHOT_DATABASE_NAME, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_MAGIC, SNAPSHOT_MANIFEST_NAME,
-    SnapshotManifest, SnapshotReport, restore_snapshot, restore_snapshot_with_injector,
-    validate_snapshot,
 };
 pub use superblock::{
     SUPERBLOCK_FORMAT_VERSION, SelectedSuperblock, Superblock, SuperblockSlot, choose_superblock,

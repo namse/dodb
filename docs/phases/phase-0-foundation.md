@@ -19,7 +19,7 @@
 ## Explicit non-goals
 
 No B+Tree, page allocator, free list, overflow implementation, WAL, recovery,
-fsync commit protocol, production OCC, MVCC, snapshot/checkpoint, replication,
+fsync commit protocol, production OCC, MVCC, checkpoint, replication,
 shard movement, 2PC, query parser, network/server/client, or performance
 tuning is present.
 
@@ -28,4 +28,3 @@ tuning is present.
 `cargo fmt --check`, workspace clippy with `-D warnings`, and
 `cargo test --workspace` must pass. Phase 1 may use the existing key, page,
 superblock, durable-file, and testkit contracts as its starting surface.
-

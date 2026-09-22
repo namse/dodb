@@ -5,8 +5,8 @@ logical key is `(tenant, (pk, sk))` and whose value is opaque bytes. Phase 1
 adds a checked single-file B+Tree storage engine for one shard. Phase 2 adds
 the redo-only WAL and crash recovery. Phase 3 adds optimistic same-shard
 point-key transactions and WAL group commit.
-Phase 5 adds formal checkpoints, WAL reclamation, local physical snapshots,
-and validated restore. Phase 6 adds the bounded raw QUIC application protocol,
+Phase 5 adds formal checkpoints, WAL reclamation, and the storage-level
+crash-consistent backup contract. Phase 6 adds the bounded raw QUIC application protocol,
 the transport-independent service boundary, the local tenant/shard service,
 and the first-party Rust client.
 
@@ -40,7 +40,8 @@ separate types and routing stays outside the physical document key.
 
 Phase 5 remains local to one physical shard. Phase 6 keeps the same local
 durability boundary: network requests never expose pages, WAL records, LSN
-frames, superblocks, checkpoints, or snapshots. There is no replication,
+frames, superblocks, or checkpoints. Application-level backup files are not
+part of the protocol. There is no replication,
 remote object storage, public PITR, distributed checkpoint, authentication,
 tenant authorization, or distributed routing.
 

@@ -238,8 +238,7 @@ impl ApplicationError {
             },
             Error::UnsupportedFormat(detail)
             | Error::RecoveryFailure(detail)
-            | Error::CheckpointFailure(detail)
-            | Error::SnapshotInvalid(detail) => Self {
+            | Error::CheckpointFailure(detail) => Self {
                 kind: ApplicationErrorKind::StorageFailure,
                 detail: detail.clone(),
                 mutation_outcome: MutationOutcome::Unknown,

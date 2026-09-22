@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,6 @@ use super::{
     BTreeStore, BatchRequest, BatchResponse, CheckpointReport, StorageMetrics, validate_encoded_key,
 };
 use crate::DurableFile;
-use crate::SnapshotReport;
 use crate::wal::WalMetrics;
 
 /// Internal scheduling limits for one shard coordinator.
@@ -205,18 +203,6 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
         }
     }
 
-    pub async fn create_snapshot(&self, destination: impl Into<PathBuf>) -> Result<SnapshotReport> {
-        match self
-            .send(CoordinatorOperation::Snapshot(destination.into()))
-            .await?
-        {
-            CoordinatorResponse::Snapshot(report) => Ok(report),
-            _ => Err(Error::invariant(
-                "coordinator returned the wrong snapshot response",
-            )),
-        }
-    }
-
     fn try_read(
         &self,
         request: &BatchRequest,
@@ -333,7 +319,6 @@ enum CoordinatorOperation {
     },
     Observe(Vec<DocumentKey>),
     Checkpoint,
-    Snapshot(PathBuf),
 }
 
 enum CoordinatorResponse {
@@ -342,7 +327,6 @@ enum CoordinatorResponse {
     TransactGet(Vec<RevisionState>),
     Observe(Vec<ObservedState>),
     Checkpoint(CheckpointReport),
-    Snapshot(SnapshotReport),
 }
 
 fn try_enqueue(
@@ -633,9 +617,6 @@ fn process_segment<F: DurableFile, W: DurableFile>(
             CoordinatorOperation::Checkpoint => {
                 store.checkpoint().map(CoordinatorResponse::Checkpoint)
             }
-            CoordinatorOperation::Snapshot(destination) => store
-                .create_snapshot(destination)
-                .map(CoordinatorResponse::Snapshot),
         })
         .collect();
     Ok(responses)
@@ -710,9 +691,6 @@ fn batch_error(error: &Error) -> Error {
         Error::CheckpointFailure(message) => {
             Error::checkpoint(format!("batch was not published: {message}"))
         }
-        Error::SnapshotInvalid(message) => {
-            Error::snapshot(format!("batch was not published: {message}"))
-        }
         Error::InternalInvariantViolation(message) => {
             Error::invariant(format!("batch was not published: {message}"))
         }
@@ -784,7 +762,6 @@ fn operation_size(operation: &CoordinatorOperation) -> usize {
             .map(|key| key.encode().len())
             .fold(0usize, usize::saturating_add),
         CoordinatorOperation::Checkpoint => 0,
-        CoordinatorOperation::Snapshot(destination) => destination.to_string_lossy().len(),
     }
 }
 
