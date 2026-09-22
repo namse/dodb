@@ -6,6 +6,7 @@ pub enum Error {
     InvalidInput(String),
     InvalidRequest(String),
     Overloaded(String),
+    ResponseTooLarge(String),
     Conflict(crate::transaction::TransactionConflict),
     Corruption(String),
     Io(std::io::Error),
@@ -34,6 +35,10 @@ impl Error {
 
     pub fn overloaded(message: impl Into<String>) -> Self {
         Self::Overloaded(message.into())
+    }
+
+    pub fn response_too_large(message: impl Into<String>) -> Self {
+        Self::ResponseTooLarge(message.into())
     }
 
     pub fn conflict(conflict: crate::transaction::TransactionConflict) -> Self {
@@ -71,6 +76,7 @@ impl fmt::Display for Error {
             Self::InvalidInput(message) => write!(formatter, "invalid input: {message}"),
             Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
             Self::Overloaded(message) => write!(formatter, "overloaded: {message}"),
+            Self::ResponseTooLarge(message) => write!(formatter, "response too large: {message}"),
             Self::Conflict(conflict) => write!(formatter, "conflict: {conflict}"),
             Self::Corruption(message) => write!(formatter, "corruption: {message}"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),

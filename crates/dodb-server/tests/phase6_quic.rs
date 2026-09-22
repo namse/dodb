@@ -1,14 +1,18 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dodb_client::{ClientError, ClientTlsConfig, DodbClient};
 use dodb_core::{
-    ConditionExpectation, DocumentKey, Revision, RevisionState, TenantId, TransactionCondition,
-    TransactionMutation, TransactionRequest,
+    ConditionExpectation, DocumentKey, Error, Revision, RevisionState, TenantId,
+    TransactionCondition, TransactionMutation, TransactionRequest,
 };
 use dodb_server::{
     DodbServer, DodbServerConfig, LocalTenantService, LocalTenantServiceConfig, ServerTlsConfig,
 };
-use dodb_service::TransactionOutcome;
+use dodb_service::{
+    DodbService, ExecutionBudget, Request, Response, ServiceFuture, TransactionOutcome,
+};
+use dodb_storage::FaultInjector;
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use rcgen::generate_simple_self_signed;
@@ -33,6 +37,18 @@ async fn start_server(
     Arc<DodbServer<LocalTenantService>>,
     tokio::task::JoinHandle<Result<(), dodb_server::ServerError>>,
 ) {
+    start_server_with_limits(data_dir, tls, dodb_protocol::ProtocolLimits::default(), 64).await
+}
+
+async fn start_server_with_limits(
+    data_dir: std::path::PathBuf,
+    tls: &TestTls,
+    protocol_limits: dodb_protocol::ProtocolLimits,
+    max_concurrent_requests: usize,
+) -> (
+    Arc<DodbServer<LocalTenantService>>,
+    tokio::task::JoinHandle<Result<(), dodb_server::ServerError>>,
+) {
     let service = Arc::new(
         LocalTenantService::new(LocalTenantServiceConfig {
             data_dir,
@@ -50,9 +66,10 @@ async fn start_server(
                     tls.private_key.clone(),
                 )
                 .unwrap(),
-                protocol_limits: dodb_protocol::ProtocolLimits::default(),
+                protocol_limits,
                 max_connections: 8,
                 max_concurrent_streams: 64,
+                max_concurrent_requests,
             },
         )
         .unwrap(),
@@ -62,10 +79,25 @@ async fn start_server(
     (server, task)
 }
 
-async fn connect_client(
-    server: &DodbServer<LocalTenantService>,
+async fn connect_client<S: DodbService + 'static>(
+    server: &DodbServer<S>,
     tls: &TestTls,
     tenant: TenantId,
+) -> DodbClient {
+    connect_client_with_limits(
+        server,
+        tls,
+        tenant,
+        dodb_protocol::ProtocolLimits::default(),
+    )
+    .await
+}
+
+async fn connect_client_with_limits<S: DodbService + 'static>(
+    server: &DodbServer<S>,
+    tls: &TestTls,
+    tenant: TenantId,
+    limits: dodb_protocol::ProtocolLimits,
 ) -> DodbClient {
     DodbClient::connect(
         "0.0.0.0:0".parse().unwrap(),
@@ -73,7 +105,7 @@ async fn connect_client(
         "localhost",
         tenant,
         ClientTlsConfig::from_der(vec![tls.certificate.clone()]).unwrap(),
-        dodb_protocol::ProtocolLimits::default(),
+        limits,
     )
     .await
     .unwrap()
@@ -83,13 +115,36 @@ fn key(pk: &[u8], sk: &[u8]) -> DocumentKey {
     DocumentKey::new(pk.to_vec(), sk.to_vec())
 }
 
-async fn stop_server(
+struct BlockingService {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    first_request: AtomicBool,
+}
+
+impl DodbService for BlockingService {
+    fn execute<'service>(
+        &'service self,
+        _tenant: TenantId,
+        _request: Request,
+        _budget: ExecutionBudget,
+    ) -> ServiceFuture<'service> {
+        Box::pin(async move {
+            if !self.first_request.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Response::Get(RevisionState::missing(Revision::ZERO)))
+        })
+    }
+}
+
+async fn stop_server<S: DodbService + 'static>(
     client: DodbClient,
-    server: Arc<DodbServer<LocalTenantService>>,
+    server: Arc<DodbServer<S>>,
     task: tokio::task::JoinHandle<Result<(), dodb_server::ServerError>>,
 ) {
     client.close();
-    server.close();
+    server.shutdown().await;
     task.await.unwrap().unwrap();
 }
 
@@ -233,6 +288,10 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
         ClientError::Application(error) => {
             assert_eq!(error.kind, dodb_protocol::ApplicationErrorKind::Conflict);
             assert_eq!(
+                error.mutation_outcome,
+                dodb_protocol::MutationOutcome::NotApplied
+            );
+            assert_eq!(
                 error.conflict.as_ref().unwrap().expected,
                 ConditionExpectation::RevisionEquals(first_revision)
             );
@@ -260,6 +319,35 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
             assert_eq!(conflict.actual, RevisionState::missing(deleted_revision));
         }
         other => panic!("unexpected ABA error: {other}"),
+    }
+
+    let invalid = client
+        .transact(TransactionRequest::new(
+            Vec::new(),
+            vec![
+                TransactionMutation::Put {
+                    key: key(b"invalid", b"key"),
+                    value: vec![1],
+                },
+                TransactionMutation::Delete {
+                    key: key(b"invalid", b"key"),
+                },
+            ],
+        ))
+        .await
+        .unwrap_err();
+    match invalid {
+        ClientError::Application(error) => {
+            assert_eq!(
+                error.kind,
+                dodb_protocol::ApplicationErrorKind::InvalidRequest
+            );
+            assert_eq!(
+                error.mutation_outcome,
+                dodb_protocol::MutationOutcome::NotApplied
+            );
+        }
+        other => panic!("unexpected invalid request error: {other}"),
     }
 
     stop_server(client, server, task).await;
@@ -313,6 +401,104 @@ async fn concurrent_streams_and_tenant_isolation_are_preserved() {
 }
 
 #[tokio::test]
+async fn global_request_backpressure_preserves_unrelated_in_flight_streams() {
+    let tls = test_tls();
+    let service = Arc::new(BlockingService {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        first_request: AtomicBool::new(false),
+    });
+    let server = Arc::new(
+        DodbServer::bind(
+            Arc::clone(&service),
+            DodbServerConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                tls: ServerTlsConfig::from_der(
+                    vec![tls.certificate.clone()],
+                    tls.private_key.clone(),
+                )
+                .unwrap(),
+                protocol_limits: dodb_protocol::ProtocolLimits::default(),
+                max_connections: 2,
+                max_concurrent_streams: 8,
+                max_concurrent_requests: 1,
+            },
+        )
+        .unwrap(),
+    );
+    let task_server = Arc::clone(&server);
+    let task = tokio::spawn(async move { task_server.run().await });
+    let client = connect_client(&server, &tls, TenantId::new(71)).await;
+
+    let entered = service.entered.notified();
+    let first_client = client.clone();
+    let first = tokio::spawn(async move { first_client.get(key(b"blocking", b"first")).await });
+    entered.await;
+
+    let second_client = client.clone();
+    let second = tokio::spawn(async move { second_client.get(key(b"blocking", b"second")).await });
+    tokio::task::yield_now().await;
+    service.release.notify_one();
+
+    assert_eq!(
+        first.await.unwrap().unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    assert_eq!(
+        second.await.unwrap().unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    stop_server(client, server, task).await;
+}
+
+#[tokio::test]
+async fn aggregate_read_budget_returns_structured_result_too_large_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let limits = dodb_protocol::ProtocolLimits {
+        max_request_frame_size: 3 * 1024 * 1024,
+        max_response_frame_size: 3 * 1024 * 1024,
+        ..dodb_protocol::ProtocolLimits::default()
+    };
+    let (server, task) =
+        start_server_with_limits(directory.path().to_owned(), &tls, limits, 8).await;
+    let client = connect_client_with_limits(&server, &tls, TenantId::new(72), limits).await;
+    let first = key(b"aggregate", b"first");
+    let second = key(b"aggregate", b"second");
+    let value = vec![5; 2 * 1024 * 1024];
+    client.put(first.clone(), value.clone()).await.unwrap();
+    client.put(second.clone(), value).await.unwrap();
+
+    let aggregate_results = vec![
+        client
+            .query(dodb_core::PrimaryKey::new(b"aggregate".to_vec()), None, 2)
+            .await,
+        client.scan(None, 2).await,
+    ];
+    for result in aggregate_results {
+        match result.unwrap_err() {
+            ClientError::Application(error) => {
+                assert_eq!(
+                    error.kind,
+                    dodb_protocol::ApplicationErrorKind::ResponseTooLarge
+                );
+            }
+            other => panic!("unexpected aggregate read error: {other}"),
+        }
+    }
+    match client.transact_get(vec![first, second]).await.unwrap_err() {
+        ClientError::Application(error) => {
+            assert_eq!(
+                error.kind,
+                dodb_protocol::ApplicationErrorKind::ResponseTooLarge
+            );
+        }
+        other => panic!("unexpected transactional read error: {other}"),
+    }
+    stop_server(client, server, task).await;
+}
+
+#[tokio::test]
 async fn persisted_state_is_available_after_server_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let tls = test_tls();
@@ -336,6 +522,70 @@ async fn persisted_state_is_available_after_server_reopen() {
         );
         stop_server(client, server, task).await;
     }
+}
+
+struct FailWalSync;
+
+impl FaultInjector for FailWalSync {
+    fn hit(&mut self, point: &str) -> dodb_core::Result<()> {
+        if point == "during_wal_sync" {
+            return Err(Error::durability("injected WAL sync failure"));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn wal_durability_failure_is_unknown_over_the_real_client_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let mut local_service = LocalTenantService::new(LocalTenantServiceConfig {
+        data_dir: directory.path().to_owned(),
+        ..LocalTenantServiceConfig::default()
+    })
+    .unwrap();
+    local_service.set_fault_injector_factory(Arc::new(|_, _| Box::new(FailWalSync)));
+    let server = Arc::new(
+        DodbServer::bind(
+            Arc::new(local_service),
+            DodbServerConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                tls: ServerTlsConfig::from_der(
+                    vec![tls.certificate.clone()],
+                    tls.private_key.clone(),
+                )
+                .unwrap(),
+                protocol_limits: dodb_protocol::ProtocolLimits::default(),
+                max_connections: 2,
+                max_concurrent_streams: 8,
+                max_concurrent_requests: 8,
+            },
+        )
+        .unwrap(),
+    );
+    let task_server = Arc::clone(&server);
+    let task = tokio::spawn(async move { task_server.run().await });
+    let client = connect_client(&server, &tls, TenantId::new(73)).await;
+    let error = client
+        .put(key(b"durability", b"failure"), vec![1, 2, 3])
+        .await
+        .unwrap_err();
+    match error {
+        ClientError::UnknownMutationOutcome {
+            cause: Some(cause), ..
+        } => {
+            assert_eq!(
+                cause.kind,
+                dodb_protocol::ApplicationErrorKind::DurabilityFailure
+            );
+            assert_eq!(
+                cause.mutation_outcome,
+                dodb_protocol::MutationOutcome::Unknown
+            );
+        }
+        other => panic!("unexpected durability error: {other}"),
+    }
+    stop_server(client, server, task).await;
 }
 
 #[tokio::test]

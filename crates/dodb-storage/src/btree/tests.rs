@@ -103,6 +103,23 @@ fn basic_operations_preserve_missing_revisions_and_order() {
 }
 
 #[test]
+fn canonical_key_boundary_includes_zero_byte_expansion() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let boundary = key(vec![0; 1_994], Vec::new());
+    assert_eq!(boundary.encoded_len(), MAX_ENCODED_KEY_SIZE);
+    assert_eq!(
+        store.get(&boundary).unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+
+    let oversized = key(vec![0; 1_995], Vec::new());
+    assert!(matches!(
+        store.put(oversized, b"rejected"),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+#[test]
 fn splits_root_and_internal_pages_and_reopens() {
     let mut store = BTreeStore::open(MemoryFile::default(), config(0)).unwrap();
     for value in 0u16..3000 {
@@ -320,6 +337,82 @@ async fn async_shard_reads_use_one_committed_view_and_bypass_write_queue() {
     assert_eq!(scan.len(), 240);
     let metrics = shard.coordinator_metrics();
     assert_eq!(metrics.queued_requests, 240);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn response_budgets_bound_query_scan_and_transact_get_without_truncation() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let first = key(b"budget", b"first");
+    let second = key(b"budget", b"second");
+    let value = vec![7; 2 * 1024 * 1024];
+    store.put(first.clone(), value.clone()).unwrap();
+    store.put(second.clone(), value).unwrap();
+    let shard = AsyncShard::start(store, 8);
+
+    for request in [
+        BatchRequest::Query {
+            pk: PrimaryKey::new(b"budget".to_vec()),
+            exclusive_after_sk: None,
+            limit: 2,
+        },
+        BatchRequest::Scan {
+            exclusive_after_key: None,
+            limit: 2,
+        },
+    ] {
+        assert!(matches!(
+            shard
+                .execute_with_response_budget(request, 3 * 1024 * 1024)
+                .await,
+            Err(Error::ResponseTooLarge(_))
+        ));
+    }
+    assert!(matches!(
+        shard
+            .transact_get_with_response_budget(vec![first.clone(), second.clone()], 3 * 1024 * 1024)
+            .await,
+        Err(Error::ResponseTooLarge(_))
+    ));
+
+    let query = shard
+        .execute_with_response_budget(
+            BatchRequest::Query {
+                pk: PrimaryKey::new(b"budget".to_vec()),
+                exclusive_after_sk: None,
+                limit: 2,
+            },
+            5 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+    let BatchResponse::Query(rows) = query else {
+        panic!("expected query response");
+    };
+    assert_eq!(rows.len(), 2);
+    let states = shard
+        .transact_get_with_response_budget(vec![second, first], 5 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(states.len(), 2);
+    shard.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_near_maximum_value_remains_readable_with_a_response_budget() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let key = key(b"large", b"value");
+    let value = vec![3; MAX_VALUE_SIZE];
+    store.put(key.clone(), value.clone()).unwrap();
+    let shard = AsyncShard::start(store, 8);
+    let response = shard
+        .execute_with_response_budget(BatchRequest::Get { key }, MAX_VALUE_SIZE + 1024 * 1024)
+        .await
+        .unwrap();
+    let BatchResponse::Get(state) = response else {
+        panic!("expected get response");
+    };
+    assert_eq!(state.value().map(|bytes| bytes.len()), Some(value.len()));
     shard.close().await.unwrap();
 }
 

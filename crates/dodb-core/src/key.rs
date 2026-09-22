@@ -64,6 +64,11 @@ impl DocumentKey {
         encoded
     }
 
+    /// Returns the length of the canonical encoding without allocating it.
+    pub fn encoded_len(&self) -> usize {
+        encoded_component_len(&self.pk.0) + encoded_component_len(&self.sk.0)
+    }
+
     /// Decodes the exact canonical encoding produced by [`Self::encode`].
     pub fn decode(encoded: &[u8]) -> Result<Self, KeyCodecError> {
         let (pk, next) = decode_component(encoded, 0)?;
@@ -129,6 +134,10 @@ fn encode_component(bytes: &[u8], output: &mut Vec<u8>) {
         }
     }
     output.extend_from_slice(&[0, 0]);
+}
+
+fn encoded_component_len(bytes: &[u8]) -> usize {
+    bytes.len() + bytes.iter().filter(|byte| **byte == 0).count() + 2
 }
 
 fn decode_component(encoded: &[u8], start: usize) -> Result<(Vec<u8>, usize), KeyCodecError> {
@@ -206,5 +215,14 @@ mod tests {
             assert!(DocumentKey::decode(&input).is_err(), "accepted {input:?}");
         }
         assert!(DocumentKey::decode(&[0, 0, 0, 0]).is_ok());
+    }
+
+    #[test]
+    fn encoded_len_matches_canonical_encoding_and_counts_zero_escapes() {
+        let key = DocumentKey::new(vec![0; 1_994], Vec::new());
+        assert_eq!(key.encoded_len(), 3_992);
+        assert_eq!(key.encoded_len(), key.encode().len());
+        let oversized = DocumentKey::new(vec![0; 1_995], Vec::new());
+        assert_eq!(oversized.encoded_len(), 3_994);
     }
 }

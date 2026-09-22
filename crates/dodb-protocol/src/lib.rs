@@ -13,12 +13,14 @@ pub const REQUEST_MESSAGE_TYPE: u8 = 1;
 pub const RESPONSE_MESSAGE_TYPE: u8 = 2;
 pub const MAX_STORAGE_VALUE_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_STORAGE_KEY_COMPONENT_SIZE: usize = 3_990;
+pub const MAX_STORAGE_ENCODED_KEY_SIZE: usize = 3_992;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProtocolLimits {
     pub max_request_frame_size: usize,
     pub max_response_frame_size: usize,
     pub max_key_component_size: usize,
+    pub max_encoded_key_size: usize,
     pub max_value_size: usize,
     pub max_keys: usize,
     pub max_conditions: usize,
@@ -34,6 +36,7 @@ impl Default for ProtocolLimits {
             max_request_frame_size: 68 * 1024 * 1024,
             max_response_frame_size: 68 * 1024 * 1024,
             max_key_component_size: MAX_STORAGE_KEY_COMPONENT_SIZE,
+            max_encoded_key_size: MAX_STORAGE_ENCODED_KEY_SIZE,
             max_value_size: MAX_STORAGE_VALUE_SIZE,
             max_keys: 4_096,
             max_conditions: 256,
@@ -50,6 +53,7 @@ impl ProtocolLimits {
         if self.max_request_frame_size < HEADER_SIZE
             || self.max_response_frame_size < HEADER_SIZE
             || self.max_key_component_size == 0
+            || self.max_encoded_key_size == 0
             || self.max_value_size == 0
             || self.max_keys == 0
             || self.max_conditions == 0
@@ -61,6 +65,7 @@ impl ProtocolLimits {
             return Err(ProtocolError::InvalidLimits);
         }
         if self.max_key_component_size > MAX_STORAGE_KEY_COMPONENT_SIZE
+            || self.max_encoded_key_size > MAX_STORAGE_ENCODED_KEY_SIZE
             || self.max_value_size > MAX_STORAGE_VALUE_SIZE
         {
             return Err(ProtocolError::InvalidLimits);
@@ -86,6 +91,7 @@ pub enum ProtocolError {
     TruncatedPayload,
     TrailingBytes,
     PayloadTooLarge { length: usize, maximum: usize },
+    KeyTooLarge { length: usize, maximum: usize },
     LengthOverflow,
     InvalidOpcode(u8),
     InvalidStatus(u8),
@@ -117,6 +123,12 @@ impl fmt::Display for ProtocolError {
                     "payload length {length} exceeds maximum {maximum}"
                 )
             }
+            Self::KeyTooLarge { length, maximum } => {
+                write!(
+                    formatter,
+                    "encoded key length {length} exceeds maximum {maximum}"
+                )
+            }
             Self::LengthOverflow => write!(formatter, "length conversion overflow"),
             Self::InvalidOpcode(opcode) => write!(formatter, "invalid operation opcode {opcode}"),
             Self::InvalidStatus(status) => write!(formatter, "invalid response status {status}"),
@@ -146,6 +158,7 @@ pub enum ApplicationErrorKind {
     InvalidRequest,
     Overloaded,
     Conflict,
+    ResponseTooLarge,
     StorageFailure,
     Corruption,
     DurabilityFailure,
@@ -153,10 +166,18 @@ pub enum ApplicationErrorKind {
     UnsupportedProtocol,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationOutcome {
+    NotApplicable,
+    NotApplied,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationError {
     pub kind: ApplicationErrorKind,
     pub detail: String,
+    pub mutation_outcome: MutationOutcome,
     pub conflict: Option<ConflictDetails>,
 }
 
@@ -172,6 +193,7 @@ impl ApplicationError {
         Self {
             kind: ApplicationErrorKind::InvalidRequest,
             detail: detail.into(),
+            mutation_outcome: MutationOutcome::NotApplied,
             conflict: None,
         }
     }
@@ -181,26 +203,37 @@ impl ApplicationError {
             Error::InvalidInput(detail) | Error::InvalidRequest(detail) => Self {
                 kind: ApplicationErrorKind::InvalidRequest,
                 detail: detail.clone(),
+                mutation_outcome: MutationOutcome::NotApplied,
                 conflict: None,
             },
             Error::Overloaded(detail) => Self {
                 kind: ApplicationErrorKind::Overloaded,
                 detail: detail.clone(),
+                mutation_outcome: MutationOutcome::NotApplied,
                 conflict: None,
             },
             Error::Conflict(conflict) => Self {
                 kind: ApplicationErrorKind::Conflict,
                 detail: "transaction condition conflict".to_owned(),
+                mutation_outcome: MutationOutcome::NotApplied,
                 conflict: Some(ConflictDetails::from(conflict)),
+            },
+            Error::ResponseTooLarge(detail) => Self {
+                kind: ApplicationErrorKind::ResponseTooLarge,
+                detail: detail.clone(),
+                mutation_outcome: MutationOutcome::NotApplied,
+                conflict: None,
             },
             Error::Corruption(detail) => Self {
                 kind: ApplicationErrorKind::Corruption,
                 detail: detail.clone(),
+                mutation_outcome: MutationOutcome::Unknown,
                 conflict: None,
             },
             Error::Io(error) => Self {
                 kind: ApplicationErrorKind::StorageFailure,
                 detail: error.to_string(),
+                mutation_outcome: MutationOutcome::Unknown,
                 conflict: None,
             },
             Error::UnsupportedFormat(detail)
@@ -209,19 +242,30 @@ impl ApplicationError {
             | Error::SnapshotInvalid(detail) => Self {
                 kind: ApplicationErrorKind::StorageFailure,
                 detail: detail.clone(),
+                mutation_outcome: MutationOutcome::Unknown,
                 conflict: None,
             },
             Error::DurabilityFailure(detail) => Self {
                 kind: ApplicationErrorKind::DurabilityFailure,
                 detail: detail.clone(),
+                mutation_outcome: MutationOutcome::Unknown,
                 conflict: None,
             },
             Error::InternalInvariantViolation(detail) => Self {
                 kind: ApplicationErrorKind::Internal,
                 detail: detail.clone(),
+                mutation_outcome: MutationOutcome::Unknown,
                 conflict: None,
             },
         }
+    }
+
+    pub fn from_core_for_request(error: &Error, is_mutation: bool) -> Self {
+        let mut application_error = Self::from_core(error);
+        if !is_mutation {
+            application_error.mutation_outcome = MutationOutcome::NotApplicable;
+        }
+        application_error
     }
 
     pub fn from_protocol(error: &ProtocolError) -> Self {
@@ -234,6 +278,7 @@ impl ApplicationError {
         Self {
             kind,
             detail: error.to_string(),
+            mutation_outcome: MutationOutcome::NotApplied,
             conflict: None,
         }
     }
@@ -505,6 +550,13 @@ fn encode_request_payload(
             exclusive_after_sk,
             limit,
         } => {
+            validate_key_parts(
+                pk.as_bytes(),
+                exclusive_after_sk
+                    .as_ref()
+                    .map_or(&[][..], dodb_core::SortKey::as_bytes),
+                limits,
+            )?;
             encode_bytes(writer, pk.as_bytes(), limits.max_key_component_size)?;
             encode_optional_bytes(
                 writer,
@@ -549,10 +601,15 @@ fn decode_request_payload(
             key: decode_key(reader, limits)?,
         }),
         4 => {
-            let pk = dodb_core::PrimaryKey::new(reader.bytes(limits.max_key_component_size)?);
-            let exclusive_after_sk = reader
-                .optional_bytes(limits.max_key_component_size)?
-                .map(dodb_core::SortKey::new);
+            let pk_bytes = reader.bytes(limits.max_key_component_size)?;
+            let exclusive_after_sk_bytes = reader.optional_bytes(limits.max_key_component_size)?;
+            validate_key_parts(
+                &pk_bytes,
+                exclusive_after_sk_bytes.as_deref().unwrap_or(&[]),
+                limits,
+            )?;
+            let pk = dodb_core::PrimaryKey::new(pk_bytes);
+            let exclusive_after_sk = exclusive_after_sk_bytes.map(dodb_core::SortKey::new);
             let limit = reader.limit(limits.max_query_limit)?;
             Ok(Request::Query {
                 pk,
@@ -853,6 +910,7 @@ fn encode_key(
     key: &DocumentKey,
     limits: ProtocolLimits,
 ) -> Result<(), ProtocolError> {
+    validate_key(key, limits)?;
     encode_bytes(writer, key.pk.as_bytes(), limits.max_key_component_size)?;
     encode_bytes(writer, key.sk.as_bytes(), limits.max_key_component_size)
 }
@@ -861,10 +919,28 @@ fn decode_key(
     reader: &mut Reader<'_>,
     limits: ProtocolLimits,
 ) -> Result<DocumentKey, ProtocolError> {
-    Ok(DocumentKey::new(
+    let key = DocumentKey::new(
         reader.bytes(limits.max_key_component_size)?,
         reader.bytes(limits.max_key_component_size)?,
-    ))
+    );
+    validate_key(&key, limits)?;
+    Ok(key)
+}
+
+fn validate_key(key: &DocumentKey, limits: ProtocolLimits) -> Result<(), ProtocolError> {
+    validate_key_parts(key.pk.as_bytes(), key.sk.as_bytes(), limits)
+}
+
+fn validate_key_parts(pk: &[u8], sk: &[u8], limits: ProtocolLimits) -> Result<(), ProtocolError> {
+    let key = DocumentKey::new(pk.to_vec(), sk.to_vec());
+    let encoded_length = key.encoded_len();
+    if encoded_length > limits.max_encoded_key_size {
+        return Err(ProtocolError::KeyTooLarge {
+            length: encoded_length,
+            maximum: limits.max_encoded_key_size,
+        });
+    }
+    Ok(())
 }
 
 fn encode_optional_key(
@@ -952,6 +1028,7 @@ fn encode_application_error(
         .take(limits.max_error_detail_size)
         .collect::<String>();
     encode_bytes(writer, detail.as_bytes(), limits.max_error_detail_size)?;
+    writer.u8(mutation_outcome_code(error.mutation_outcome));
     match &error.conflict {
         Some(conflict) => {
             writer.u8(1);
@@ -969,6 +1046,7 @@ fn decode_application_error(
     let kind = application_error_kind(reader.u8()?)?;
     let detail = String::from_utf8(reader.bytes(limits.max_error_detail_size)?)
         .map_err(|_| ProtocolError::InvalidUtf8)?;
+    let mutation_outcome = mutation_outcome(reader.u8()?)?;
     let conflict = match reader.flag()? {
         true => Some(decode_conflict(reader, limits)?),
         false => None,
@@ -976,6 +1054,7 @@ fn decode_application_error(
     Ok(ApplicationError {
         kind,
         detail,
+        mutation_outcome,
         conflict,
     })
 }
@@ -1025,6 +1104,7 @@ fn application_error_kind_code(kind: ApplicationErrorKind) -> u8 {
         ApplicationErrorKind::DurabilityFailure => 5,
         ApplicationErrorKind::Internal => 6,
         ApplicationErrorKind::UnsupportedProtocol => 7,
+        ApplicationErrorKind::ResponseTooLarge => 8,
     }
 }
 
@@ -1038,7 +1118,25 @@ fn application_error_kind(code: u8) -> Result<ApplicationErrorKind, ProtocolErro
         5 => Ok(ApplicationErrorKind::DurabilityFailure),
         6 => Ok(ApplicationErrorKind::Internal),
         7 => Ok(ApplicationErrorKind::UnsupportedProtocol),
+        8 => Ok(ApplicationErrorKind::ResponseTooLarge),
         other => Err(ProtocolError::InvalidErrorKind(other)),
+    }
+}
+
+fn mutation_outcome_code(outcome: MutationOutcome) -> u8 {
+    match outcome {
+        MutationOutcome::NotApplicable => 0,
+        MutationOutcome::NotApplied => 1,
+        MutationOutcome::Unknown => 2,
+    }
+}
+
+fn mutation_outcome(code: u8) -> Result<MutationOutcome, ProtocolError> {
+    match code {
+        0 => Ok(MutationOutcome::NotApplicable),
+        1 => Ok(MutationOutcome::NotApplied),
+        2 => Ok(MutationOutcome::Unknown),
+        other => Err(ProtocolError::InvalidFlag(other)),
     }
 }
 
@@ -1264,6 +1362,7 @@ mod tests {
         let error = ApplicationError {
             kind: ApplicationErrorKind::Conflict,
             detail: "conflict".to_owned(),
+            mutation_outcome: MutationOutcome::NotApplied,
             conflict: Some(ConflictDetails {
                 key: key(&[1], &[2]),
                 expected: ConditionExpectation::RevisionEquals(Revision::new(8)),
@@ -1384,5 +1483,60 @@ mod tests {
         let mapped = ApplicationError::from_core(&Error::conflict(conflict.clone()));
         assert_eq!(mapped.kind, ApplicationErrorKind::Conflict);
         assert_eq!(mapped.conflict, Some(ConflictDetails::from(&conflict)));
+        assert_eq!(mapped.mutation_outcome, MutationOutcome::NotApplied);
+        assert_eq!(
+            ApplicationError::from_core(&Error::invalid_request("bad request")).mutation_outcome,
+            MutationOutcome::NotApplied
+        );
+        assert_eq!(
+            ApplicationError::from_core(&Error::overloaded("busy")).mutation_outcome,
+            MutationOutcome::NotApplied
+        );
+    }
+
+    #[test]
+    fn canonical_key_limit_accounts_for_zero_byte_escaping() {
+        let limits = ProtocolLimits::default();
+        let boundary = Request::Get {
+            key: key(&vec![0; 1_994], &[]),
+        };
+        encode_request(TenantId::ZERO, &boundary, limits).unwrap();
+
+        let oversized = Request::Get {
+            key: key(&vec![0; 1_995], &[]),
+        };
+        assert!(matches!(
+            encode_request(TenantId::ZERO, &oversized, limits),
+            Err(ProtocolError::KeyTooLarge { .. })
+        ));
+
+        let oversized_cursor = Request::Query {
+            pk: PrimaryKey::new(vec![0; 1_994]),
+            exclusive_after_sk: Some(SortKey::new(vec![0])),
+            limit: 1,
+        };
+        assert!(matches!(
+            encode_request(TenantId::ZERO, &oversized_cursor, limits),
+            Err(ProtocolError::KeyTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn application_error_round_trip_preserves_unknown_mutation_outcome() {
+        let error = ApplicationError {
+            kind: ApplicationErrorKind::DurabilityFailure,
+            detail: "WAL sync failed".to_owned(),
+            mutation_outcome: MutationOutcome::Unknown,
+            conflict: None,
+        };
+        let encoded = encode_response(
+            &ResponseEnvelope::Error(error.clone()),
+            ProtocolLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_response_frame(&encoded, None, ProtocolLimits::default()).unwrap(),
+            ResponseEnvelope::Error(error)
+        );
     }
 }

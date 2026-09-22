@@ -8,13 +8,33 @@ use dodb_core::{
 
 pub type ServiceFuture<'service> =
     Pin<Box<dyn Future<Output = Result<Response>> + Send + 'service>>;
+pub type ShutdownFuture<'service> = Pin<Box<dyn Future<Output = ()> + Send + 'service>>;
+
+/// Per-request resource limits supplied by the protocol/server boundary.
+/// Services must enforce the response budget before materializing large read
+/// values. The budget includes the encoded response frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionBudget {
+    pub max_response_bytes: usize,
+}
+
+impl ExecutionBudget {
+    pub const fn new(max_response_bytes: usize) -> Self {
+        Self { max_response_bytes }
+    }
+}
 
 pub trait DodbService: Send + Sync {
     fn execute<'service>(
         &'service self,
         tenant: TenantId,
         request: Request,
+        budget: ExecutionBudget,
     ) -> ServiceFuture<'service>;
+
+    fn shutdown<'service>(&'service self) -> ShutdownFuture<'service> {
+        Box::pin(async {})
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

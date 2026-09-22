@@ -234,6 +234,77 @@ pub struct StorageMetrics {
     pub publication_nanos: u64,
 }
 
+const RESPONSE_WIRE_OVERHEAD: usize = 17;
+const RESPONSE_MEMORY_OVERHEAD: usize = 64 * 1024;
+
+struct ResponseBudget {
+    maximum_wire: usize,
+    maximum_memory: usize,
+    used_wire: usize,
+    used_memory: usize,
+}
+
+impl ResponseBudget {
+    fn new(maximum: usize) -> Self {
+        Self {
+            maximum_wire: maximum,
+            maximum_memory: maximum.saturating_add(RESPONSE_MEMORY_OVERHEAD),
+            used_wire: RESPONSE_WIRE_OVERHEAD.min(maximum),
+            used_memory: 0,
+        }
+    }
+
+    fn reserve(&mut self, wire: usize, memory: usize) -> Result<()> {
+        let next_wire = self
+            .used_wire
+            .checked_add(wire)
+            .ok_or_else(|| Error::response_too_large("encoded response size overflows"))?;
+        let next_memory = self
+            .used_memory
+            .checked_add(memory)
+            .ok_or_else(|| Error::response_too_large("response materialization size overflows"))?;
+        if next_wire > self.maximum_wire || next_memory > self.maximum_memory {
+            return Err(Error::response_too_large(format!(
+                "response materialization exceeds {} bytes",
+                self.maximum_wire
+            )));
+        }
+        self.used_wire = next_wire;
+        self.used_memory = next_memory;
+        Ok(())
+    }
+
+    fn reserve_state(&mut self, value_len: usize) -> Result<()> {
+        let wire = 1 + 4 + value_len + 8;
+        self.reserve(wire, value_len.saturating_add(32))
+    }
+
+    fn reserve_document(&mut self, key: &DocumentKey, value_len: usize) -> Result<()> {
+        let materialized = key
+            .pk
+            .as_bytes()
+            .len()
+            .saturating_add(key.sk.as_bytes().len())
+            .saturating_add(value_len)
+            .saturating_add(64);
+        let encoded = key
+            .pk
+            .as_bytes()
+            .len()
+            .saturating_add(key.sk.as_bytes().len())
+            .saturating_add(value_len)
+            .saturating_add(20);
+        let wire = key
+            .pk
+            .as_bytes()
+            .len()
+            .saturating_add(key.sk.as_bytes().len())
+            .saturating_add(value_len)
+            .saturating_add(20);
+        self.reserve(wire, materialized.max(encoded))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointReport {
     pub checkpoint_lsn: Lsn,
@@ -481,6 +552,10 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         self.fault_injector = Some(Box::new(injector));
     }
 
+    pub fn set_boxed_fault_injector(&mut self, injector: Box<dyn FaultInjector + Send>) {
+        self.fault_injector = Some(injector);
+    }
+
     pub fn get(&mut self, key: &DocumentKey) -> Result<RevisionState> {
         let request = BatchRequest::Get { key: key.clone() };
         match self.apply_batch(std::slice::from_ref(&request))?.remove(0) {
@@ -555,6 +630,15 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         self.publish_prepared(prepared)
     }
 
+    pub fn apply_batch_with_response_budget(
+        &mut self,
+        requests: &[BatchRequest],
+        max_response_bytes: usize,
+    ) -> Result<Vec<BatchResponse>> {
+        let prepared = self.prepare_batch_with_response_budget(requests, max_response_bytes)?;
+        self.publish_prepared(prepared)
+    }
+
     /// Commits one optimistic point-key transaction as one logical commit.
     pub fn transact(&mut self, request: TransactionRequest) -> Result<TransactionResult> {
         let mut results = self.apply_transaction_group(std::slice::from_ref(&request))?;
@@ -611,20 +695,40 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
     /// Reads a set of point keys from one committed coordinator state. The
     /// output preserves the caller's input order.
     pub fn transact_get(&mut self, keys: &[DocumentKey]) -> Result<Vec<RevisionState>> {
+        self.transact_get_with_response_budget(keys, usize::MAX)
+    }
+
+    pub fn transact_get_with_response_budget(
+        &mut self,
+        keys: &[DocumentKey],
+        max_response_bytes: usize,
+    ) -> Result<Vec<RevisionState>> {
         if let Some(message) = &self.broken {
             return Err(Error::durability(format!(
                 "storage shard is not serving after an uncertain persistence failure: {message}"
             )));
         }
         let mut overlay = Overlay::new(self);
-        keys.iter().map(|key| overlay.get_state(key)).collect()
+        let mut budget = ResponseBudget::new(max_response_bytes);
+        keys.iter()
+            .map(|key| overlay.get_state_with_budget(key, &mut budget))
+            .collect()
     }
 
     pub fn prepare_batch(&mut self, requests: &[BatchRequest]) -> Result<PreparedBatch> {
+        self.prepare_batch_with_response_budget(requests, usize::MAX)
+    }
+
+    pub fn prepare_batch_with_response_budget(
+        &mut self,
+        requests: &[BatchRequest],
+        max_response_bytes: usize,
+    ) -> Result<PreparedBatch> {
         let mut overlay = Overlay::new(self);
+        let mut budget = ResponseBudget::new(max_response_bytes);
         let mut responses = Vec::with_capacity(requests.len());
         for request in requests {
-            responses.push(overlay.execute(request)?);
+            responses.push(overlay.execute_with_budget(request, &mut budget)?);
         }
         overlay.finish(responses)
     }
@@ -1181,26 +1285,35 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
         }
     }
 
-    fn execute(&mut self, request: &BatchRequest) -> Result<BatchResponse> {
+    fn execute_with_budget(
+        &mut self,
+        request: &BatchRequest,
+        budget: &mut ResponseBudget,
+    ) -> Result<BatchResponse> {
         match request {
-            BatchRequest::Get { key } => Ok(BatchResponse::Get(self.get_state(key)?)),
+            BatchRequest::Get { key } => {
+                Ok(BatchResponse::Get(self.get_state_with_budget(key, budget)?))
+            }
             BatchRequest::Put { key, value } => Ok(BatchResponse::Put(self.put(key, value)?)),
             BatchRequest::Delete { key } => Ok(BatchResponse::Delete(self.delete(key)?)),
             BatchRequest::Query {
                 pk,
                 exclusive_after_sk,
                 limit,
-            } => Ok(BatchResponse::Query(self.query(
+            } => Ok(BatchResponse::Query(self.query_with_budget(
                 pk,
                 exclusive_after_sk.as_ref(),
                 *limit,
+                budget,
             )?)),
             BatchRequest::Scan {
                 exclusive_after_key,
                 limit,
-            } => Ok(BatchResponse::Scan(
-                self.scan(exclusive_after_key.as_ref(), *limit)?,
-            )),
+            } => Ok(BatchResponse::Scan(self.scan_with_budget(
+                exclusive_after_key.as_ref(),
+                *limit,
+                budget,
+            )?)),
         }
     }
 
@@ -1461,19 +1574,35 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
     }
 
     fn get_state(&mut self, key: &DocumentKey) -> Result<RevisionState> {
+        let mut budget = ResponseBudget::new(usize::MAX);
+        self.get_state_with_budget(key, &mut budget)
+    }
+
+    fn get_state_with_budget(
+        &mut self,
+        key: &DocumentKey,
+        budget: &mut ResponseBudget,
+    ) -> Result<RevisionState> {
         let encoded = key.encode();
         validate_encoded_key(&encoded)?;
         let leaf_id = self.find_leaf(&encoded)?.0;
         let leaf = self.leaf(leaf_id)?;
         let Some(entry) = leaf.entries.iter().find(|entry| entry.key == encoded) else {
+            budget.reserve_state(0)?;
             return Ok(RevisionState::missing(Revision::ZERO));
         };
         match &entry.value {
-            Some(value_ref) => Ok(RevisionState::present(
-                self.read_value(value_ref)?,
-                entry.revision,
-            )),
-            None => Ok(RevisionState::missing(entry.revision)),
+            Some(value_ref) => {
+                budget.reserve_state(value_length(value_ref)?)?;
+                Ok(RevisionState::present(
+                    self.read_value(value_ref)?,
+                    entry.revision,
+                ))
+            }
+            None => {
+                budget.reserve_state(0)?;
+                Ok(RevisionState::missing(entry.revision))
+            }
         }
     }
 
@@ -1576,11 +1705,12 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
         Ok(revision)
     }
 
-    fn query(
+    fn query_with_budget(
         &mut self,
         pk: &PrimaryKey,
         exclusive_after_sk: Option<&SortKey>,
         limit: usize,
+        budget: &mut ResponseBudget,
     ) -> Result<Vec<Document>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1623,6 +1753,7 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
                     continue;
                 }
                 if let Some(value) = &entry.value {
+                    budget.reserve_document(&document_key, value_length(value)?)?;
                     rows.push(Document {
                         key: document_key,
                         value: self.read_value(value)?,
@@ -1643,7 +1774,12 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
         Ok(rows)
     }
 
-    fn scan(&mut self, cursor: Option<&DocumentKey>, limit: usize) -> Result<Vec<Document>> {
+    fn scan_with_budget(
+        &mut self,
+        cursor: Option<&DocumentKey>,
+        limit: usize,
+        budget: &mut ResponseBudget,
+    ) -> Result<Vec<Document>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1671,6 +1807,7 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
                     Error::corruption(format!("leaf key decode failed: {error}"))
                 })?;
                 if let Some(value) = &entry.value {
+                    budget.reserve_document(&document_key, value_length(value)?)?;
                     rows.push(Document {
                         key: document_key,
                         value: self.read_value(value)?,
@@ -2336,6 +2473,14 @@ fn validate_encoded_key(key: &[u8]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn value_length(value: &ValueRef) -> Result<usize> {
+    match value {
+        ValueRef::Inline(bytes) => Ok(bytes.len()),
+        ValueRef::Overflow { length, .. } => usize::try_from(*length)
+            .map_err(|_| Error::corruption("overflow value length does not fit usize")),
+    }
 }
 
 fn restamp_responses(

@@ -6,8 +6,8 @@ use dodb_core::{
     DocumentKey, Revision, RevisionState, TenantId, TransactionMutation, TransactionRequest,
 };
 use dodb_protocol::{
-    ApplicationError, ProtocolError, ProtocolLimits, ResponseEnvelope, decode_header,
-    decode_response_parts, encode_request,
+    ApplicationError, MutationOutcome, ProtocolError, ProtocolLimits, ResponseEnvelope,
+    decode_header, decode_response_parts, encode_request,
 };
 use dodb_service::{Document, Response, TransactionOutcome};
 use quinn::rustls::pki_types::CertificateDer;
@@ -21,7 +21,10 @@ pub enum ClientError {
     Transport(String),
     Protocol(ProtocolError),
     Application(Box<ApplicationError>),
-    UnknownMutationOutcome(String),
+    UnknownMutationOutcome {
+        detail: String,
+        cause: Option<Box<ApplicationError>>,
+    },
 }
 
 impl fmt::Display for ClientError {
@@ -39,7 +42,7 @@ impl fmt::Display for ClientError {
                     error.kind, error.detail
                 )
             }
-            Self::UnknownMutationOutcome(detail) => {
+            Self::UnknownMutationOutcome { detail, .. } => {
                 write!(formatter, "mutation outcome is unknown: {detail}")
             }
         }
@@ -315,7 +318,15 @@ impl DodbClient {
             .map_err(|error| uncertain_protocol(mutation, error))?
         {
             ResponseEnvelope::Success(response) => Ok(response),
-            ResponseEnvelope::Error(error) => Err(ClientError::Application(Box::new(error))),
+            ResponseEnvelope::Error(error) => {
+                if mutation && error.mutation_outcome == MutationOutcome::Unknown {
+                    return Err(ClientError::UnknownMutationOutcome {
+                        detail: error.detail.clone(),
+                        cause: Some(Box::new(error)),
+                    });
+                }
+                Err(ClientError::Application(Box::new(error)))
+            }
         }
     }
 }
@@ -330,7 +341,10 @@ fn unexpected_response(expected: u8, actual: u8) -> ClientError {
 
 fn uncertain_mutation(mutation: bool, detail: String) -> ClientError {
     if mutation {
-        ClientError::UnknownMutationOutcome(detail)
+        ClientError::UnknownMutationOutcome {
+            detail,
+            cause: None,
+        }
     } else {
         ClientError::Transport(detail)
     }
@@ -338,7 +352,10 @@ fn uncertain_mutation(mutation: bool, detail: String) -> ClientError {
 
 fn uncertain_protocol(mutation: bool, error: ProtocolError) -> ClientError {
     if mutation {
-        ClientError::UnknownMutationOutcome(error.to_string())
+        ClientError::UnknownMutationOutcome {
+            detail: error.to_string(),
+            cause: None,
+        }
     } else {
         ClientError::Protocol(error)
     }

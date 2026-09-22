@@ -59,7 +59,8 @@ pub struct AsyncShard<
     W: DurableFile + Send + 'static = super::NoWal,
 > {
     request_tx: tokio::sync::mpsc::Sender<QueuedRequest>,
-    close_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    close_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    coordinator_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metrics: Arc<Mutex<Option<WalMetrics>>>,
     storage_metrics: Arc<Mutex<Option<StorageMetrics>>>,
     coordinator_metrics: Arc<Mutex<CoordinatorMetrics>>,
@@ -102,7 +103,7 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
             coordinator_metrics: Arc::clone(&coordinator_metrics),
             read_view: Arc::clone(&read_view),
         };
-        tokio::spawn(coordinator(
+        let coordinator_task = tokio::spawn(coordinator(
             store,
             request_rx,
             close_rx,
@@ -111,7 +112,8 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
         ));
         Self {
             request_tx,
-            close_tx: Some(close_tx),
+            close_tx: Mutex::new(Some(close_tx)),
+            coordinator_task: Mutex::new(Some(coordinator_task)),
             metrics,
             storage_metrics,
             coordinator_metrics,
@@ -121,10 +123,24 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
     }
 
     pub async fn execute(&self, request: BatchRequest) -> Result<BatchResponse> {
-        if let Some(result) = self.try_read(&request) {
+        self.execute_with_response_budget(request, usize::MAX).await
+    }
+
+    pub async fn execute_with_response_budget(
+        &self,
+        request: BatchRequest,
+        max_response_bytes: usize,
+    ) -> Result<BatchResponse> {
+        if let Some(result) = self.try_read(&request, max_response_bytes) {
             return result;
         }
-        match self.send(CoordinatorOperation::Batch(request)).await? {
+        match self
+            .send(CoordinatorOperation::Batch {
+                request,
+                max_response_bytes,
+            })
+            .await?
+        {
             CoordinatorResponse::Batch(response) => Ok(response),
             _ => Err(Error::invariant(
                 "coordinator returned the wrong batch response",
@@ -148,7 +164,22 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
     }
 
     pub async fn transact_get(&self, keys: Vec<DocumentKey>) -> Result<Vec<RevisionState>> {
-        match self.send(CoordinatorOperation::TransactGet(keys)).await? {
+        self.transact_get_with_response_budget(keys, usize::MAX)
+            .await
+    }
+
+    pub async fn transact_get_with_response_budget(
+        &self,
+        keys: Vec<DocumentKey>,
+        max_response_bytes: usize,
+    ) -> Result<Vec<RevisionState>> {
+        match self
+            .send(CoordinatorOperation::TransactGet {
+                keys,
+                max_response_bytes,
+            })
+            .await?
+        {
             CoordinatorResponse::TransactGet(result) => Ok(result),
             _ => Err(Error::invariant(
                 "coordinator returned the wrong point-read response",
@@ -177,7 +208,11 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
         }
     }
 
-    fn try_read(&self, request: &BatchRequest) -> Option<Result<BatchResponse>> {
+    fn try_read(
+        &self,
+        request: &BatchRequest,
+        max_response_bytes: usize,
+    ) -> Option<Result<BatchResponse>> {
         let state = self.read_view.read().ok()?;
         if let Some(message) = &state.broken {
             return Some(Err(Error::durability(format!(
@@ -185,20 +220,23 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
             ))));
         }
         let view = state.view.as_ref()?;
+        let mut budget = super::ResponseBudget::new(max_response_bytes);
         let result = match request {
-            BatchRequest::Get { key } => view.get(key).map(BatchResponse::Get),
+            BatchRequest::Get { key } => view
+                .get_with_budget(key, &mut budget)
+                .map(BatchResponse::Get),
             BatchRequest::Query {
                 pk,
                 exclusive_after_sk,
                 limit,
             } => view
-                .query(pk, exclusive_after_sk.as_ref(), *limit)
+                .query_with_budget(pk, exclusive_after_sk.as_ref(), *limit, &mut budget)
                 .map(BatchResponse::Query),
             BatchRequest::Scan {
                 exclusive_after_key,
                 limit,
             } => view
-                .scan(exclusive_after_key.as_ref(), *limit)
+                .scan_with_budget(exclusive_after_key.as_ref(), *limit, &mut budget)
                 .map(BatchResponse::Scan),
             BatchRequest::Put { .. } | BatchRequest::Delete { .. } => return None,
         };
@@ -219,9 +257,30 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
             .map_err(|_| Error::invariant("storage coordinator dropped a response"))?
     }
 
-    pub async fn close(mut self) -> Result<()> {
-        self.close_tx.take();
+    pub async fn shutdown(&self) -> Result<()> {
+        let close_tx = self
+            .close_tx
+            .lock()
+            .map_err(|_| Error::invariant("storage coordinator close lock is poisoned"))?
+            .take();
+        if let Some(close_tx) = close_tx {
+            let _ = close_tx.send(());
+        }
+        let coordinator_task = self
+            .coordinator_task
+            .lock()
+            .map_err(|_| Error::invariant("storage coordinator task lock is poisoned"))?
+            .take();
+        if let Some(coordinator_task) = coordinator_task {
+            coordinator_task.await.map_err(|error| {
+                Error::invariant(format!("storage coordinator task failed: {error}"))
+            })?;
+        }
         Ok(())
+    }
+
+    pub async fn close(self) -> Result<()> {
+        self.shutdown().await
     }
 
     pub fn wal_metrics(&self) -> Option<WalMetrics> {
@@ -251,9 +310,15 @@ struct QueuedRequest {
 
 #[derive(Clone)]
 enum CoordinatorOperation {
-    Batch(BatchRequest),
+    Batch {
+        request: BatchRequest,
+        max_response_bytes: usize,
+    },
     Transaction(TransactionRequest),
-    TransactGet(Vec<DocumentKey>),
+    TransactGet {
+        keys: Vec<DocumentKey>,
+        max_response_bytes: usize,
+    },
     Checkpoint,
     Snapshot(PathBuf),
 }
@@ -506,16 +571,18 @@ fn process_segment<F: DurableFile, W: DurableFile>(
             .zip(operations)
             .map(|(result, operation)| {
                 result.map(|transaction| match operation {
-                    CoordinatorOperation::Batch(BatchRequest::Put { .. }) => {
-                        CoordinatorResponse::Batch(BatchResponse::Put(Revision::from(
-                            transaction.commit_lsn,
-                        )))
-                    }
-                    CoordinatorOperation::Batch(BatchRequest::Delete { .. }) => {
-                        CoordinatorResponse::Batch(BatchResponse::Delete(Revision::from(
-                            transaction.commit_lsn,
-                        )))
-                    }
+                    CoordinatorOperation::Batch {
+                        request: BatchRequest::Put { .. },
+                        ..
+                    } => CoordinatorResponse::Batch(BatchResponse::Put(Revision::from(
+                        transaction.commit_lsn,
+                    ))),
+                    CoordinatorOperation::Batch {
+                        request: BatchRequest::Delete { .. },
+                        ..
+                    } => CoordinatorResponse::Batch(BatchResponse::Delete(Revision::from(
+                        transaction.commit_lsn,
+                    ))),
                     CoordinatorOperation::Transaction(_) => {
                         CoordinatorResponse::Transaction(transaction)
                     }
@@ -528,14 +595,23 @@ fn process_segment<F: DurableFile, W: DurableFile>(
     let responses = operations
         .iter()
         .map(|operation| match operation {
-            CoordinatorOperation::Batch(request) => store
-                .apply_batch(std::slice::from_ref(request))
+            CoordinatorOperation::Batch {
+                request,
+                max_response_bytes,
+            } => store
+                .apply_batch_with_response_budget(
+                    std::slice::from_ref(request),
+                    *max_response_bytes,
+                )
                 .map(|mut responses| CoordinatorResponse::Batch(responses.remove(0))),
             CoordinatorOperation::Transaction(request) => store
                 .transact(request.clone())
                 .map(CoordinatorResponse::Transaction),
-            CoordinatorOperation::TransactGet(keys) => store
-                .transact_get(keys)
+            CoordinatorOperation::TransactGet {
+                keys,
+                max_response_bytes,
+            } => store
+                .transact_get_with_response_budget(keys, *max_response_bytes)
                 .map(CoordinatorResponse::TransactGet),
             CoordinatorOperation::Checkpoint => {
                 store.checkpoint().map(CoordinatorResponse::Checkpoint)
@@ -551,24 +627,32 @@ fn process_segment<F: DurableFile, W: DurableFile>(
 fn is_mutation(operation: &CoordinatorOperation) -> bool {
     matches!(
         operation,
-        CoordinatorOperation::Batch(BatchRequest::Put { .. })
-            | CoordinatorOperation::Batch(BatchRequest::Delete { .. })
-            | CoordinatorOperation::Transaction(_)
+        CoordinatorOperation::Batch {
+            request: BatchRequest::Put { .. },
+            ..
+        } | CoordinatorOperation::Batch {
+            request: BatchRequest::Delete { .. },
+            ..
+        } | CoordinatorOperation::Transaction(_)
     )
 }
 
 fn as_transaction_request(operation: &CoordinatorOperation) -> Result<TransactionRequest> {
     match operation {
-        CoordinatorOperation::Batch(BatchRequest::Put { key, value }) => {
-            Ok(TransactionRequest::new(
-                Vec::new(),
-                vec![TransactionMutation::Put {
-                    key: key.clone(),
-                    value: value.clone(),
-                }],
-            ))
-        }
-        CoordinatorOperation::Batch(BatchRequest::Delete { key }) => Ok(TransactionRequest::new(
+        CoordinatorOperation::Batch {
+            request: BatchRequest::Put { key, value },
+            ..
+        } => Ok(TransactionRequest::new(
+            Vec::new(),
+            vec![TransactionMutation::Put {
+                key: key.clone(),
+                value: value.clone(),
+            }],
+        )),
+        CoordinatorOperation::Batch {
+            request: BatchRequest::Delete { key },
+            ..
+        } => Ok(TransactionRequest::new(
             Vec::new(),
             vec![TransactionMutation::Delete { key: key.clone() }],
         )),
@@ -588,6 +672,7 @@ fn batch_error(error: &Error) -> Error {
             Error::invalid_request(format!("batch was not published: {message}"))
         }
         Error::Overloaded(message) => Error::overloaded(message.clone()),
+        Error::ResponseTooLarge(message) => Error::response_too_large(message.clone()),
         Error::Conflict(conflict) => Error::conflict(conflict.clone()),
         Error::Corruption(message) => {
             Error::corruption(format!("batch was not published: {message}"))
@@ -619,28 +704,43 @@ fn batch_error(error: &Error) -> Error {
 
 fn operation_size(operation: &CoordinatorOperation) -> usize {
     match operation {
-        CoordinatorOperation::Batch(BatchRequest::Put { key, value }) => key
+        CoordinatorOperation::Batch {
+            request: BatchRequest::Put { key, value },
+            ..
+        } => key
             .encode()
             .len()
             .saturating_add(value.len())
             .saturating_add(64),
-        CoordinatorOperation::Batch(BatchRequest::Delete { key }) => {
-            key.encode().len().saturating_add(64)
-        }
-        CoordinatorOperation::Batch(BatchRequest::Get { key }) => key.encode().len(),
-        CoordinatorOperation::Batch(BatchRequest::Query {
-            pk,
-            exclusive_after_sk,
+        CoordinatorOperation::Batch {
+            request: BatchRequest::Delete { key },
             ..
-        }) => pk.as_bytes().len().saturating_add(
+        } => key.encode().len().saturating_add(64),
+        CoordinatorOperation::Batch {
+            request: BatchRequest::Get { key },
+            ..
+        } => key.encode().len(),
+        CoordinatorOperation::Batch {
+            request:
+                BatchRequest::Query {
+                    pk,
+                    exclusive_after_sk,
+                    ..
+                },
+            ..
+        } => pk.as_bytes().len().saturating_add(
             exclusive_after_sk
                 .as_ref()
                 .map_or(0, |key| key.as_bytes().len()),
         ),
-        CoordinatorOperation::Batch(BatchRequest::Scan {
-            exclusive_after_key,
+        CoordinatorOperation::Batch {
+            request:
+                BatchRequest::Scan {
+                    exclusive_after_key,
+                    ..
+                },
             ..
-        }) => exclusive_after_key
+        } => exclusive_after_key
             .as_ref()
             .map_or(0, |key| key.encode().len()),
         CoordinatorOperation::Transaction(request) => request
@@ -658,7 +758,7 @@ fn operation_size(operation: &CoordinatorOperation) -> usize {
                 }
             }))
             .fold(0usize, usize::saturating_add),
-        CoordinatorOperation::TransactGet(keys) => keys
+        CoordinatorOperation::TransactGet { keys, .. } => keys
             .iter()
             .map(|key| key.encode().len())
             .fold(0usize, usize::saturating_add),
@@ -669,6 +769,14 @@ fn operation_size(operation: &CoordinatorOperation) -> usize {
 
 fn elapsed_nanos(started: Instant) -> u64 {
     started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX)
+}
+
+fn value_length(value: &ValueRef) -> Result<usize> {
+    match value {
+        ValueRef::Inline(bytes) => Ok(bytes.len()),
+        ValueRef::Overflow { length, .. } => usize::try_from(*length)
+            .map_err(|_| Error::corruption("overflow value length does not fit usize")),
+    }
 }
 
 fn record_overload(metrics: &Arc<Mutex<CoordinatorMetrics>>) {
@@ -903,7 +1011,11 @@ impl CommittedReadView {
         }
     }
 
-    fn get(&self, key: &DocumentKey) -> Result<RevisionState> {
+    fn get_with_budget(
+        &self,
+        key: &DocumentKey,
+        budget: &mut super::ResponseBudget,
+    ) -> Result<RevisionState> {
         let encoded = key.encode();
         validate_encoded_key(&encoded)?;
         let leaf_id = self.find_leaf(&encoded)?;
@@ -911,22 +1023,30 @@ impl CommittedReadView {
             return Err(Error::corruption("read view lookup did not reach a leaf"));
         };
         let Some(entry) = entries.iter().find(|entry| entry.key == encoded) else {
+            budget.reserve_state(0)?;
             return Ok(RevisionState::missing(Revision::ZERO));
         };
         match &entry.value {
-            Some(value) => Ok(RevisionState::present(
-                self.read_value(value)?,
-                entry.revision,
-            )),
-            None => Ok(RevisionState::missing(entry.revision)),
+            Some(value) => {
+                budget.reserve_state(value_length(value)?)?;
+                Ok(RevisionState::present(
+                    self.read_value(value)?,
+                    entry.revision,
+                ))
+            }
+            None => {
+                budget.reserve_state(0)?;
+                Ok(RevisionState::missing(entry.revision))
+            }
         }
     }
 
-    fn query(
+    fn query_with_budget(
         &self,
         pk: &PrimaryKey,
         exclusive_after_sk: Option<&SortKey>,
         limit: usize,
+        budget: &mut super::ResponseBudget,
     ) -> Result<Vec<super::Document>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -974,6 +1094,7 @@ impl CommittedReadView {
                     continue;
                 }
                 if let Some(value) = &entry.value {
+                    budget.reserve_document(&document_key, value_length(value)?)?;
                     rows.push(super::Document {
                         key: document_key,
                         value: self.read_value(value)?,
@@ -991,7 +1112,12 @@ impl CommittedReadView {
         Ok(rows)
     }
 
-    fn scan(&self, cursor: Option<&DocumentKey>, limit: usize) -> Result<Vec<super::Document>> {
+    fn scan_with_budget(
+        &self,
+        cursor: Option<&DocumentKey>,
+        limit: usize,
+        budget: &mut super::ResponseBudget,
+    ) -> Result<Vec<super::Document>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1024,6 +1150,7 @@ impl CommittedReadView {
                     Error::corruption(format!("leaf key decode failed: {error}"))
                 })?;
                 if let Some(value) = &entry.value {
+                    budget.reserve_document(&document_key, value_length(value)?)?;
                     rows.push(super::Document {
                         key: document_key,
                         value: self.read_value(value)?,

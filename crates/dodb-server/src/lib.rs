@@ -14,10 +14,13 @@ use dodb_protocol::{
     ApplicationError, ProtocolError, ProtocolLimits, ResponseEnvelope, decode_header,
     decode_request_parts, encode_response,
 };
-use dodb_service::{Document, DodbService, Request, Response, ServiceFuture, TransactionOutcome};
+use dodb_service::{
+    Document, DodbService, ExecutionBudget, Request, Response, ServiceFuture, ShutdownFuture,
+    TransactionOutcome,
+};
 use dodb_storage::{
     AsyncShard, BTreeStore, BatchRequest, BatchResponse, CoordinatorConfig, DatabaseConfig,
-    ProductionFile,
+    FaultInjector, ProductionFile,
 };
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn::{Connection, Endpoint, Incoming, ServerConfig as QuinnServerConfig, VarInt};
@@ -117,7 +120,10 @@ pub struct DodbServerConfig {
     pub tls: ServerTlsConfig,
     pub protocol_limits: ProtocolLimits,
     pub max_connections: usize,
+    /// Maximum bidirectional request streams advertised per QUIC connection.
     pub max_concurrent_streams: usize,
+    /// Global active service requests across all connections.
+    pub max_concurrent_requests: usize,
 }
 
 impl DodbServerConfig {
@@ -125,9 +131,12 @@ impl DodbServerConfig {
         self.protocol_limits
             .validate()
             .map_err(|error| ServerError::Endpoint(error.to_string()))?;
-        if self.max_connections == 0 || self.max_concurrent_streams == 0 {
+        if self.max_connections == 0
+            || self.max_concurrent_streams == 0
+            || self.max_concurrent_requests == 0
+        {
             return Err(ServerError::Endpoint(
-                "connection and stream limits must be nonzero".to_owned(),
+                "connection, stream, and request limits must be nonzero".to_owned(),
             ));
         }
         Ok(())
@@ -217,7 +226,7 @@ pub struct DodbServer<S> {
     service: Arc<S>,
     protocol_limits: ProtocolLimits,
     connection_slots: Arc<Semaphore>,
-    stream_slots: Arc<Semaphore>,
+    request_slots: Arc<Semaphore>,
     metrics: ServerMetrics,
 }
 
@@ -231,7 +240,7 @@ impl<S: DodbService + 'static> DodbServer<S> {
             service,
             protocol_limits: config.protocol_limits,
             connection_slots: Arc::new(Semaphore::new(config.max_connections)),
-            stream_slots: Arc::new(Semaphore::new(config.max_concurrent_streams)),
+            request_slots: Arc::new(Semaphore::new(config.max_concurrent_requests)),
             metrics: ServerMetrics::default(),
         })
     }
@@ -248,6 +257,14 @@ impl<S: DodbService + 'static> DodbServer<S> {
         self.endpoint.close(VarInt::from_u32(0), b"server shutdown");
     }
 
+    /// Closes the endpoint, waits for established connections to drain, and
+    /// then awaits service-owned coordinator shutdown.
+    pub async fn shutdown(&self) {
+        self.close();
+        self.endpoint.wait_idle().await;
+        self.service.shutdown().await;
+    }
+
     pub async fn run(&self) -> Result<(), ServerError> {
         while let Some(incoming) = self.endpoint.accept().await {
             let Ok(connection_permit) = self.connection_slots.clone().try_acquire_owned() else {
@@ -259,14 +276,14 @@ impl<S: DodbService + 'static> DodbServer<S> {
                 continue;
             };
             let service = Arc::clone(&self.service);
-            let stream_slots = Arc::clone(&self.stream_slots);
+            let request_slots = Arc::clone(&self.request_slots);
             let limits = self.protocol_limits;
             let metrics = self.metrics.clone();
             tokio::spawn(async move {
                 serve_connection(
                     incoming,
                     service,
-                    stream_slots,
+                    request_slots,
                     limits,
                     metrics,
                     connection_permit,
@@ -281,7 +298,7 @@ impl<S: DodbService + 'static> DodbServer<S> {
 async fn serve_connection<S: DodbService + 'static>(
     incoming: Incoming,
     service: Arc<S>,
-    stream_slots: Arc<Semaphore>,
+    request_slots: Arc<Semaphore>,
     limits: ProtocolLimits,
     metrics: ServerMetrics,
     _connection_permit: OwnedSemaphorePermit,
@@ -304,7 +321,7 @@ async fn serve_connection<S: DodbService + 'static>(
         .inner
         .active_connections
         .fetch_add(1, Ordering::Relaxed);
-    accept_streams(connection, service, stream_slots, limits, metrics.clone()).await;
+    accept_streams(connection, service, request_slots, limits, metrics.clone()).await;
     metrics
         .inner
         .active_connections
@@ -314,11 +331,18 @@ async fn serve_connection<S: DodbService + 'static>(
 async fn accept_streams<S: DodbService + 'static>(
     connection: Connection,
     service: Arc<S>,
-    stream_slots: Arc<Semaphore>,
+    request_slots: Arc<Semaphore>,
     limits: ProtocolLimits,
     metrics: ServerMetrics,
 ) {
     loop {
+        let stream_permit = match tokio::select! {
+            permit = request_slots.clone().acquire_owned() => permit,
+            _ = connection.closed() => return,
+        } {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let stream = match connection.accept_bi().await {
             Ok(stream) => stream,
             Err(_) => {
@@ -328,14 +352,6 @@ async fn accept_streams<S: DodbService + 'static>(
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
-        };
-        let Ok(stream_permit) = stream_slots.clone().try_acquire_owned() else {
-            connection.close(VarInt::from_u32(1), b"too many active streams");
-            metrics
-                .inner
-                .overloaded_responses
-                .fetch_add(1, Ordering::Relaxed);
-            return;
         };
         let service = Arc::clone(&service);
         let metrics = metrics.clone();
@@ -418,6 +434,7 @@ async fn serve_stream<S: DodbService + 'static>(
         }
     };
     let operation_index = usize::from(dodb_protocol::request_opcode(&request).saturating_sub(1));
+    let is_mutation = request.is_mutation();
     metrics.inner.requests_total.fetch_add(1, Ordering::Relaxed);
     metrics.inner.request_bytes.fetch_add(
         (dodb_protocol::HEADER_SIZE + payload.len()) as u64,
@@ -427,10 +444,17 @@ async fn serve_stream<S: DodbService + 'static>(
         counter.fetch_add(1, Ordering::Relaxed);
     }
     let started = Instant::now();
-    let envelope = match service.execute(tenant, request).await {
+    let envelope = match service
+        .execute(
+            tenant,
+            request,
+            ExecutionBudget::new(limits.max_response_frame_size),
+        )
+        .await
+    {
         Ok(response) => ResponseEnvelope::Success(response),
         Err(error) => {
-            let application_error = ApplicationError::from_core(&error);
+            let application_error = ApplicationError::from_core_for_request(&error, is_mutation);
             if application_error.kind == dodb_protocol::ApplicationErrorKind::Overloaded {
                 metrics
                     .inner
@@ -528,7 +552,11 @@ pub struct LocalTenantService {
     coordinator_config: CoordinatorConfig,
     resolver: Arc<dyn TenantShardResolver>,
     shards: Mutex<BTreeMap<TenantId, Arc<AsyncShard<ProductionFile, ProductionFile>>>>,
+    fault_injector_factory: Mutex<Option<FaultInjectorFactory>>,
 }
+
+pub type FaultInjectorFactory =
+    Arc<dyn Fn(TenantId, ShardId) -> Box<dyn FaultInjector + Send> + Send + Sync>;
 
 impl LocalTenantService {
     pub fn new(config: LocalTenantServiceConfig) -> Result<Self, Error> {
@@ -543,6 +571,7 @@ impl LocalTenantService {
             coordinator_config: config.coordinator_config,
             resolver: Arc::new(OneTenantOneShard),
             shards: Mutex::new(BTreeMap::new()),
+            fault_injector_factory: Mutex::new(None),
         })
     }
 
@@ -557,16 +586,40 @@ impl LocalTenantService {
         })
     }
 
-    pub async fn shutdown(self) {
-        let mut shards = self.shards.lock().await;
-        shards.clear();
+    pub fn set_fault_injector_factory(&mut self, factory: FaultInjectorFactory) {
+        if let Ok(mut current) = self.fault_injector_factory.try_lock() {
+            *current = Some(factory);
+        }
     }
 
-    async fn execute_request(&self, tenant: TenantId, request: Request) -> Result<Response, Error> {
+    pub async fn shutdown(&self) {
+        let shards = {
+            let mut shards = self.shards.lock().await;
+            let open_shards = shards.values().cloned().collect::<Vec<_>>();
+            shards.clear();
+            open_shards
+        };
+        for shard in shards {
+            let _ = shard.shutdown().await;
+        }
+    }
+
+    async fn execute_request(
+        &self,
+        tenant: TenantId,
+        request: Request,
+        budget: ExecutionBudget,
+    ) -> Result<Response, Error> {
         match request {
             Request::Get { key } => {
                 let state = match self.read_shard(tenant).await? {
-                    Some(shard) => match shard.execute(BatchRequest::Get { key }).await? {
+                    Some(shard) => match shard
+                        .execute_with_response_budget(
+                            BatchRequest::Get { key },
+                            budget.max_response_bytes,
+                        )
+                        .await?
+                    {
                         BatchResponse::Get(state) => state,
                         _ => return Err(Error::invariant("local get returned the wrong response")),
                     },
@@ -576,7 +629,13 @@ impl LocalTenantService {
             }
             Request::Put { key, value } => {
                 let shard = self.open_shard(tenant).await?;
-                let revision = match shard.execute(BatchRequest::Put { key, value }).await? {
+                let revision = match shard
+                    .execute_with_response_budget(
+                        BatchRequest::Put { key, value },
+                        budget.max_response_bytes,
+                    )
+                    .await?
+                {
                     BatchResponse::Put(revision) => revision,
                     _ => return Err(Error::invariant("local put returned the wrong response")),
                 };
@@ -584,7 +643,13 @@ impl LocalTenantService {
             }
             Request::Delete { key } => {
                 let shard = self.open_shard(tenant).await?;
-                let revision = match shard.execute(BatchRequest::Delete { key }).await? {
+                let revision = match shard
+                    .execute_with_response_budget(
+                        BatchRequest::Delete { key },
+                        budget.max_response_bytes,
+                    )
+                    .await?
+                {
                     BatchResponse::Delete(revision) => revision,
                     _ => return Err(Error::invariant("local delete returned the wrong response")),
                 };
@@ -597,11 +662,14 @@ impl LocalTenantService {
             } => {
                 let rows = match self.read_shard(tenant).await? {
                     Some(shard) => match shard
-                        .execute(BatchRequest::Query {
-                            pk,
-                            exclusive_after_sk,
-                            limit,
-                        })
+                        .execute_with_response_budget(
+                            BatchRequest::Query {
+                                pk,
+                                exclusive_after_sk,
+                                limit,
+                            },
+                            budget.max_response_bytes,
+                        )
                         .await?
                     {
                         BatchResponse::Query(rows) => rows,
@@ -623,10 +691,13 @@ impl LocalTenantService {
             } => {
                 let rows = match self.read_shard(tenant).await? {
                     Some(shard) => match shard
-                        .execute(BatchRequest::Scan {
-                            exclusive_after_key,
-                            limit,
-                        })
+                        .execute_with_response_budget(
+                            BatchRequest::Scan {
+                                exclusive_after_key,
+                                limit,
+                            },
+                            budget.max_response_bytes,
+                        )
                         .await?
                     {
                         BatchResponse::Scan(rows) => rows,
@@ -650,9 +721,11 @@ impl LocalTenantService {
                 )))
             }
             Request::TransactGet { keys } => Ok(Response::TransactGet(
-                self.read_states(tenant, &keys).await?,
+                self.read_states(tenant, &keys, budget).await?,
             )),
-            Request::Transact { request } => self.execute_transaction(tenant, request).await,
+            Request::Transact { request } => {
+                self.execute_transaction(tenant, request, budget).await
+            }
         }
     }
 
@@ -660,6 +733,7 @@ impl LocalTenantService {
         &self,
         tenant: TenantId,
         request: TransactionRequest,
+        budget: ExecutionBudget,
     ) -> Result<Response, Error> {
         if request.mutations.is_empty() {
             validate_condition_keys(&request.conditions)?;
@@ -673,7 +747,7 @@ impl LocalTenantService {
                 .iter()
                 .map(|condition| condition.key().clone())
                 .collect::<Vec<_>>();
-            let states = self.read_states(tenant, &keys).await?;
+            let states = self.read_states(tenant, &keys, budget).await?;
             let state_map = keys.into_iter().zip(states).collect::<BTreeMap<_, _>>();
             for condition in &request.conditions {
                 let actual = state_map
@@ -702,9 +776,14 @@ impl LocalTenantService {
         &self,
         tenant: TenantId,
         keys: &[DocumentKey],
+        budget: ExecutionBudget,
     ) -> Result<Vec<RevisionState>, Error> {
         match self.read_shard(tenant).await? {
-            Some(shard) => shard.transact_get(keys.to_vec()).await,
+            Some(shard) => {
+                shard
+                    .transact_get_with_response_budget(keys.to_vec(), budget.max_response_bytes)
+                    .await
+            }
             None => Ok(keys
                 .iter()
                 .map(|_| RevisionState::missing(dodb_core::Revision::ZERO))
@@ -743,10 +822,13 @@ impl LocalTenantService {
         database_config.tenant_id = tenant;
         database_config.shard_id = shard_id;
         database_config.database_uuid = database_uuid(tenant, shard_id);
-        let store = BTreeStore::<ProductionFile, ProductionFile>::open_path(
+        let mut store = BTreeStore::<ProductionFile, ProductionFile>::open_path(
             &database_path,
             database_config,
         )?;
+        if let Some(factory) = self.fault_injector_factory.lock().await.clone() {
+            store.set_boxed_fault_injector(factory(tenant, shard_id));
+        }
         let shard = Arc::new(AsyncShard::start_with_config(
             store,
             self.coordinator_config,
@@ -766,8 +848,13 @@ impl DodbService for LocalTenantService {
         &'service self,
         tenant: TenantId,
         request: Request,
+        budget: ExecutionBudget,
     ) -> ServiceFuture<'service> {
-        Box::pin(async move { self.execute_request(tenant, request).await })
+        Box::pin(async move { self.execute_request(tenant, request, budget).await })
+    }
+
+    fn shutdown<'service>(&'service self) -> ShutdownFuture<'service> {
+        Box::pin(async move { self.shutdown().await })
     }
 }
 
@@ -779,11 +866,31 @@ fn storage_document(document: dodb_storage::Document) -> Document {
     }
 }
 
+/// Returns the deterministic logical identity for a `(tenant, shard)` pair.
+///
+/// The storage UUID is only 128 bits, so it is a domain-separated digest rather
+/// than a field concatenation. Both complete 64-bit identifiers participate;
+/// this function deliberately does not identify a physical incarnation. A
+/// future delete/recreate protocol can replace this with a persisted UUID
+/// without changing the distinct tenant/shard fields in the storage identity.
 fn database_uuid(tenant: TenantId, shard: ShardId) -> [u8; 16] {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut first = FNV_OFFSET;
+    let mut second = FNV_OFFSET ^ 0x9e3779b97f4a7c15;
+    let mut input = Vec::with_capacity(24);
+    input.extend_from_slice(b"DODB logical database identity");
+    input.extend_from_slice(&tenant.get().to_be_bytes());
+    input.extend_from_slice(&shard.get().to_be_bytes());
+    for (index, byte) in input.into_iter().enumerate() {
+        first ^= u64::from(byte);
+        first = first.wrapping_mul(FNV_PRIME);
+        second ^= u64::from(byte).wrapping_add(index as u64);
+        second = second.rotate_left(5).wrapping_mul(FNV_PRIME);
+    }
     let mut uuid = [0u8; 16];
-    uuid[..4].copy_from_slice(b"DODB");
-    uuid[4..12].copy_from_slice(&tenant.get().to_be_bytes());
-    uuid[12..].copy_from_slice(&shard.get().to_be_bytes()[..4]);
+    uuid[..8].copy_from_slice(&first.to_be_bytes());
+    uuid[8..].copy_from_slice(&second.to_be_bytes());
     uuid
 }
 
@@ -806,5 +913,27 @@ fn condition_matches(condition: &TransactionCondition, actual: &RevisionState) -
         } => actual.revision() == *expected_revision,
         TransactionCondition::Exists { .. } => !actual.is_missing(),
         TransactionCondition::NotExists { .. } => actual.is_missing(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_uuid_includes_all_shard_bits() {
+        let tenant = TenantId::new(9);
+        assert_ne!(
+            database_uuid(tenant, ShardId::new(1)),
+            database_uuid(tenant, ShardId::new(0x1_0000_0001))
+        );
+    }
+
+    #[test]
+    fn logical_database_uuid_is_stable_for_reopen() {
+        let first = database_uuid(TenantId::new(41), ShardId::new(41));
+        let reopened = database_uuid(TenantId::new(41), ShardId::new(41));
+        assert_eq!(first, reopened);
+        assert_ne!(first, database_uuid(TenantId::new(42), ShardId::new(41)));
     }
 }

@@ -27,7 +27,12 @@ response values plus:
 
 ```rust
 trait DodbService {
-    fn execute(&self, tenant: TenantId, request: Request) -> ServiceFuture;
+    fn execute(
+        &self,
+        tenant: TenantId,
+        request: Request,
+        budget: ExecutionBudget,
+    ) -> ServiceFuture;
 }
 ```
 
@@ -69,7 +74,8 @@ The default network limits are:
 
 - 68 MiB request frame and 68 MiB response frame, including the header;
 - 64 MiB maximum value, matching the storage maximum;
-- 3,990 bytes per key component;
+- 3,990 bytes per defensive key component;
+- 3,992 bytes maximum canonical encoded document key;
 - 4,096 point keys;
 - 256 conditions and 256 mutations;
 - 4,096 Query or Scan rows per response;
@@ -78,7 +84,17 @@ The default network limits are:
 The decoder validates declared frame length before allocating the payload, and
 all nested counts and byte lengths are checked against these limits. A caller
 may lower the limits but cannot raise key or value limits above the storage
-contract through `ProtocolLimits`.
+contract through `ProtocolLimits`. Canonical key length includes component
+terminators and zero-byte escapes, so component limits alone are not the key
+contract. Query primary-key cursors, Scan cursors, conditions, mutations,
+TransactGet keys, and structured conflict keys use the same canonical check.
+
+The server supplies an `ExecutionBudget` derived from the response frame limit.
+The local service passes it into bounded committed reads. Query, Scan, and
+TransactGet reserve aggregate response space before each value is materialized;
+an incomplete result is rejected as structured `ResponseTooLarge` rather than
+silently truncated. This keeps a legal single maximum-size value usable while
+bounding one response before encoding.
 
 ## QUIC and TLS
 
@@ -88,10 +104,14 @@ send side, and reads one response frame. Independent streams are concurrent;
 the client does not serialize them behind a connection mutex and does not
 create a connection per operation.
 
-The server has configurable connection and active-stream semaphores. A full
-connection or stream budget rejects additional work, and a full `AsyncShard`
-coordinator is returned as the structured `Overloaded` application category.
-QUIC transport failure remains distinct from an application error response.
+The server has separate configurable QUIC per-connection bidirectional-stream
+limits and a global active-request budget. The QUIC limit is transport-level;
+the global budget is enforced by waiting before accepting another application
+stream, allowing QUIC flow control to provide bounded backpressure. Filling the
+global budget never closes a connection or interrupts another stream. A full
+`AsyncShard` coordinator is returned as the structured `Overloaded` application
+category. QUIC transport failure remains distinct from an application error
+response.
 
 The server accepts a certificate chain and private key in DER or PEM form.
 The client requires one or more trusted root certificates and passes the
@@ -117,7 +137,10 @@ database return an empty state and do not create data or WAL files. A
 condition-only Transact reads the same missing revision-zero state and also
 does not create files. The first mutation opens the paired files and creates
 the local database. A service restart reopens the same files through the normal
-WAL recovery path.
+WAL recovery path. The 128-bit database UUID is a deterministic,
+domain-separated digest of the complete logical `(TenantId, ShardId)` pair;
+it is not a truncated shard field and is intentionally a logical-pair identity
+for this phase rather than a persisted per-incarnation identity.
 
 ## Transaction semantics
 
@@ -141,17 +164,26 @@ cross-key snapshot promise for ordinary independent Gets, Query, or Scan.
 ## Errors and unknown outcomes
 
 The wire error categories are InvalidRequest, Overloaded, Conflict,
-StorageFailure, Corruption, DurabilityFailure, Internal, and
+ResponseTooLarge, StorageFailure, Corruption, DurabilityFailure, Internal, and
 UnsupportedProtocol. Conflict includes the key, expected condition, and
 actual `Present(value, revision)` or `Missing(revision)` state. The category is
 machine-readable; human-readable detail is supplementary.
 
 An application error response is distinct from a QUIC stream or connection
-failure. There is no v1 idempotency key or deduplication table. If a mutation
-request has been sent and the response cannot be received or decoded, the Rust
-client returns `UnknownMutationOutcome` and does not retry automatically. A
-read-only request may be retried by a caller after a transport failure, but
-the client does not add an automatic retry loop in this phase.
+failure. Each application error also carries a stable mutation outcome field:
+`NotApplicable`, `NotApplied`, or `Unknown`. InvalidRequest, Conflict, and
+Overloaded are definite `NotApplied` outcomes. WAL durability failures and
+physical WAL-group I/O failures are `Unknown`, because records may have become
+durable even when the server reports an error. The Rust client converts an
+uncertain server outcome into `UnknownMutationOutcome` while retaining the
+structured application cause, and does not retry automatically. A read-only
+request may be retried by a caller after a transport failure, but the client
+does not add an automatic retry loop in this phase.
+
+Normal server shutdown closes the endpoint, waits for established connections
+to drain, and then awaits each local shard coordinator. `AsyncShard::close` and
+`LocalTenantService::shutdown` therefore do not race a subsequent reopen of the
+same database files.
 
 ## Observability
 
@@ -165,13 +197,16 @@ responses. No metrics HTTP endpoint is added.
 The protocol tests cover all request and response variants, empty and non-UTF8
 binary data, missing revision zero, near-limit values, malformed headers and
 payloads, invalid magic/version/opcodes, absurd lengths, response type
-mismatch, structured Conflict, and structured server errors.
+mismatch, canonical key boundaries with zero-byte expansion, structured
+Conflict, mutation outcome certainty, and structured server errors.
 
 The loopback Quinn tests cover TLS connection setup, mutations, Get, Query,
 Scan, TransactGet, atomic Batch, transaction commit and conflict, condition
 only transactions, concurrent streams, same-tenant write ordering, tenant
 isolation, missing-revision ABA, lazy file creation, disconnect/reconnect
-through server restart, and persisted WAL-backed state after reopen.
+through server restart, persisted WAL-backed state after reopen, global request
+backpressure, and an injected WAL durability failure reported as an unknown
+mutation outcome.
 
 ## Deferred features
 
