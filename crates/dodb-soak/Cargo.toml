@@ -1,0 +1,21 @@
+[package]
+name = "dodb-soak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dodb-client = { path = "../dodb-client" }
+dodb-core = { path = "../dodb-core" }
+dodb-protocol = { path = "../dodb-protocol" }
+dodb-server = { path = "../dodb-server" }
+dodb-service = { path = "../dodb-service" }
+dodb-storage = { path = "../dodb-storage" }
+mimalloc.workspace = true
+rcgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

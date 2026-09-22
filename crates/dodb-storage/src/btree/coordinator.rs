@@ -10,7 +10,8 @@ use dodb_core::{
 
 use super::format::{MAX_OVERFLOW_PAGES, PageData, ValueRef};
 use super::{
-    BTreeStore, BatchRequest, BatchResponse, CheckpointReport, StorageMetrics, validate_encoded_key,
+    BTreeStore, BatchRequest, BatchResponse, CheckpointReport, InvariantReport, StorageMetrics,
+    validate_encoded_key,
 };
 use crate::DurableFile;
 use crate::SnapshotReport;
@@ -205,6 +206,18 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
         }
     }
 
+    /// Runs the storage invariant checker at the coordinator serialization
+    /// point. This is an explicit inspection hook for validation tools; it is
+    /// not part of the client protocol.
+    pub async fn check_invariants(&self) -> Result<InvariantReport> {
+        match self.send(CoordinatorOperation::CheckInvariants).await? {
+            CoordinatorResponse::Invariants(report) => Ok(report),
+            _ => Err(Error::invariant(
+                "coordinator returned the wrong invariant response",
+            )),
+        }
+    }
+
     pub async fn create_snapshot(&self, destination: impl Into<PathBuf>) -> Result<SnapshotReport> {
         match self
             .send(CoordinatorOperation::Snapshot(destination.into()))
@@ -342,6 +355,7 @@ enum CoordinatorResponse {
     TransactGet(Vec<RevisionState>),
     Observe(Vec<ObservedState>),
     Checkpoint(CheckpointReport),
+    Invariants(InvariantReport),
     Snapshot(SnapshotReport),
 }
 
@@ -633,6 +647,9 @@ fn process_segment<F: DurableFile, W: DurableFile>(
             CoordinatorOperation::Checkpoint => {
                 store.checkpoint().map(CoordinatorResponse::Checkpoint)
             }
+            CoordinatorOperation::CheckInvariants => {
+                store.check_invariants().map(CoordinatorResponse::Invariants)
+            }
             CoordinatorOperation::Snapshot(destination) => store
                 .create_snapshot(destination)
                 .map(CoordinatorResponse::Snapshot),
@@ -784,6 +801,7 @@ fn operation_size(operation: &CoordinatorOperation) -> usize {
             .map(|key| key.encode().len())
             .fold(0usize, usize::saturating_add),
         CoordinatorOperation::Checkpoint => 0,
+        CoordinatorOperation::CheckInvariants => 0,
         CoordinatorOperation::Snapshot(destination) => destination.to_string_lossy().len(),
     }
 }
