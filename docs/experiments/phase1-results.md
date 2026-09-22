@@ -2,7 +2,7 @@
 
 This record is the Phase 1 companion to
 [`b-link-batched-engine.md`](b-link-batched-engine.md). It describes the
-experimental engine at commit `0d023088f73fb0040e01a97c3897cf5b` and the
+experimental engine at commit `0d023088f73fb0040e01a97c3897cf57dbd69773` and the
 focused serial control runs. It does not implement or claim Phase 2
 optimistic reads, epoch reclamation, multi-writer page workers, batch planning,
 same-leaf coalescing, concurrent SMO, or WAL redesign.
@@ -13,7 +13,7 @@ same-leaf coalescing, concurrent SMO, or WAL redesign.
 | --- | --- |
 | Baseline main commit | `1ff96e1b3d205074d4c1b820f5f2680bd3226a8b` |
 | Phase 0 document commit | `49f262d0e97a8681cd48b8b1ad22b1ada5b86f4f` |
-| Phase 1 implementation/control commit | `0d023088f73fb0040e01a97c3897cf5b` |
+| Phase 1 implementation/control commit | `0d023088f73fb0040e01a97c3897cf57dbd69773` |
 | Baseline engine selector | `main-btree` |
 | Experimental engine selector | `serial-blink` |
 | Physical writer | one serial Blink mutation worker |
