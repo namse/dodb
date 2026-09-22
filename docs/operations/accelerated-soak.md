@@ -18,15 +18,17 @@ Build or run the dedicated workspace executable with commands such as:
 
     cargo run -p dodb-soak -- --profile smoke --seed 1
     cargo run -p dodb-soak -- --profile accelerated --seed 1
+    cargo run -p dodb-soak -- --phase bounded --duration 30s --seed 1
     cargo run -p dodb-soak -- --phase crash --duration 10m --seed 7
 
 The smoke profile is a few minutes and is suitable for manual or CI sanity
-checks. The accelerated profile has approximately ten minutes of mixed load,
-ten minutes of high contention and churn, and twelve minutes of crash/restart
-cycles, followed by quiescent verification. --duration overrides each
-selected phase, so a quick local crash check can use --phase crash --duration
-8s. --tenants, --concurrency, --checkpoint-ms, --output, and --data-dir make
-resource and phase sizing explicit. Connection churn can be disabled with
+checks. The accelerated profile has approximately eight minutes of growth
+load, six minutes of bounded-state overwrite/delete/reinsert load, eight
+minutes of high contention, and ten minutes of crash/restart cycles, followed
+by quiescent verification. --duration overrides each selected phase, so a
+quick local crash check can use --phase crash --duration 8s. --tenants,
+--concurrency, --checkpoint-ms, --output, and --data-dir make resource and
+phase sizing explicit. Connection churn can be disabled with
 --no-connection-churn when isolating another failure.
 
 The generator is seeded and does not use thread-local entropy after startup.
@@ -54,6 +56,15 @@ hot-key and 20% wide-key distribution, multiple tenants, fixed-size hot values,
 and rare medium, large, and near-limit cold values. This keeps hot revision
 churn and contention fast while still exercising inline values, overflow pages,
 response budgeting, and QUIC framing.
+
+The growth phase intentionally creates new wide keys and stresses tree growth,
+splits, overflow values, and checkpoint/WAL reclaim. The bounded phase uses a
+fixed per-tenant keyspace and repeatedly overwrites, deletes, reinserts,
+queries, scans, checkpoints, and churns connections. Its logical key count and
+phase-labelled RSS, virtual-memory, FD, stream, connection, and mimalloc
+observations are the primary context for resource-leak diagnostics. Growth
+phase RSS is interpreted alongside database bytes and reachable-state growth;
+database growth alone is not treated as a leak.
 
 The model stores tenant, document key, value, presence, and opaque revision
 history. Revisions are learned only from successful dodb responses. Full

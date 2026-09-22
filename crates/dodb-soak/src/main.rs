@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -142,9 +142,9 @@ impl HarnessConfig {
         }
         if !matches!(
             config.phase.as_str(),
-            "all" | "steady" | "contention" | "crash"
+            "all" | "steady" | "bounded" | "contention" | "crash"
         ) {
-            return Err("--phase must be all, steady, contention, or crash".to_owned());
+            return Err("--phase must be all, steady, bounded, contention, or crash".to_owned());
         }
         if config.hot_percent.is_some_and(|value| value > 100) {
             return Err("--hot-percent must be between 0 and 100".to_owned());
@@ -168,6 +168,7 @@ impl HarnessConfig {
             return if self.phase == "all" {
                 vec![
                     ("steady", duration),
+                    ("bounded", duration),
                     ("contention", duration),
                     ("crash", duration),
                 ]
@@ -177,12 +178,18 @@ impl HarnessConfig {
         }
         let durations = if self.profile == "accelerated" {
             [
-                ("steady", 10 * 60),
-                ("contention", 10 * 60),
-                ("crash", 12 * 60),
+                ("steady", 8 * 60),
+                ("bounded", 6 * 60),
+                ("contention", 8 * 60),
+                ("crash", 10 * 60),
             ]
         } else {
-            [("steady", 45), ("contention", 45), ("crash", 60)]
+            [
+                ("steady", 30),
+                ("bounded", 30),
+                ("contention", 30),
+                ("crash", 45),
+            ]
         };
         durations
             .into_iter()
@@ -195,6 +202,7 @@ impl HarnessConfig {
 fn phase_name(phase: &str) -> &'static str {
     match phase {
         "steady" => "steady",
+        "bounded" => "bounded",
         "contention" => "contention",
         "crash" => "crash",
         _ => "steady",
@@ -238,7 +246,7 @@ fn print_help() {
     println!(
         "dodb-soak --profile smoke|accelerated --seed N [options]\n\
          \nOptions:\n\
-         --phase all|steady|contention|crash\n\
+         --phase all|steady|bounded|contention|crash\n\
          --duration 10s|10m (override each selected phase)\n\
          --output DIR --data-dir DIR --tenants N --concurrency N\n\
          --hot-percent N --weights GET,PUT,DELETE,QUERY,SCAN,TRANSACT_GET,TRANSACT\n\
@@ -611,6 +619,7 @@ struct RunState {
     recent: Mutex<RecentOperations>,
     latency: Mutex<LatencyStats>,
     resources: Mutex<Vec<ResourceSample>>,
+    phase_key_counts: Mutex<BTreeMap<String, PhaseKeyCounts>>,
     crash_history: Mutex<Vec<CrashRecord>>,
     failure: Mutex<Option<String>>,
     abort: AtomicBool,
@@ -627,6 +636,7 @@ impl RunState {
             recent: Mutex::new(RecentOperations::new(256)),
             latency: Mutex::new(LatencyStats::default()),
             resources: Mutex::new(Vec::new()),
+            phase_key_counts: Mutex::new(BTreeMap::new()),
             crash_history: Mutex::new(Vec::new()),
             failure: Mutex::new(None),
             abort: AtomicBool::new(false),
@@ -645,6 +655,27 @@ impl RunState {
 
     fn elapsed_ms(&self) -> u128 {
         self.started.elapsed().as_millis()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct PhaseKeyCounts {
+    initial: Option<usize>,
+    final_count: Option<usize>,
+}
+
+fn record_phase_key_count(state: &Arc<RunState>, phase: &str, initial: bool) {
+    let Ok(model) = state.model.lock() else {
+        return;
+    };
+    let Ok(mut counts) = state.phase_key_counts.lock() else {
+        return;
+    };
+    let entry = counts.entry(phase.to_owned()).or_default();
+    if initial {
+        entry.initial = Some(model.total_key_count());
+    } else {
+        entry.final_count = Some(model.total_key_count());
     }
 }
 
@@ -694,7 +725,13 @@ fn workload_config(config: &HarnessConfig, phase: &str) -> WorkloadConfig {
         tenant_count: config.tenant_count,
         ..WorkloadConfig::default()
     };
-    if phase == "contention" {
+    if phase == "bounded" {
+        workload.bounded_keyspace = true;
+        workload.wide_key_count = 256;
+        workload.hot_percent = 90;
+        workload.operation_weights = [15, 25, 20, 10, 5, 10, 15];
+        workload.max_transaction_mutations = 4;
+    } else if phase == "contention" {
         workload.hot_percent = 95;
         workload.operation_weights = [15, 15, 10, 5, 5, 20, 30];
         workload.max_transaction_mutations = 4;
@@ -1284,6 +1321,7 @@ async fn spawn_workload(
 fn phase_seed(phase: &str) -> u64 {
     match phase {
         "steady" => 0x1111,
+        "bounded" => 0x4444,
         "contention" => 0x2222,
         "crash" => 0x3333,
         _ => 0,
@@ -1352,11 +1390,12 @@ async fn sample_resources(
     pid: u32,
     data_dir: PathBuf,
     event_file: PathBuf,
+    phase: String,
     stop: watch::Receiver<bool>,
 ) {
     let mut stop = stop;
     while !*stop.borrow() && !state.abort.load(Ordering::Relaxed) {
-        push_resource_sample(&state, pid, &data_dir, &event_file, false);
+        push_resource_sample(&state, pid, &data_dir, &event_file, &phase, false);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             changed = stop.changed() => if changed.is_err() { break; },
@@ -1369,11 +1408,13 @@ fn push_resource_sample(
     pid: u32,
     data_dir: &Path,
     event_file: &Path,
+    phase: &str,
     post_quiescence: bool,
 ) {
     let (rss, virtual_memory, threads) = proc_status(pid);
     let active = latest_metrics(event_file);
     let sample = ResourceSample {
+        phase: phase.to_owned(),
         elapsed_ms: state.elapsed_ms(),
         post_quiescence,
         rss_bytes: rss,
@@ -1401,6 +1442,7 @@ async fn collect_post_quiescence_samples(
     pid: u32,
     data_dir: &Path,
     event_file: &Path,
+    phase: &str,
 ) -> Result<(), String> {
     // The child publishes metrics once per second. The first wait gives that
     // publisher time to observe the closed QUIC connection; later samples
@@ -1412,7 +1454,7 @@ async fn collect_post_quiescence_samples(
             Duration::from_millis(250)
         })
         .await;
-        push_resource_sample(state, pid, data_dir, event_file, true);
+        push_resource_sample(state, pid, data_dir, event_file, phase, true);
     }
     let samples = state
         .resources
@@ -1897,11 +1939,16 @@ async fn run_normal_phase(
     )
     .await?;
     for tenant in 1..=config.tenant_count {
+        let marker = if phase == "bounded" {
+            "bounded".to_owned()
+        } else {
+            format!("{}-{cycle}", config.seed)
+        };
         run_aba_probe(
             state,
             &connection.for_tenant(TenantId::new(tenant)),
             TenantId::new(tenant),
-            &format!("{}-{cycle}", config.seed),
+            &marker,
         )
         .await?;
     }
@@ -1911,6 +1958,7 @@ async fn run_normal_phase(
         server.pid,
         data_dir.to_owned(),
         server.event_file.clone(),
+        phase.to_owned(),
         sample_receiver,
     ));
     let workload = spawn_workload(
@@ -1944,7 +1992,8 @@ async fn run_normal_phase(
     };
     connection.close();
     let post_quiescence =
-        collect_post_quiescence_samples(state, server.pid, data_dir, &server.event_file).await;
+        collect_post_quiescence_samples(state, server.pid, data_dir, &server.event_file, phase)
+            .await;
     let _ = sample_stop.send(true);
     let _ = sampler.await;
     let server_result = stop_server(server, output, true).await;
@@ -2009,6 +2058,7 @@ async fn run_crash_phase(
             server.pid,
             data_dir.to_owned(),
             server.event_file.clone(),
+            "crash".to_owned(),
             sample_receiver,
         ));
         let workload = spawn_workload(
@@ -2086,6 +2136,7 @@ async fn run_crash_phase(
                 recovered_server.pid,
                 data_dir,
                 &recovered_server.event_file,
+                "crash",
             )
             .await
         };
@@ -2151,6 +2202,8 @@ struct Report {
     wal_bytes: MetricSummary,
     database_bytes: MetricSummary,
     allocator_stats: Option<serde_json::Value>,
+    phase_key_counts: BTreeMap<String, PhaseKeyCounts>,
+    resource_trend_warnings_by_phase: BTreeMap<String, Vec<TrendDiagnostic>>,
     trend_warnings: Vec<TrendDiagnostic>,
     crash_history: Vec<CrashRecord>,
     failure: Option<String>,
@@ -2218,19 +2271,50 @@ fn build_report(
         .lock()
         .map(|pending| pending.len() as u64)
         .unwrap_or(u64::MAX);
-    let trend_warnings = [
-        trend(&samples, "rss", |sample| sample.rss_bytes),
-        trend(&samples, "virtual_memory", |sample| sample.virtual_bytes),
-        trend(&samples, "file_descriptors", |sample| sample.fd_count),
-        trend(&samples, "active_streams", |sample| sample.active_streams),
-        trend(&samples, "wal_bytes", |sample| Some(sample.wal_bytes)),
-        trend(&samples, "database_bytes", |sample| {
-            Some(sample.database_bytes)
-        }),
-    ]
-    .into_iter()
-    .filter(|diagnostic| diagnostic.warning)
-    .collect();
+    let mut samples_by_phase = BTreeMap::<String, Vec<ResourceSample>>::new();
+    for sample in &samples {
+        if !sample.post_quiescence {
+            samples_by_phase
+                .entry(sample.phase.clone())
+                .or_default()
+                .push(sample.clone());
+        }
+    }
+    let mut resource_trend_warnings_by_phase = BTreeMap::new();
+    for (phase, phase_samples) in samples_by_phase {
+        let warnings = [
+            trend(&phase_samples, "rss", |sample| sample.rss_bytes),
+            trend(&phase_samples, "virtual_memory", |sample| {
+                sample.virtual_bytes
+            }),
+            trend(&phase_samples, "file_descriptors", |sample| sample.fd_count),
+            trend(&phase_samples, "active_connections", |sample| {
+                sample.active_connections
+            }),
+            trend(&phase_samples, "active_streams", |sample| {
+                sample.active_streams
+            }),
+            trend(&phase_samples, "wal_bytes", |sample| Some(sample.wal_bytes)),
+            trend(&phase_samples, "database_bytes", |sample| {
+                Some(sample.database_bytes)
+            }),
+        ]
+        .into_iter()
+        .filter(|diagnostic| diagnostic.warning)
+        .collect::<Vec<_>>();
+        if !warnings.is_empty() {
+            resource_trend_warnings_by_phase.insert(phase, warnings);
+        }
+    }
+    let trend_warnings = resource_trend_warnings_by_phase
+        .values()
+        .flat_map(|warnings| warnings.iter().cloned())
+        .collect::<Vec<_>>();
+    let phase_key_counts = state
+        .phase_key_counts
+        .lock()
+        .map(|counts| counts.clone())
+        .unwrap_or_default();
     let (
         server_requests,
         server_connections,
@@ -2288,6 +2372,8 @@ fn build_report(
         wal_bytes: metric_summary(&samples, |sample| Some(sample.wal_bytes)),
         database_bytes: metric_summary(&samples, |sample| Some(sample.database_bytes)),
         allocator_stats,
+        phase_key_counts,
+        resource_trend_warnings_by_phase,
         trend_warnings,
         crash_history: state
             .crash_history
@@ -2466,11 +2552,26 @@ fn print_report(report: &Report) {
         println!(
             "resource trend warnings: {}",
             report
-                .trend_warnings
+                .resource_trend_warnings_by_phase
                 .iter()
-                .map(|warning| warning.metric.as_str())
+                .map(|(phase, warnings)| {
+                    format!(
+                        "{phase}:{}",
+                        warnings
+                            .iter()
+                            .map(|warning| warning.metric.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(" ")
+        );
+    }
+    if let Some(bounded) = report.phase_key_counts.get("bounded") {
+        println!(
+            "bounded keyspace: {:?}->{:?}",
+            bounded.initial, bounded.final_count
         );
     }
     if let Some(failure) = &report.failure {
@@ -2501,6 +2602,7 @@ async fn run(config: HarnessConfig) -> Result<(), BoxError> {
         if state.abort.load(Ordering::Relaxed) {
             break;
         }
+        record_phase_key_count(&state, phase, true);
         let phase_result = match phase {
             "crash" => {
                 run_crash_phase(
@@ -2533,6 +2635,7 @@ async fn run(config: HarnessConfig) -> Result<(), BoxError> {
             state.fail(format!("phase {phase} failed: {error}"));
             break;
         }
+        record_phase_key_count(&state, phase, false);
     }
     let pending_count = state
         .pending
@@ -2634,6 +2737,7 @@ mod tests {
         fds: Option<u64>,
     ) -> ResourceSample {
         ResourceSample {
+            phase: "test".to_owned(),
             elapsed_ms: 1,
             post_quiescence: true,
             rss_bytes: None,

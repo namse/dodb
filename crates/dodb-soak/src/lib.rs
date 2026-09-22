@@ -12,7 +12,7 @@ use serde_json::Value;
 
 /// The operation mix is deliberately explicit so a run can be reproduced
 /// without relying on process-global or thread-local entropy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OperationKind {
     Get,
     Put,
@@ -161,6 +161,7 @@ pub struct WorkloadConfig {
     pub tenant_count: u64,
     pub hot_key_count: u32,
     pub wide_key_count: u32,
+    pub bounded_keyspace: bool,
     pub hot_percent: u32,
     pub operation_weights: [u32; 7],
     pub max_query_limit: usize,
@@ -174,6 +175,7 @@ impl Default for WorkloadConfig {
             tenant_count: 16,
             hot_key_count: 8,
             wide_key_count: 16_384,
+            bounded_keyspace: false,
             hot_percent: 80,
             operation_weights: [35, 20, 10, 10, 5, 10, 10],
             max_query_limit: 32,
@@ -262,7 +264,7 @@ impl OperationGenerator {
             OperationKind::Put => {
                 let mut key = self.key(tenant);
                 let value = self.value_for_key(operation_index, &key);
-                if value.len() > 512 {
+                if value.len() > 512 && !self.config.bounded_keyspace {
                     key = self.unique_value_key(tenant, operation_index, 0);
                 }
                 GeneratedOperation::Put { tenant, key, value }
@@ -303,7 +305,7 @@ impl OperationGenerator {
                     1 + self.rng.below(self.config.max_transaction_mutations as u64) as usize;
                 let mut mutations = Vec::with_capacity(mutation_count);
                 while mutations.len() < mutation_count {
-                    let key = if mutation_count > 1 {
+                    let key = if mutation_count > 1 && !self.config.bounded_keyspace {
                         self.unique_value_key(tenant, operation_index, mutations.len() as u64)
                     } else {
                         self.key(tenant)
@@ -320,6 +322,7 @@ impl OperationGenerator {
                         PlannedMutationKind::Put
                     };
                     let key = if matches!(kind, PlannedMutationKind::Delete)
+                        && !self.config.bounded_keyspace
                         && key
                             .pk
                             .as_bytes()
@@ -331,7 +334,7 @@ impl OperationGenerator {
                         key
                     };
                     let value = self.value_for_key(operation_index, &key);
-                    let key = if value.len() > 512 {
+                    let key = if value.len() > 512 && !self.config.bounded_keyspace {
                         self.unique_value_key(tenant, operation_index, mutations.len() as u64)
                     } else {
                         key
@@ -353,7 +356,11 @@ impl OperationGenerator {
             format!(
                 "tenant-{}-hot-transition-pk-{}",
                 tenant.get(),
-                operation_index / 64
+                if self.config.bounded_keyspace {
+                    operation_index % u64::from(self.config.wide_key_count)
+                } else {
+                    operation_index / 64
+                }
             ),
             "transition-sk",
         );
@@ -756,6 +763,10 @@ impl ReferenceModel {
             .collect()
     }
 
+    pub fn total_key_count(&self) -> usize {
+        self.states.values().map(BTreeMap::len).sum()
+    }
+
     pub fn all_documents(&self) -> Vec<(TenantId, Document)> {
         self.tenants()
             .flat_map(|(tenant, documents)| {
@@ -982,6 +993,7 @@ pub fn percentile_value(values: &[u64], percentile: f64) -> u64 {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ResourceSample {
+    pub phase: String,
     pub elapsed_ms: u128,
     pub post_quiescence: bool,
     pub rss_bytes: Option<u64>,
@@ -1119,6 +1131,49 @@ mod tests {
                 "phase-local operation index {phase_index} did not replay"
             );
         }
+    }
+
+    #[test]
+    fn bounded_generator_reuses_a_finite_keyspace_and_replays() {
+        let config = WorkloadConfig {
+            tenant_count: 2,
+            hot_key_count: 4,
+            wide_key_count: 12,
+            bounded_keyspace: true,
+            operation_weights: [10, 30, 20, 5, 5, 10, 20],
+            max_transaction_mutations: 3,
+            ..WorkloadConfig::default()
+        };
+        let mut first = OperationGenerator::new(41, config.clone()).unwrap();
+        let mut replay = OperationGenerator::new(41, config).unwrap();
+        let mut keys = HashSet::new();
+        let mut key_kinds = BTreeMap::<DocumentKey, HashSet<OperationKind>>::new();
+        let mut transaction_count = 0;
+        for index in 0..2_000 {
+            let operation = first.next(index);
+            assert_eq!(operation, replay.next(index));
+            for key in operation.keys() {
+                keys.insert(key.clone());
+                key_kinds
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(operation.kind());
+            }
+            if let GeneratedOperation::Transact { mutations, .. } = &operation {
+                transaction_count += 1;
+                assert!(mutations.len() <= 3);
+                let unique = mutations
+                    .iter()
+                    .map(|mutation| &mutation.key)
+                    .collect::<HashSet<_>>();
+                assert_eq!(unique.len(), mutations.len());
+            }
+        }
+        assert!(keys.len() <= 2 * (4 + 12 + 12));
+        assert!(transaction_count > 0);
+        assert!(key_kinds.values().any(|kinds| {
+            kinds.contains(&OperationKind::Put) && kinds.contains(&OperationKind::Delete)
+        }));
     }
 
     #[test]
