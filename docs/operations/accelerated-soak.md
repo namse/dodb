@@ -18,12 +18,12 @@ Build or run the dedicated workspace executable with commands such as:
 
     cargo run -p dodb-soak -- --profile smoke --seed 1
     cargo run -p dodb-soak -- --profile accelerated --seed 1
-    cargo run -p dodb-soak -- --phase bounded --duration 30s --seed 1
+    cargo run -p dodb-soak -- --phase growth --duration 30s --seed 1
     cargo run -p dodb-soak -- --phase crash --duration 10m --seed 7
 
 The smoke profile is a few minutes and is suitable for manual or CI sanity
-checks. The accelerated profile has approximately eight minutes of growth
-load, six minutes of bounded-state overwrite/delete/reinsert load, eight
+checks. The accelerated profile has approximately eight minutes of bounded
+growth-then-churn load, six minutes of bounded-state overwrite/delete/reinsert load, eight
 minutes of high contention, and ten minutes of crash/restart cycles, followed
 by quiescent verification. --duration overrides each selected phase, so a
 quick local crash check can use --phase crash --duration 8s. --tenants,
@@ -53,25 +53,34 @@ informative than one partially completed long run:
 The default mix covers Get, Put, Delete, Query, Scan, TransactGet, and Transact
 with weights approximately 35/20/10/10/5/10/10. The generator uses an 80%
 hot-key and 20% wide-key distribution, multiple tenants, fixed-size hot values,
-and rare medium, large, and near-limit cold values. This keeps hot revision
-churn and contention fast while still exercising inline values, overflow pages,
-response budgeting, and QUIC framing.
+and finite large-value probes. This keeps hot revision churn and contention
+fast while still exercising inline values, overflow pages, response budgeting,
+and QUIC framing.
 
-The growth phase intentionally creates new wide keys and stresses tree growth,
-splits, overflow values, and checkpoint/WAL reclaim. The bounded phase uses a
-fixed per-tenant keyspace and repeatedly overwrites, deletes, reinserts,
-queries, scans, checkpoints, and churns connections. Its logical key count and
-phase-labelled RSS, virtual-memory, FD, stream, connection, and mimalloc
-observations are the primary context for resource-leak diagnostics. Growth
-phase RSS is interpreted alongside database bytes and reachable-state growth;
-database growth alone is not treated as a leak.
+The growth phase fills an explicit target of 1,024 ordinary keys per tenant
+over its first 16,384 generated operations, then keeps mutating that same finite
+keyspace. The bounded phase uses 256 ordinary keys per tenant. Contention uses
+64 ordinary keys per tenant with a 95% hot-key distribution and a 40%
+transaction weight, so collision probability stays high without creating new
+keys. Crash uses 128 ordinary keys per tenant and reuses its ABA and large-value
+probe keys on every restart cycle.
 
-The model stores tenant, document key, value, presence, and opaque revision
-history. Revisions are learned only from successful dodb responses. Full
-quiescent checks compare scans, queries, cursors, and TransactGet ordering and
-state. During concurrent traffic, point and range observations are allowed to
-reflect a legal linearization point between model updates; the later quiescent
-check is the exact comparison boundary.
+Every phase also has finite transition and large-value probe sets. The growth
+phase therefore exercises leaf/internal/root growth before spending the rest of
+its budget on overwrite, delete/reinsert, value-size transitions,
+checkpoint/WAL reclaim, and allocator reuse. Logical key counts and
+phase-labelled RSS, virtual-memory, database-byte, FD, stream, connection, and
+reference-model retained-value observations are reported together; database
+growth alone is not treated as a leak.
+
+The model stores tenant, document key, presence, and opaque revision history.
+Values at or below 512 bytes may be retained inline; larger values retain only
+their length and SHA-256 digest. Revisions are learned only from successful
+dodb responses. Full quiescent checks compare scans, queries, cursors, and
+TransactGet ordering, exact revisions, value lengths, and value digests.
+During concurrent traffic, observations may reflect a legal linearization point
+between model updates; generated mutation fingerprints are used to validate
+the returned value while the exact quiescent comparison remains authoritative.
 
 Each phase also runs explicit Put/Delete/Put/Delete sequences and stale
 RevisionEquals checks for both missing and present revisions. Transaction

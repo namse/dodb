@@ -1,14 +1,14 @@
 //! Deterministic workload, reference-model, and reporting primitives for the
 //! `dodb-soak` executable.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
 use dodb_core::{DocumentKey, PrimaryKey, Revision, RevisionState, TenantId};
-use dodb_service::Document;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// The operation mix is deliberately explicit so a run can be reproduced
 /// without relying on process-global or thread-local entropy.
@@ -162,6 +162,15 @@ pub struct WorkloadConfig {
     pub hot_key_count: u32,
     pub wide_key_count: u32,
     pub bounded_keyspace: bool,
+    /// Growth phases fill this many ordinary keys per tenant before reusing
+    /// the same finite keyspace for churn. Bounded phases use wide_key_count.
+    pub growth_target_key_count: u32,
+    /// Number of generated operations spent filling the growth keyspace.
+    pub growth_fill_operations: u64,
+    /// Finite key count for the explicit put/delete transition probes.
+    pub transition_key_count: u32,
+    /// Finite key count for reused large-value probe keys.
+    pub large_probe_key_count: u32,
     pub hot_percent: u32,
     pub operation_weights: [u32; 7],
     pub max_query_limit: usize,
@@ -174,8 +183,12 @@ impl Default for WorkloadConfig {
         Self {
             tenant_count: 16,
             hot_key_count: 8,
-            wide_key_count: 16_384,
+            wide_key_count: 512,
             bounded_keyspace: false,
+            growth_target_key_count: 1_024,
+            growth_fill_operations: 16_384,
+            transition_key_count: 16,
+            large_probe_key_count: 2,
             hot_percent: 80,
             operation_weights: [35, 20, 10, 10, 5, 10, 10],
             max_query_limit: 32,
@@ -190,6 +203,10 @@ impl WorkloadConfig {
         if self.tenant_count == 0
             || self.hot_key_count == 0
             || self.wide_key_count == 0
+            || self.growth_target_key_count == 0
+            || self.growth_fill_operations == 0
+            || self.transition_key_count == 0
+            || self.large_probe_key_count == 0
             || self.max_query_limit == 0
             || self.max_scan_limit == 0
             || self.max_transaction_mutations == 0
@@ -202,7 +219,32 @@ impl WorkloadConfig {
         if self.operation_weights.iter().sum::<u32>() == 0 {
             return Err("at least one operation weight must be nonzero".to_owned());
         }
+        if !self.bounded_keyspace
+            && self.growth_fill_operations
+                < self
+                    .tenant_count
+                    .checked_mul(u64::from(self.growth_target_key_count))
+                    .ok_or_else(|| "growth key budget overflows u64".to_owned())?
+        {
+            return Err(
+                "growth fill operations must cover every tenant's target key count".to_owned(),
+            );
+        }
         Ok(())
+    }
+
+    pub fn maximum_generated_key_count(&self) -> usize {
+        let ordinary = if self.bounded_keyspace {
+            self.wide_key_count
+        } else {
+            self.growth_target_key_count
+        } as usize;
+        (self.tenant_count as usize).saturating_mul(
+            self.hot_key_count as usize
+                + ordinary
+                + self.transition_key_count as usize
+                + self.large_probe_key_count as usize,
+        )
     }
 }
 
@@ -251,6 +293,12 @@ impl OperationGenerator {
     }
 
     pub fn next(&mut self, operation_index: u64) -> GeneratedOperation {
+        if let Some(operation) = self.growth_seed_operation(operation_index) {
+            return operation;
+        }
+        if let Some(operation) = self.large_value_probe_operation(operation_index) {
+            return operation;
+        }
         if let Some(operation) = self.transition_operation(operation_index) {
             return operation;
         }
@@ -259,19 +307,16 @@ impl OperationGenerator {
         match kind {
             OperationKind::Get => GeneratedOperation::Get {
                 tenant,
-                key: self.key(tenant),
+                key: self.key(tenant, operation_index),
             },
             OperationKind::Put => {
-                let mut key = self.key(tenant);
+                let key = self.key(tenant, operation_index);
                 let value = self.value_for_key(operation_index, &key);
-                if value.len() > 512 && !self.config.bounded_keyspace {
-                    key = self.unique_value_key(tenant, operation_index, 0);
-                }
                 GeneratedOperation::Put { tenant, key, value }
             }
             OperationKind::Delete => GeneratedOperation::Delete {
                 tenant,
-                key: self.wide_key(tenant),
+                key: self.wide_key(tenant, operation_index),
             },
             OperationKind::Query => {
                 let pk = self.primary_key(tenant);
@@ -290,14 +335,17 @@ impl OperationGenerator {
             }
             OperationKind::Scan => GeneratedOperation::Scan {
                 tenant,
-                exclusive_after_key: (self.rng.below(5) == 0).then(|| self.key(tenant)),
+                exclusive_after_key: (self.rng.below(5) == 0)
+                    .then(|| self.key(tenant, operation_index)),
                 limit: self.limit(self.config.max_scan_limit),
             },
             OperationKind::TransactGet => {
                 let key_count = 1 + self.rng.below(4) as usize;
                 GeneratedOperation::TransactGet {
                     tenant,
-                    keys: (0..key_count).map(|_| self.key(tenant)).collect(),
+                    keys: (0..key_count)
+                        .map(|_| self.key(tenant, operation_index))
+                        .collect(),
                 }
             }
             OperationKind::Transact => {
@@ -305,11 +353,7 @@ impl OperationGenerator {
                     1 + self.rng.below(self.config.max_transaction_mutations as u64) as usize;
                 let mut mutations = Vec::with_capacity(mutation_count);
                 while mutations.len() < mutation_count {
-                    let key = if mutation_count > 1 && !self.config.bounded_keyspace {
-                        self.unique_value_key(tenant, operation_index, mutations.len() as u64)
-                    } else {
-                        self.key(tenant)
-                    };
+                    let key = self.key(tenant, operation_index);
                     if mutations
                         .iter()
                         .any(|mutation: &PlannedMutation| mutation.key == key)
@@ -321,24 +365,7 @@ impl OperationGenerator {
                     } else {
                         PlannedMutationKind::Put
                     };
-                    let key = if matches!(kind, PlannedMutationKind::Delete)
-                        && !self.config.bounded_keyspace
-                        && key
-                            .pk
-                            .as_bytes()
-                            .windows(5)
-                            .any(|window| window == b"-hot-")
-                    {
-                        self.unique_value_key(tenant, operation_index, mutations.len() as u64)
-                    } else {
-                        key
-                    };
                     let value = self.value_for_key(operation_index, &key);
-                    let key = if value.len() > 512 && !self.config.bounded_keyspace {
-                        self.unique_value_key(tenant, operation_index, mutations.len() as u64)
-                    } else {
-                        key
-                    };
                     mutations.push(PlannedMutation { key, kind, value });
                 }
                 GeneratedOperation::Transact { tenant, mutations }
@@ -356,11 +383,7 @@ impl OperationGenerator {
             format!(
                 "tenant-{}-hot-transition-pk-{}",
                 tenant.get(),
-                if self.config.bounded_keyspace {
-                    operation_index % u64::from(self.config.wide_key_count)
-                } else {
-                    operation_index / 64
-                }
+                (operation_index / 64) % u64::from(self.config.transition_key_count)
             ),
             "transition-sk",
         );
@@ -368,6 +391,25 @@ impl OperationGenerator {
         Some(match step {
             0 | 2 => GeneratedOperation::Put { tenant, key, value },
             _ => GeneratedOperation::Delete { tenant, key },
+        })
+    }
+
+    fn growth_seed_operation(&mut self, operation_index: u64) -> Option<GeneratedOperation> {
+        if self.config.bounded_keyspace || operation_index >= self.config.growth_fill_operations {
+            return None;
+        }
+        let tenant = TenantId::new((operation_index % self.config.tenant_count) + 1);
+        let index = operation_index / self.config.tenant_count;
+        let key = self.wide_key_at(tenant, index);
+        let value_size = if index.is_multiple_of(8) {
+            2 * 1024
+        } else {
+            128
+        };
+        Some(GeneratedOperation::Put {
+            tenant,
+            key,
+            value: patterned_value(operation_index, value_size),
         })
     }
 
@@ -383,17 +425,33 @@ impl OperationGenerator {
         OperationKind::Transact
     }
 
-    fn key(&mut self, tenant: TenantId) -> DocumentKey {
+    fn key(&mut self, tenant: TenantId, operation_index: u64) -> DocumentKey {
         if self.rng.below(100) < u64::from(self.config.hot_percent) {
             let index = self.rng.below(u64::from(self.config.hot_key_count)) as u32;
             self.hot_key(tenant, index)
         } else {
-            self.wide_key(tenant)
+            self.wide_key(tenant, operation_index)
         }
     }
 
-    fn wide_key(&mut self, tenant: TenantId) -> DocumentKey {
-        let index = self.rng.below(u64::from(self.config.wide_key_count));
+    fn wide_key(&mut self, tenant: TenantId, operation_index: u64) -> DocumentKey {
+        let key_count = if self.config.bounded_keyspace {
+            self.config.wide_key_count
+        } else {
+            self.config.growth_target_key_count
+        };
+        let _ = operation_index;
+        let index = self.rng.below(u64::from(key_count));
+        self.wide_key_at(tenant, index)
+    }
+
+    fn wide_key_at(&self, tenant: TenantId, index: u64) -> DocumentKey {
+        let key_count = if self.config.bounded_keyspace {
+            self.config.wide_key_count
+        } else {
+            self.config.growth_target_key_count
+        };
+        let index = index % u64::from(key_count);
         DocumentKey::new(
             format!("tenant-{}-wide-pk-{}", tenant.get(), index % 64),
             format!("wide-sk-{index}"),
@@ -407,10 +465,10 @@ impl OperationGenerator {
         )
     }
 
-    fn unique_value_key(&self, tenant: TenantId, operation_index: u64, salt: u64) -> DocumentKey {
+    fn large_probe_key(&self, tenant: TenantId, index: u32) -> DocumentKey {
         DocumentKey::new(
-            format!("tenant-{}-wide-value-pk", tenant.get()),
-            format!("wide-value-{operation_index}-{salt}"),
+            format!("tenant-{}-large-probe-pk-{}", tenant.get(), index),
+            format!("large-probe-sk-{index}"),
         )
     }
 
@@ -438,53 +496,199 @@ impl OperationGenerator {
         let selector = self.rng.below(10_000);
         let size = if selector < 7_000 {
             32 + self.rng.below(224) as usize
-        } else if selector < 9_200 {
-            512 + self.rng.below(4 * 1024) as usize
-        } else if selector < 9_850 {
-            8 * 1024 + self.rng.below(128 * 1024) as usize
-        } else if selector < 9_995 {
-            256 * 1024 + self.rng.below(2 * 1024 * 1024) as usize
         } else {
-            32 * 1024 * 1024 + self.rng.below(8 * 1024 * 1024) as usize
+            512 + self.rng.below(4 * 1024) as usize
         };
-        let prefix = format!("soak_operation_id={operation_index};payload=");
-        let mut value = Vec::with_capacity(size.max(prefix.len()));
-        value.extend_from_slice(prefix.as_bytes());
-        while value.len() < size {
-            value.push((operation_index as u8).wrapping_add(value.len() as u8));
-        }
-        value.truncate(size);
-        value
+        patterned_value(operation_index, size)
     }
 
-    fn value_for_key(&mut self, operation_index: u64, key: &DocumentKey) -> Vec<u8> {
+    fn large_value_probe_operation(&mut self, operation_index: u64) -> Option<GeneratedOperation> {
+        let step = operation_index % 128;
+        if step >= 8 {
+            return None;
+        }
+        let cycle = operation_index / 128;
+        let tenant = TenantId::new((cycle % self.config.tenant_count) + 1);
+        let probe = (cycle % u64::from(self.config.large_probe_key_count)) as u32;
+        let key = self.large_probe_key(tenant, probe);
+        let value_size = match step {
+            0 => 64,
+            1 => 511,
+            2 => 513,
+            3 => 768 * 1024,
+            4 => 1024 * 1024,
+            5 => 4 * 1024 * 1024,
+            6 => 64,
+            7 => 2 * 1024 * 1024,
+            _ => unreachable!(),
+        };
+        Some(match step {
+            0..=5 | 7 => GeneratedOperation::Put {
+                tenant,
+                key,
+                value: patterned_value(operation_index, value_size),
+            },
+            6 => GeneratedOperation::Delete { tenant, key },
+            _ => unreachable!(),
+        })
+    }
+
+    fn regular_value_for_key(&mut self, operation_index: u64, key: &DocumentKey) -> Vec<u8> {
         if key
             .pk
             .as_bytes()
             .windows(5)
             .any(|window| window == b"-hot-")
         {
-            let size = 64;
-            let prefix = format!("soak_operation_id={operation_index};payload=");
-            let mut value = Vec::with_capacity(size.max(prefix.len()));
-            value.extend_from_slice(prefix.as_bytes());
-            while value.len() < size {
-                value.push((operation_index as u8).wrapping_add(value.len() as u8));
-            }
-            value.truncate(size);
-            value
+            patterned_value(operation_index, 64)
         } else {
             self.value(operation_index)
         }
     }
+
+    fn value_for_key(&mut self, operation_index: u64, key: &DocumentKey) -> Vec<u8> {
+        // Large values are only generated by the finite probe schedule. This
+        // keeps overflow coverage while preventing value-size randomness from
+        // creating a second persistent keyspace.
+        self.regular_value_for_key(operation_index, key)
+    }
+}
+
+fn patterned_value(operation_index: u64, size: usize) -> Vec<u8> {
+    let prefix = format!("soak_operation_id={operation_index};payload=");
+    let mut value = Vec::with_capacity(size.max(prefix.len()));
+    value.extend_from_slice(prefix.as_bytes());
+    while value.len() < size {
+        value.push((operation_index as u8).wrapping_add(value.len() as u8));
+    }
+    value.truncate(size);
+    value
+}
+
+/// Values at or below this size are retained in the model for convenient
+/// diagnostics. Larger values keep only their length and SHA-256 digest.
+pub const MODEL_INLINE_VALUE_LIMIT: usize = 512;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ExpectedValue {
+    length: usize,
+    digest: [u8; 32],
+    inline: Option<Box<[u8]>>,
+}
+
+impl ExpectedValue {
+    pub fn from_bytes(value: &[u8]) -> Self {
+        let digest = Sha256::digest(value).into();
+        Self {
+            length: value.len(),
+            digest,
+            inline: (value.len() <= MODEL_INLINE_VALUE_LIMIT)
+                .then(|| value.to_vec().into_boxed_slice()),
+        }
+    }
+
+    pub const fn length(&self) -> usize {
+        self.length
+    }
+
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    pub fn matches(&self, value: &[u8]) -> bool {
+        let digest: [u8; 32] = Sha256::digest(value).into();
+        self.length == value.len() && self.digest == digest
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.inline.as_ref().map_or(0, |value| value.len())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExpectedState {
+    Present {
+        value: ExpectedValue,
+        revision: Revision,
+    },
+    Missing {
+        revision: Revision,
+    },
+}
+
+impl ExpectedState {
+    pub fn present(value: impl AsRef<[u8]>, revision: Revision) -> Self {
+        Self::Present {
+            value: ExpectedValue::from_bytes(value.as_ref()),
+            revision,
+        }
+    }
+
+    pub const fn missing(revision: Revision) -> Self {
+        Self::Missing { revision }
+    }
+
+    fn from_revision_state(state: &RevisionState) -> Self {
+        match state {
+            RevisionState::Present { value, revision } => Self::present(value, *revision),
+            RevisionState::Missing { revision } => Self::missing(*revision),
+        }
+    }
+
+    pub const fn revision(&self) -> Revision {
+        match self {
+            Self::Present { revision, .. } | Self::Missing { revision } => *revision,
+        }
+    }
+
+    pub const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing { .. })
+    }
+
+    pub fn value(&self) -> Option<&ExpectedValue> {
+        match self {
+            Self::Present { value, .. } => Some(value),
+            Self::Missing { .. } => None,
+        }
+    }
+
+    fn matches_revision_state(&self, actual: &RevisionState) -> bool {
+        match (self, actual) {
+            (
+                Self::Present { value, revision },
+                RevisionState::Present {
+                    value: actual_value,
+                    revision: actual_revision,
+                },
+            ) => revision == actual_revision && value.matches(actual_value),
+            (
+                Self::Missing { revision },
+                RevisionState::Missing {
+                    revision: actual_revision,
+                },
+            ) => revision == actual_revision,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectedDocument {
+    pub key: DocumentKey,
+    pub value: ExpectedValue,
+    pub revision: Revision,
 }
 
 /// A logical model of the committed state. Revisions are copied from actual
 /// successful dodb responses; this model never predicts a future revision.
+/// Large values are represented by compact fingerprints instead of retaining
+/// their complete byte vectors in current state and ABA history.
 #[derive(Clone, Debug, Default)]
 pub struct ReferenceModel {
-    states: BTreeMap<TenantId, BTreeMap<DocumentKey, RevisionState>>,
-    history: BTreeMap<(TenantId, DocumentKey), Vec<RevisionState>>,
+    states: BTreeMap<TenantId, BTreeMap<DocumentKey, ExpectedState>>,
+    history: BTreeMap<(TenantId, DocumentKey), Vec<ExpectedState>>,
+    candidates: BTreeMap<(TenantId, DocumentKey), Vec<ExpectedValue>>,
+    delete_candidates: BTreeSet<(TenantId, DocumentKey)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -497,12 +701,21 @@ pub enum UnknownMutationResolution {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum StateShape {
     Missing,
-    Present(Vec<u8>),
+    Present(ExpectedValue),
 }
 
-fn state_shape(state: &RevisionState) -> StateShape {
+fn expected_state_shape(state: &ExpectedState) -> StateShape {
     match state {
-        RevisionState::Present { value, .. } => StateShape::Present(value.clone()),
+        ExpectedState::Present { value, .. } => StateShape::Present(value.clone()),
+        ExpectedState::Missing { .. } => StateShape::Missing,
+    }
+}
+
+fn actual_state_shape(state: &RevisionState) -> StateShape {
+    match state {
+        RevisionState::Present { value, .. } => {
+            StateShape::Present(ExpectedValue::from_bytes(value))
+        }
         RevisionState::Missing { .. } => StateShape::Missing,
     }
 }
@@ -520,7 +733,7 @@ fn operation_effects(
                 .ok_or_else(|| {
                     "unknown put key was not included in reconciliation set".to_owned()
                 })?;
-            effects.push((index, StateShape::Present(value.clone())));
+            effects.push((index, StateShape::Present(ExpectedValue::from_bytes(value))));
         }
         GeneratedOperation::Delete { key, .. } => {
             let index = keys
@@ -540,7 +753,9 @@ fn operation_effects(
                         "unknown transaction key was not included in reconciliation set".to_owned()
                     })?;
                 let shape = match mutation.kind {
-                    PlannedMutationKind::Put => StateShape::Present(mutation.value.clone()),
+                    PlannedMutationKind::Put => {
+                        StateShape::Present(ExpectedValue::from_bytes(&mutation.value))
+                    }
                     PlannedMutationKind::Delete => StateShape::Missing,
                 };
                 effects.push((index, shape));
@@ -557,20 +772,24 @@ fn operation_effects(
 pub fn reconcile_unknown_operations(
     operations: &[GeneratedOperation],
     keys: &[DocumentKey],
-    current: &[RevisionState],
+    current: &[ExpectedState],
     actual: &[RevisionState],
 ) -> Result<UnknownMutationResolution, String> {
     if keys.len() != current.len() || keys.len() != actual.len() || operations.is_empty() {
         return Err("unknown reconciliation input lengths are inconsistent".to_owned());
     }
-    let current_shapes = current.iter().map(state_shape).collect::<Vec<_>>();
-    let actual_shapes = actual.iter().map(state_shape).collect::<Vec<_>>();
+    let current_shapes = current.iter().map(expected_state_shape).collect::<Vec<_>>();
+    let actual_shapes = actual.iter().map(actual_state_shape).collect::<Vec<_>>();
     let effects = operations
         .iter()
         .map(|operation| operation_effects(operation, keys))
         .collect::<Result<Vec<_>, _>>()?;
 
-    if actual == current {
+    if current
+        .iter()
+        .zip(actual)
+        .all(|(expected, actual)| expected.matches_revision_state(actual))
+    {
         return Ok(UnknownMutationResolution::NotApplied);
     }
 
@@ -643,9 +862,9 @@ pub fn reconcile_unknown_operations(
 
 pub fn classify_unknown_mutation(
     operation: &GeneratedOperation,
-    _before: &[RevisionState],
+    _before: &[ExpectedState],
     actual: &[RevisionState],
-    current: &[RevisionState],
+    current: &[ExpectedState],
 ) -> UnknownMutationResolution {
     let keys = operation.keys().into_iter().cloned().collect::<Vec<_>>();
     reconcile_unknown_operations(std::slice::from_ref(operation), &keys, current, actual)
@@ -653,15 +872,16 @@ pub fn classify_unknown_mutation(
 }
 
 impl ReferenceModel {
-    pub fn state(&self, tenant: TenantId, key: &DocumentKey) -> RevisionState {
+    pub fn state(&self, tenant: TenantId, key: &DocumentKey) -> ExpectedState {
         self.states
             .get(&tenant)
             .and_then(|states| states.get(key))
             .cloned()
-            .unwrap_or_else(|| RevisionState::missing(Revision::ZERO))
+            .unwrap_or_else(|| ExpectedState::missing(Revision::ZERO))
     }
 
     pub fn apply(&mut self, tenant: TenantId, key: DocumentKey, state: RevisionState) {
+        let state = ExpectedState::from_revision_state(&state);
         let history = self.history.entry((tenant, key.clone())).or_default();
         if history.last() != Some(&state) {
             history.push(state.clone());
@@ -692,13 +912,40 @@ impl ReferenceModel {
         self.apply(tenant, key, RevisionState::missing(revision));
     }
 
+    pub fn record_expected_put(&mut self, tenant: TenantId, key: DocumentKey, value: &[u8]) {
+        let candidates = self.candidates.entry((tenant, key)).or_default();
+        let expected = ExpectedValue::from_bytes(value);
+        if candidates.last() != Some(&expected) {
+            candidates.push(expected);
+            if candidates.len() > 16 {
+                candidates.remove(0);
+            }
+        }
+    }
+
+    pub fn record_expected_delete(&mut self, tenant: TenantId, key: DocumentKey) {
+        self.delete_candidates.insert((tenant, key));
+    }
+
     pub fn knows_state(&self, tenant: TenantId, key: &DocumentKey, state: &RevisionState) -> bool {
-        (*state == RevisionState::missing(Revision::ZERO))
-            || self
-                .history
-                .get(&(tenant, key.clone()))
-                .is_some_and(|history| history.iter().any(|known| known == state))
-            || self.state(tenant, key) == *state
+        if matches!(state, RevisionState::Missing { revision } if *revision == Revision::ZERO) {
+            return true;
+        }
+        self.history
+            .get(&(tenant, key.clone()))
+            .is_some_and(|history| {
+                history
+                    .iter()
+                    .any(|known| known.matches_revision_state(state))
+            })
+            || self.state(tenant, key).matches_revision_state(state)
+            || matches!(state, RevisionState::Present { value, .. }
+                if self
+                    .candidates
+                    .get(&(tenant, key.clone()))
+                    .is_some_and(|candidates| candidates.iter().any(|candidate| candidate.matches(value))))
+            || matches!(state, RevisionState::Missing { .. }
+                if self.delete_candidates.contains(&(tenant, key.clone())))
     }
 
     pub fn knows_revision(&self, tenant: TenantId, key: &DocumentKey, revision: Revision) -> bool {
@@ -708,12 +955,21 @@ impl ReferenceModel {
             || self.state(tenant, key).revision() == revision
     }
 
+    pub fn matches_state(
+        &self,
+        tenant: TenantId,
+        key: &DocumentKey,
+        state: &RevisionState,
+    ) -> bool {
+        self.knows_state(tenant, key, state)
+    }
+
     pub fn scan(
         &self,
         tenant: TenantId,
         cursor: Option<&DocumentKey>,
         limit: usize,
-    ) -> Vec<Document> {
+    ) -> Vec<ExpectedDocument> {
         self.states
             .get(&tenant)
             .into_iter()
@@ -723,12 +979,12 @@ impl ReferenceModel {
                     return None;
                 }
                 match state {
-                    RevisionState::Present { value, revision } => Some(Document {
+                    ExpectedState::Present { value, revision } => Some(ExpectedDocument {
                         key: key.clone(),
                         value: value.clone(),
                         revision: *revision,
                     }),
-                    RevisionState::Missing { .. } => None,
+                    ExpectedState::Missing { .. } => None,
                 }
             })
             .take(limit)
@@ -741,7 +997,7 @@ impl ReferenceModel {
         pk: &PrimaryKey,
         cursor: Option<&dodb_core::SortKey>,
         limit: usize,
-    ) -> Vec<Document> {
+    ) -> Vec<ExpectedDocument> {
         self.scan(tenant, None, usize::MAX)
             .into_iter()
             .filter(|document| {
@@ -751,7 +1007,7 @@ impl ReferenceModel {
             .collect()
     }
 
-    pub fn documents(&self, tenant: TenantId) -> Vec<Document> {
+    pub fn documents(&self, tenant: TenantId) -> Vec<ExpectedDocument> {
         self.scan(tenant, None, usize::MAX)
     }
 
@@ -767,7 +1023,7 @@ impl ReferenceModel {
         self.states.values().map(BTreeMap::len).sum()
     }
 
-    pub fn all_documents(&self) -> Vec<(TenantId, Document)> {
+    pub fn all_documents(&self) -> Vec<(TenantId, ExpectedDocument)> {
         self.tenants()
             .flat_map(|(tenant, documents)| {
                 documents
@@ -777,7 +1033,7 @@ impl ReferenceModel {
             .collect()
     }
 
-    pub fn tenants(&self) -> impl Iterator<Item = (TenantId, Vec<Document>)> + '_ {
+    pub fn tenants(&self) -> impl Iterator<Item = (TenantId, Vec<ExpectedDocument>)> + '_ {
         self.states
             .keys()
             .copied()
@@ -786,6 +1042,29 @@ impl ReferenceModel {
 
     pub fn known_key_count(&self) -> usize {
         self.states.values().map(BTreeMap::len).sum()
+    }
+
+    pub fn retained_value_bytes(&self) -> usize {
+        let current = self
+            .states
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter_map(ExpectedState::value)
+            .map(ExpectedValue::retained_bytes)
+            .sum::<usize>();
+        let history = self
+            .history
+            .values()
+            .flat_map(|states| states.iter().filter_map(ExpectedState::value))
+            .map(ExpectedValue::retained_bytes)
+            .sum::<usize>();
+        let candidates = self
+            .candidates
+            .values()
+            .flat_map(|values| values.iter())
+            .map(ExpectedValue::retained_bytes)
+            .sum::<usize>();
+        current + history + candidates
     }
 }
 
@@ -1169,11 +1448,116 @@ mod tests {
                 assert_eq!(unique.len(), mutations.len());
             }
         }
-        assert!(keys.len() <= 2 * (4 + 12 + 12));
+        assert!(keys.len() <= 2 * (4 + 12 + 16 + 2));
         assert!(transaction_count > 0);
         assert!(key_kinds.values().any(|kinds| {
             kinds.contains(&OperationKind::Put) && kinds.contains(&OperationKind::Delete)
         }));
+    }
+
+    #[test]
+    fn growth_contention_and_crash_configs_have_explicit_finite_key_bounds() {
+        let configurations = [
+            WorkloadConfig {
+                tenant_count: 2,
+                growth_target_key_count: 24,
+                growth_fill_operations: 48,
+                bounded_keyspace: false,
+                ..WorkloadConfig::default()
+            },
+            WorkloadConfig {
+                tenant_count: 2,
+                bounded_keyspace: true,
+                wide_key_count: 8,
+                ..WorkloadConfig::default()
+            },
+            WorkloadConfig {
+                tenant_count: 2,
+                bounded_keyspace: true,
+                wide_key_count: 6,
+                ..WorkloadConfig::default()
+            },
+        ];
+        for config in configurations {
+            let upper_bound = config.maximum_generated_key_count();
+            let mut generator = OperationGenerator::new(1, config.clone()).unwrap();
+            let mut keys = HashSet::new();
+            for index in 0..20_000 {
+                for key in generator.next(index).keys() {
+                    keys.insert(key.clone());
+                }
+            }
+            assert!(keys.len() <= upper_bound, "generated {keys:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_workload_contains_put_delete_updates_and_transactions() {
+        let config = WorkloadConfig {
+            tenant_count: 2,
+            hot_key_count: 3,
+            wide_key_count: 8,
+            bounded_keyspace: true,
+            operation_weights: [10, 30, 25, 0, 0, 0, 35],
+            max_transaction_mutations: 3,
+            ..WorkloadConfig::default()
+        };
+        let mut generator = OperationGenerator::new(9, config).unwrap();
+        let mut puts = 0;
+        let mut deletes = 0;
+        let mut transactions = 0;
+        let mut put_keys = HashSet::new();
+        let mut deleted_keys = HashSet::new();
+        for index in 0..4_000 {
+            match generator.next(index) {
+                GeneratedOperation::Put { key, .. } => {
+                    puts += 1;
+                    put_keys.insert(key);
+                }
+                GeneratedOperation::Delete { key, .. } => {
+                    deletes += 1;
+                    deleted_keys.insert(key);
+                }
+                GeneratedOperation::Transact { .. } => transactions += 1,
+                _ => {}
+            }
+        }
+        assert!(puts > 0 && deletes > 0 && transactions > 0);
+        assert!(put_keys.intersection(&deleted_keys).next().is_some());
+    }
+
+    #[test]
+    fn large_value_probe_keys_are_reused() {
+        let config = WorkloadConfig {
+            tenant_count: 3,
+            large_probe_key_count: 2,
+            ..WorkloadConfig::default()
+        };
+        let mut generator = OperationGenerator::new(3, config.clone()).unwrap();
+        let mut probes = HashSet::new();
+        for index in 0..20_000 {
+            let operation = generator.next(index);
+            let is_probe = |key: &DocumentKey| {
+                key.pk
+                    .as_bytes()
+                    .windows(b"-large-probe-".len())
+                    .any(|window| window == b"-large-probe-")
+            };
+            match operation {
+                GeneratedOperation::Put { key, value, .. } if is_probe(&key) => {
+                    probes.insert(key);
+                    assert!(value.len() <= 4 * 1024 * 1024);
+                }
+                GeneratedOperation::Delete { key, .. } if is_probe(&key) => {
+                    probes.insert(key);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            probes.len(),
+            (config.tenant_count * u64::from(config.large_probe_key_count)) as usize
+        );
     }
 
     #[test]
@@ -1183,19 +1567,48 @@ mod tests {
         let mut model = ReferenceModel::default();
         assert_eq!(
             model.state(tenant, &document),
-            RevisionState::missing(Revision::ZERO)
+            ExpectedState::missing(Revision::ZERO)
         );
         model.apply_put(tenant, document.clone(), b"a".to_vec(), Revision::new(4));
         model.apply_delete(tenant, document.clone(), Revision::new(5));
         assert_eq!(
             model.state(tenant, &document),
-            RevisionState::missing(Revision::new(5))
+            ExpectedState::missing(Revision::new(5))
         );
         assert!(model.knows_state(tenant, &document, &RevisionState::missing(Revision::ZERO)));
         assert!(model.knows_state(
             tenant,
             &document,
             &RevisionState::present(b"a".to_vec(), Revision::new(4))
+        ));
+    }
+
+    #[test]
+    fn compact_expected_values_detect_changed_contents_and_lengths() {
+        let expected = ExpectedValue::from_bytes(&vec![7; MODEL_INLINE_VALUE_LIMIT + 128]);
+        assert!(expected.matches(&vec![7; MODEL_INLINE_VALUE_LIMIT + 128]));
+        assert!(!expected.matches(&vec![8; MODEL_INLINE_VALUE_LIMIT + 128]));
+        assert!(!expected.matches(&vec![7; MODEL_INLINE_VALUE_LIMIT + 127]));
+
+        let tenant = TenantId::new(1);
+        let document = key(b"compact", b"value");
+        let mut model = ReferenceModel::default();
+        model.apply_put(
+            tenant,
+            document.clone(),
+            vec![7; MODEL_INLINE_VALUE_LIMIT + 128],
+            Revision::new(4),
+        );
+        assert_eq!(model.retained_value_bytes(), 0);
+        assert!(model.knows_state(
+            tenant,
+            &document,
+            &RevisionState::present(vec![7; MODEL_INLINE_VALUE_LIMIT + 128], Revision::new(4))
+        ));
+        assert!(!model.knows_state(
+            tenant,
+            &document,
+            &RevisionState::present(vec![8; MODEL_INLINE_VALUE_LIMIT + 128], Revision::new(4))
         ));
     }
 
@@ -1219,7 +1632,7 @@ mod tests {
                 },
             ],
         };
-        let before = vec![RevisionState::missing(Revision::ZERO); 2];
+        let before = vec![ExpectedState::missing(Revision::ZERO); 2];
         let current = before.clone();
         let applied = vec![
             RevisionState::present(b"first".to_vec(), Revision::new(10)),
@@ -1233,7 +1646,7 @@ mod tests {
             classify_unknown_mutation(
                 &operation,
                 &before,
-                &[applied[0].clone(), before[1].clone()],
+                &[applied[0].clone(), RevisionState::missing(Revision::ZERO),],
                 &current,
             ),
             UnknownMutationResolution::Partial
@@ -1256,7 +1669,7 @@ mod tests {
                 value: b"b".to_vec(),
             },
         ];
-        let current = vec![RevisionState::missing(Revision::ZERO)];
+        let current = vec![ExpectedState::missing(Revision::ZERO)];
         let actual = vec![RevisionState::present(b"b".to_vec(), Revision::new(8))];
         assert_eq!(
             reconcile_unknown_operations(
@@ -1283,7 +1696,7 @@ mod tests {
             tenant,
             key: document.clone(),
         };
-        let current = vec![RevisionState::missing(Revision::ZERO)];
+        let current = vec![ExpectedState::missing(Revision::ZERO)];
         let present = vec![RevisionState::present(b"a".to_vec(), Revision::new(8))];
         assert_eq!(
             reconcile_unknown_operations(
@@ -1317,8 +1730,8 @@ mod tests {
             key: document.clone(),
             value: b"old".to_vec(),
         };
-        let current = vec![RevisionState::present(b"new".to_vec(), Revision::new(10))];
-        let actual = current.clone();
+        let current = vec![ExpectedState::present(b"new", Revision::new(10))];
+        let actual = vec![RevisionState::present(b"new".to_vec(), Revision::new(10))];
         assert_eq!(
             reconcile_unknown_operations(
                 &[operation],
@@ -1340,7 +1753,7 @@ mod tests {
             key: document.clone(),
             value: b"normal-phase".to_vec(),
         };
-        let current = vec![RevisionState::missing(Revision::ZERO)];
+        let current = vec![ExpectedState::missing(Revision::ZERO)];
         let actual = vec![RevisionState::present(
             b"normal-phase".to_vec(),
             Revision::new(11),
@@ -1356,7 +1769,10 @@ mod tests {
         // The exact verification model is only valid after this state update.
         let mut model = ReferenceModel::default();
         model.apply(tenant, document.clone(), actual[0].clone());
-        assert_eq!(model.state(tenant, &document), actual[0]);
+        assert_eq!(
+            model.state(tenant, &document),
+            ExpectedState::present(b"normal-phase", Revision::new(11))
+        );
     }
 
     #[test]
@@ -1380,12 +1796,12 @@ mod tests {
             ],
         };
         let keys = vec![first, second];
-        let current = vec![RevisionState::missing(Revision::ZERO); 2];
+        let current = vec![ExpectedState::missing(Revision::ZERO); 2];
         let all = vec![
             RevisionState::present(b"first".to_vec(), Revision::new(10)),
             RevisionState::present(b"second".to_vec(), Revision::new(10)),
         ];
-        let partial = vec![all[0].clone(), current[1].clone()];
+        let partial = vec![all[0].clone(), RevisionState::missing(Revision::ZERO)];
         assert_eq!(
             reconcile_unknown_operations(std::slice::from_ref(&operation), &keys, &current, &all)
                 .unwrap(),

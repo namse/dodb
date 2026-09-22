@@ -25,10 +25,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 use dodb_soak::{
-    DeterministicRng, GeneratedOperation, LatencyStats, OperationGenerator, OperationRecord,
-    PlannedMutation, PlannedMutationKind, RecentOperations, ReferenceModel, ResourceSample,
-    TrendDiagnostic, UnknownMutationResolution, WorkloadConfig, parse_event_lines,
-    reconcile_unknown_operations, trend_diagnostic,
+    DeterministicRng, ExpectedDocument, ExpectedState, GeneratedOperation, LatencyStats,
+    OperationGenerator, OperationRecord, PlannedMutation, PlannedMutationKind, RecentOperations,
+    ReferenceModel, ResourceSample, TrendDiagnostic, UnknownMutationResolution, WorkloadConfig,
+    parse_event_lines, reconcile_unknown_operations, trend_diagnostic,
 };
 
 #[global_allocator]
@@ -142,9 +142,9 @@ impl HarnessConfig {
         }
         if !matches!(
             config.phase.as_str(),
-            "all" | "steady" | "bounded" | "contention" | "crash"
+            "all" | "growth" | "steady" | "bounded" | "contention" | "crash"
         ) {
-            return Err("--phase must be all, steady, bounded, contention, or crash".to_owned());
+            return Err("--phase must be all, growth, bounded, contention, or crash".to_owned());
         }
         if config.hot_percent.is_some_and(|value| value > 100) {
             return Err("--hot-percent must be between 0 and 100".to_owned());
@@ -153,6 +153,9 @@ impl HarnessConfig {
     }
 
     fn normalize(&mut self) {
+        if self.phase == "steady" {
+            self.phase = "growth".to_owned();
+        }
         if self.tenant_count == 0 {
             self.tenant_count = if self.profile == "accelerated" { 16 } else { 4 };
         }
@@ -167,7 +170,7 @@ impl HarnessConfig {
         if let Some(duration) = self.duration_override {
             return if self.phase == "all" {
                 vec![
-                    ("steady", duration),
+                    ("growth", duration),
                     ("bounded", duration),
                     ("contention", duration),
                     ("crash", duration),
@@ -178,14 +181,14 @@ impl HarnessConfig {
         }
         let durations = if self.profile == "accelerated" {
             [
-                ("steady", 8 * 60),
+                ("growth", 8 * 60),
                 ("bounded", 6 * 60),
                 ("contention", 8 * 60),
                 ("crash", 10 * 60),
             ]
         } else {
             [
-                ("steady", 30),
+                ("growth", 30),
                 ("bounded", 30),
                 ("contention", 30),
                 ("crash", 45),
@@ -201,11 +204,11 @@ impl HarnessConfig {
 
 fn phase_name(phase: &str) -> &'static str {
     match phase {
-        "steady" => "steady",
+        "growth" | "steady" => "growth",
         "bounded" => "bounded",
         "contention" => "contention",
         "crash" => "crash",
-        _ => "steady",
+        _ => "growth",
     }
 }
 
@@ -246,7 +249,7 @@ fn print_help() {
     println!(
         "dodb-soak --profile smoke|accelerated --seed N [options]\n\
          \nOptions:\n\
-         --phase all|steady|bounded|contention|crash\n\
+         --phase all|growth|bounded|contention|crash\n\
          --duration 10s|10m (override each selected phase)\n\
          --output DIR --data-dir DIR --tenants N --concurrency N\n\
          --hot-percent N --weights GET,PUT,DELETE,QUERY,SCAN,TRANSACT_GET,TRANSACT\n\
@@ -662,9 +665,24 @@ impl RunState {
 struct PhaseKeyCounts {
     initial: Option<usize>,
     final_count: Option<usize>,
+    initial_database_bytes: Option<u64>,
+    final_database_bytes: Option<u64>,
+    database_bytes_peak: Option<u64>,
+    rss_initial: Option<u64>,
+    rss_final: Option<u64>,
+    rss_peak: Option<u64>,
+    virtual_memory_initial: Option<u64>,
+    virtual_memory_final: Option<u64>,
+    virtual_memory_peak: Option<u64>,
+    operations_initial: Option<u64>,
+    operations_final: Option<u64>,
+    checkpoints_initial: Option<u64>,
+    checkpoints_final: Option<u64>,
+    reference_retained_value_bytes_initial: Option<usize>,
+    reference_retained_value_bytes_final: Option<usize>,
 }
 
-fn record_phase_key_count(state: &Arc<RunState>, phase: &str, initial: bool) {
+fn record_phase_key_count(state: &Arc<RunState>, phase: &str, initial: bool, data_dir: &Path) {
     let Ok(model) = state.model.lock() else {
         return;
     };
@@ -674,8 +692,16 @@ fn record_phase_key_count(state: &Arc<RunState>, phase: &str, initial: bool) {
     let entry = counts.entry(phase.to_owned()).or_default();
     if initial {
         entry.initial = Some(model.total_key_count());
+        entry.initial_database_bytes = Some(directory_bytes(data_dir, "db"));
+        entry.operations_initial = Some(state.counters.total_operations.load(Ordering::Relaxed));
+        entry.checkpoints_initial = Some(state.counters.checkpoints.load(Ordering::Relaxed));
+        entry.reference_retained_value_bytes_initial = Some(model.retained_value_bytes());
     } else {
         entry.final_count = Some(model.total_key_count());
+        entry.final_database_bytes = Some(directory_bytes(data_dir, "db"));
+        entry.operations_final = Some(state.counters.total_operations.load(Ordering::Relaxed));
+        entry.checkpoints_final = Some(state.counters.checkpoints.load(Ordering::Relaxed));
+        entry.reference_retained_value_bytes_final = Some(model.retained_value_bytes());
     }
 }
 
@@ -732,8 +758,16 @@ fn workload_config(config: &HarnessConfig, phase: &str) -> WorkloadConfig {
         workload.operation_weights = [15, 25, 20, 10, 5, 10, 15];
         workload.max_transaction_mutations = 4;
     } else if phase == "contention" {
+        workload.bounded_keyspace = true;
+        workload.wide_key_count = 64;
         workload.hot_percent = 95;
-        workload.operation_weights = [15, 15, 10, 5, 5, 20, 30];
+        workload.operation_weights = [10, 15, 10, 5, 5, 15, 40];
+        workload.max_transaction_mutations = 4;
+    } else if phase == "crash" {
+        workload.bounded_keyspace = true;
+        workload.wide_key_count = 128;
+        workload.hot_percent = 85;
+        workload.operation_weights = [15, 20, 15, 10, 5, 10, 25];
         workload.max_transaction_mutations = 4;
     }
     if let Some(hot_percent) = config.hot_percent {
@@ -759,7 +793,7 @@ fn before_states(
     model: &ReferenceModel,
     tenant: TenantId,
     keys: &[DocumentKey],
-) -> Vec<(DocumentKey, RevisionState)> {
+) -> Vec<(DocumentKey, ExpectedState)> {
     keys.iter()
         .map(|key| (key.clone(), model.state(tenant, key)))
         .collect()
@@ -769,7 +803,7 @@ fn transaction_request(
     model: &ReferenceModel,
     tenant: TenantId,
     mutations: &[PlannedMutation],
-) -> (TransactionRequest, Vec<(DocumentKey, RevisionState)>) {
+) -> (TransactionRequest, Vec<(DocumentKey, ExpectedState)>) {
     let keys = mutations
         .iter()
         .map(|mutation| mutation.key.clone())
@@ -926,12 +960,14 @@ fn validate_documents(
         {
             return Err("response violated cursor or partition-key semantics".to_owned());
         }
-        let known_at_last_model_view = model.knows_state(
-            tenant,
-            &document.key,
-            &RevisionState::present(document.value.clone(), document.revision),
-        );
-        let _ = known_at_last_model_view;
+        let actual = RevisionState::present(document.value.clone(), document.revision);
+        let known_at_last_model_view = model.matches_state(tenant, &document.key, &actual);
+        if !known_at_last_model_view {
+            return Err(format!(
+                "read returned an unrecognized value or revision for key {:?}",
+                document.key
+            ));
+        }
     }
     Ok(())
 }
@@ -986,9 +1022,40 @@ async fn execute_operation(
 ) -> Result<(), String> {
     let started = Instant::now();
     let tenant = operation.tenant();
+    if let Ok(mut model) = state.model.lock() {
+        match &operation {
+            GeneratedOperation::Put { key, value, .. } => {
+                model.record_expected_put(tenant, key.clone(), value);
+            }
+            GeneratedOperation::Delete { key, .. } => {
+                model.record_expected_delete(tenant, key.clone());
+            }
+            GeneratedOperation::Transact { mutations, .. } => {
+                for mutation in mutations {
+                    if matches!(mutation.kind, PlannedMutationKind::Put) {
+                        model.record_expected_put(tenant, mutation.key.clone(), &mutation.value);
+                    } else {
+                        model.record_expected_delete(tenant, mutation.key.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     let result = match &operation {
         GeneratedOperation::Get { key, .. } => match client.get(key.clone()).await {
-            Ok(_) => Ok("ok".to_owned()),
+            Ok(actual) => state
+                .model
+                .lock()
+                .map_err(|_| "reference model lock poisoned".to_owned())
+                .and_then(|model| {
+                    model
+                        .matches_state(tenant, key, &actual)
+                        .then_some("ok".to_owned())
+                        .ok_or_else(|| {
+                            format!("Get returned an unrecognized value or revision for {key:?}")
+                        })
+                }),
             Err(error) => handle_non_mutation_error(state, error, allow_transport_errors),
         },
         GeneratedOperation::Put { key, value, .. } => {
@@ -1079,7 +1146,20 @@ async fn execute_operation(
                     if actual.len() != keys.len() {
                         Err("TransactGet returned the wrong number of states".to_owned())
                     } else {
-                        Ok("ok".to_owned())
+                        state
+                            .model
+                            .lock()
+                            .map_err(|_| "reference model lock poisoned".to_owned())
+                            .and_then(|model| {
+                                keys.iter()
+                                    .zip(actual.iter())
+                                    .all(|(key, state)| model.matches_state(tenant, key, state))
+                                    .then_some("ok".to_owned())
+                                    .ok_or_else(|| {
+                                        "TransactGet returned an unrecognized value or revision"
+                                            .to_owned()
+                                    })
+                            })
                     }
                 }
                 Err(error) => handle_non_mutation_error(state, error, allow_transport_errors),
@@ -1320,7 +1400,7 @@ async fn spawn_workload(
 
 fn phase_seed(phase: &str) -> u64 {
     match phase {
-        "steady" => 0x1111,
+        "growth" | "steady" => 0x1111,
         "bounded" => 0x4444,
         "contention" => 0x2222,
         "crash" => 0x3333,
@@ -1673,7 +1753,12 @@ async fn verify_full(
                 break;
             }
             let end = (offset + page.len()).min(expected.len());
-            if end - offset != page.len() || page != expected[offset..end] {
+            if end - offset != page.len()
+                || page
+                    .iter()
+                    .zip(&expected[offset..end])
+                    .any(|(actual, expected)| !expected_document_matches(actual, expected))
+            {
                 return Err(format!(
                     "full scan mismatch for tenant {tenant_number} at offset {offset}"
                 ));
@@ -1703,7 +1788,12 @@ async fn verify_full(
                     break;
                 }
                 let end = (query_offset + page.len()).min(partition.len());
-                if end - query_offset != page.len() || page != partition[query_offset..end] {
+                if end - query_offset != page.len()
+                    || page
+                        .iter()
+                        .zip(&partition[query_offset..end])
+                        .any(|(actual, expected)| !expected_document_matches(actual, expected))
+                {
                     return Err(format!("query mismatch for tenant {tenant_number}"));
                 }
                 query_cursor = page.last().map(|document| document.key.sk.clone());
@@ -1720,7 +1810,7 @@ async fn verify_full(
                 return Err("TransactGet verification length mismatch".to_owned());
             }
             for (key, state_value) in chunk.iter().zip(actual.iter()) {
-                if *state_value != model.state(tenant, key) {
+                if !model.matches_state(tenant, key, state_value) {
                     return Err(format!("TransactGet mismatch for tenant {tenant_number}"));
                 }
             }
@@ -1728,6 +1818,12 @@ async fn verify_full(
     }
     state.counters.verifications.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+fn expected_document_matches(actual: &Document, expected: &ExpectedDocument) -> bool {
+    actual.key == expected.key
+        && actual.revision == expected.revision
+        && expected.value.matches(&actual.value)
 }
 
 async fn reconcile_unknown(
@@ -1939,11 +2035,7 @@ async fn run_normal_phase(
     )
     .await?;
     for tenant in 1..=config.tenant_count {
-        let marker = if phase == "bounded" {
-            "bounded".to_owned()
-        } else {
-            format!("{}-{cycle}", config.seed)
-        };
+        let marker = format!("{phase}-aba");
         run_aba_probe(
             state,
             &connection.for_tenant(TenantId::new(tenant)),
@@ -2045,13 +2137,7 @@ async fn run_crash_phase(
         )
         .await?;
         let tenant = TenantId::new((cycle % config.tenant_count) + 1);
-        run_aba_probe(
-            state,
-            &connection.for_tenant(tenant),
-            tenant,
-            &format!("{}-crash-{cycle}", config.seed),
-        )
-        .await?;
+        run_aba_probe(state, &connection.for_tenant(tenant), tenant, "crash-aba").await?;
         let (sample_stop, sample_receiver) = watch::channel(false);
         let sampler = tokio::spawn(sample_resources(
             Arc::clone(state),
@@ -2281,21 +2367,21 @@ fn build_report(
         }
     }
     let mut resource_trend_warnings_by_phase = BTreeMap::new();
-    for (phase, phase_samples) in samples_by_phase {
+    for (phase, phase_samples) in &samples_by_phase {
         let warnings = [
-            trend(&phase_samples, "rss", |sample| sample.rss_bytes),
-            trend(&phase_samples, "virtual_memory", |sample| {
+            trend(phase_samples, "rss", |sample| sample.rss_bytes),
+            trend(phase_samples, "virtual_memory", |sample| {
                 sample.virtual_bytes
             }),
-            trend(&phase_samples, "file_descriptors", |sample| sample.fd_count),
-            trend(&phase_samples, "active_connections", |sample| {
+            trend(phase_samples, "file_descriptors", |sample| sample.fd_count),
+            trend(phase_samples, "active_connections", |sample| {
                 sample.active_connections
             }),
-            trend(&phase_samples, "active_streams", |sample| {
+            trend(phase_samples, "active_streams", |sample| {
                 sample.active_streams
             }),
-            trend(&phase_samples, "wal_bytes", |sample| Some(sample.wal_bytes)),
-            trend(&phase_samples, "database_bytes", |sample| {
+            trend(phase_samples, "wal_bytes", |sample| Some(sample.wal_bytes)),
+            trend(phase_samples, "database_bytes", |sample| {
                 Some(sample.database_bytes)
             }),
         ]
@@ -2303,7 +2389,7 @@ fn build_report(
         .filter(|diagnostic| diagnostic.warning)
         .collect::<Vec<_>>();
         if !warnings.is_empty() {
-            resource_trend_warnings_by_phase.insert(phase, warnings);
+            resource_trend_warnings_by_phase.insert(phase.clone(), warnings);
         }
     }
     let trend_warnings = resource_trend_warnings_by_phase
@@ -2315,6 +2401,20 @@ fn build_report(
         .lock()
         .map(|counts| counts.clone())
         .unwrap_or_default();
+    let mut phase_key_counts = phase_key_counts;
+    for (phase, phase_samples) in &samples_by_phase {
+        let entry = phase_key_counts.entry(phase.clone()).or_default();
+        let rss = metric_summary(phase_samples, |sample| sample.rss_bytes);
+        let virtual_memory = metric_summary(phase_samples, |sample| sample.virtual_bytes);
+        let database = metric_summary(phase_samples, |sample| Some(sample.database_bytes));
+        entry.rss_initial = rss.initial;
+        entry.rss_final = rss.final_value;
+        entry.rss_peak = rss.peak;
+        entry.virtual_memory_initial = virtual_memory.initial;
+        entry.virtual_memory_final = virtual_memory.final_value;
+        entry.virtual_memory_peak = virtual_memory.peak;
+        entry.database_bytes_peak = database.peak;
+    }
     let (
         server_requests,
         server_connections,
@@ -2574,6 +2674,28 @@ fn print_report(report: &Report) {
             bounded.initial, bounded.final_count
         );
     }
+    for (phase, summary) in &report.phase_key_counts {
+        println!(
+            "phase={phase} keys={:?}->{:?} db_bytes={:?}->{:?} db_peak={:?} rss={:?}->{:?} rss_peak={:?} vm={:?}->{:?} vm_peak={:?} operations={:?}->{:?} checkpoints={:?}->{:?} reference_retained_value_bytes={:?}->{:?}",
+            summary.initial,
+            summary.final_count,
+            summary.initial_database_bytes,
+            summary.final_database_bytes,
+            summary.database_bytes_peak,
+            summary.rss_initial,
+            summary.rss_final,
+            summary.rss_peak,
+            summary.virtual_memory_initial,
+            summary.virtual_memory_final,
+            summary.virtual_memory_peak,
+            summary.operations_initial,
+            summary.operations_final,
+            summary.checkpoints_initial,
+            summary.checkpoints_final,
+            summary.reference_retained_value_bytes_initial,
+            summary.reference_retained_value_bytes_final
+        );
+    }
     if let Some(failure) = &report.failure {
         println!("FAILURE: {failure}");
     } else {
@@ -2602,7 +2724,7 @@ async fn run(config: HarnessConfig) -> Result<(), BoxError> {
         if state.abort.load(Ordering::Relaxed) {
             break;
         }
-        record_phase_key_count(&state, phase, true);
+        record_phase_key_count(&state, phase, true, &data_dir);
         let phase_result = match phase {
             "crash" => {
                 run_crash_phase(
@@ -2635,7 +2757,7 @@ async fn run(config: HarnessConfig) -> Result<(), BoxError> {
             state.fail(format!("phase {phase} failed: {error}"));
             break;
         }
-        record_phase_key_count(&state, phase, false);
+        record_phase_key_count(&state, phase, false, &data_dir);
     }
     let pending_count = state
         .pending
@@ -2828,5 +2950,24 @@ mod tests {
         }
         let parsed = parse_event_lines(&fs::read_to_string(path).unwrap(), false).unwrap();
         assert_eq!(parsed.metrics.len(), 8);
+    }
+
+    #[test]
+    fn phase_workload_configs_keep_explicit_keyspace_bounds() {
+        let config = HarnessConfig {
+            tenant_count: 4,
+            ..HarnessConfig::default()
+        };
+        let growth = workload_config(&config, "growth");
+        assert!(!growth.bounded_keyspace);
+        assert!(growth.growth_fill_operations >= 4 * u64::from(growth.growth_target_key_count));
+        assert!(growth.maximum_generated_key_count() < 5_000);
+
+        for (phase, wide_key_count) in [("bounded", 256), ("contention", 64), ("crash", 128)] {
+            let workload = workload_config(&config, phase);
+            assert!(workload.bounded_keyspace, "{phase} must be bounded");
+            assert_eq!(workload.wide_key_count, wide_key_count);
+            assert!(workload.maximum_generated_key_count() < 2_000);
+        }
     }
 }
