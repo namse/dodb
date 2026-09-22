@@ -13,7 +13,7 @@ pub mod transaction;
 pub use error::{Error, Result};
 pub use identifiers::{Lsn, PageId, Revision, ShardEpoch, ShardId, TenantId, TxnId};
 pub use key::{DocumentKey, KeyCodecError, PrimaryKey, SortKey};
-pub use revision::RevisionState;
+pub use revision::{ObservedState, RevisionState};
 pub use transaction::{
     ConditionExpectation, ReadSet, TransactionCondition, TransactionConflict, TransactionMutation,
     TransactionRequest, TransactionResult, WriteIntent, WriteSet,

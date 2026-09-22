@@ -16,9 +16,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use dodb_core::{
-    DocumentKey, Error, Lsn, PageId, PrimaryKey, Result, Revision, RevisionState, ShardEpoch,
-    ShardId, SortKey, TenantId, TransactionCondition, TransactionConflict, TransactionMutation,
-    TransactionRequest, TransactionResult,
+    DocumentKey, Error, Lsn, ObservedState, PageId, PrimaryKey, Result, Revision, RevisionState,
+    ShardEpoch, ShardId, SortKey, TenantId, TransactionCondition, TransactionConflict,
+    TransactionMutation, TransactionRequest, TransactionResult,
 };
 
 use self::cache::PageCache;
@@ -245,13 +245,18 @@ struct ResponseBudget {
 }
 
 impl ResponseBudget {
-    fn new(maximum: usize) -> Self {
-        Self {
+    fn new(maximum: usize) -> Result<Self> {
+        if maximum < RESPONSE_WIRE_OVERHEAD {
+            return Err(Error::response_too_large(format!(
+                "response envelope exceeds {maximum} bytes"
+            )));
+        }
+        Ok(Self {
             maximum_wire: maximum,
             maximum_memory: maximum.saturating_add(RESPONSE_MEMORY_OVERHEAD),
-            used_wire: RESPONSE_WIRE_OVERHEAD.min(maximum),
+            used_wire: RESPONSE_WIRE_OVERHEAD,
             used_memory: 0,
-        }
+        })
     }
 
     fn reserve(&mut self, wire: usize, memory: usize) -> Result<()> {
@@ -709,9 +714,22 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             )));
         }
         let mut overlay = Overlay::new(self);
-        let mut budget = ResponseBudget::new(max_response_bytes);
+        let mut budget = ResponseBudget::new(max_response_bytes)?;
         keys.iter()
             .map(|key| overlay.get_state_with_budget(key, &mut budget))
+            .collect()
+    }
+
+    /// Observes point-key presence and revisions without materializing values.
+    pub fn observe(&mut self, keys: &[DocumentKey]) -> Result<Vec<ObservedState>> {
+        if let Some(message) = &self.broken {
+            return Err(Error::durability(format!(
+                "storage shard is not serving after an uncertain persistence failure: {message}"
+            )));
+        }
+        let mut overlay = Overlay::new(self);
+        keys.iter()
+            .map(|key| overlay.get_observed_state(key))
             .collect()
     }
 
@@ -725,7 +743,7 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         max_response_bytes: usize,
     ) -> Result<PreparedBatch> {
         let mut overlay = Overlay::new(self);
-        let mut budget = ResponseBudget::new(max_response_bytes);
+        let mut budget = ResponseBudget::new(max_response_bytes)?;
         let mut responses = Vec::with_capacity(requests.len());
         for request in requests {
             responses.push(overlay.execute_with_budget(request, &mut budget)?);
@@ -1337,7 +1355,7 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
             self.validate_transaction_mutation(mutation)?;
         }
         for condition in &request.conditions {
-            let actual = self.get_state(condition.key())?;
+            let actual = self.get_observed_state(condition.key())?;
             let satisfied = match condition {
                 TransactionCondition::RevisionEquals {
                     expected_revision, ..
@@ -1573,11 +1591,6 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
         })
     }
 
-    fn get_state(&mut self, key: &DocumentKey) -> Result<RevisionState> {
-        let mut budget = ResponseBudget::new(usize::MAX);
-        self.get_state_with_budget(key, &mut budget)
-    }
-
     fn get_state_with_budget(
         &mut self,
         key: &DocumentKey,
@@ -1603,6 +1616,21 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
                 budget.reserve_state(0)?;
                 Ok(RevisionState::missing(entry.revision))
             }
+        }
+    }
+
+    fn get_observed_state(&mut self, key: &DocumentKey) -> Result<ObservedState> {
+        let encoded = key.encode();
+        validate_encoded_key(&encoded)?;
+        let leaf_id = self.find_leaf(&encoded)?.0;
+        let leaf = self.leaf(leaf_id)?;
+        let Some(entry) = leaf.entries.iter().find(|entry| entry.key == encoded) else {
+            return Ok(ObservedState::missing(Revision::ZERO));
+        };
+        if entry.value.is_some() {
+            Ok(ObservedState::present(entry.revision))
+        } else {
+            Ok(ObservedState::missing(entry.revision))
         }
     }
 

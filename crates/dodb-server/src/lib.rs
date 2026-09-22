@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dodb_core::{
-    DocumentKey, Error, RevisionState, ShardId, TenantId, TransactionCondition,
+    DocumentKey, Error, ObservedState, RevisionState, ShardId, TenantId, TransactionCondition,
     TransactionConflict, TransactionRequest,
 };
 use dodb_protocol::{
@@ -336,14 +336,10 @@ async fn accept_streams<S: DodbService + 'static>(
     metrics: ServerMetrics,
 ) {
     loop {
-        let stream_permit = match tokio::select! {
-            permit = request_slots.clone().acquire_owned() => permit,
+        let stream = match tokio::select! {
+            stream = connection.accept_bi() => stream,
             _ = connection.closed() => return,
         } {
-            Ok(permit) => permit,
-            Err(_) => return,
-        };
-        let stream = match connection.accept_bi().await {
             Ok(stream) => stream,
             Err(_) => {
                 metrics
@@ -352,6 +348,13 @@ async fn accept_streams<S: DodbService + 'static>(
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
+        };
+        let stream_permit = match tokio::select! {
+            permit = request_slots.clone().acquire_owned() => permit,
+            _ = connection.closed() => return,
+        } {
+            Ok(permit) => permit,
+            Err(_) => return,
         };
         let service = Arc::clone(&service);
         let metrics = metrics.clone();
@@ -623,7 +626,12 @@ impl LocalTenantService {
                         BatchResponse::Get(state) => state,
                         _ => return Err(Error::invariant("local get returned the wrong response")),
                     },
-                    None => RevisionState::missing(dodb_core::Revision::ZERO),
+                    None => {
+                        let response =
+                            Response::Get(RevisionState::missing(dodb_core::Revision::ZERO));
+                        ensure_synthesized_response_budget(&response, budget.max_response_bytes)?;
+                        return Ok(response);
+                    }
                 };
                 Ok(Response::Get(state))
             }
@@ -679,7 +687,11 @@ impl LocalTenantService {
                             ));
                         }
                     },
-                    None => Vec::new(),
+                    None => {
+                        let response = Response::Query(Vec::new());
+                        ensure_synthesized_response_budget(&response, budget.max_response_bytes)?;
+                        return Ok(response);
+                    }
                 };
                 Ok(Response::Query(
                     rows.into_iter().map(storage_document).collect(),
@@ -705,7 +717,11 @@ impl LocalTenantService {
                             return Err(Error::invariant("local scan returned the wrong response"));
                         }
                     },
-                    None => Vec::new(),
+                    None => {
+                        let response = Response::Scan(Vec::new());
+                        ensure_synthesized_response_budget(&response, budget.max_response_bytes)?;
+                        return Ok(response);
+                    }
                 };
                 Ok(Response::Scan(
                     rows.into_iter().map(storage_document).collect(),
@@ -733,7 +749,7 @@ impl LocalTenantService {
         &self,
         tenant: TenantId,
         request: TransactionRequest,
-        budget: ExecutionBudget,
+        _budget: ExecutionBudget,
     ) -> Result<Response, Error> {
         if request.mutations.is_empty() {
             validate_condition_keys(&request.conditions)?;
@@ -747,7 +763,7 @@ impl LocalTenantService {
                 .iter()
                 .map(|condition| condition.key().clone())
                 .collect::<Vec<_>>();
-            let states = self.read_states(tenant, &keys, budget).await?;
+            let states = self.observe_states(tenant, &keys).await?;
             let state_map = keys.into_iter().zip(states).collect::<BTreeMap<_, _>>();
             for condition in &request.conditions {
                 let actual = state_map
@@ -757,7 +773,7 @@ impl LocalTenantService {
                     return Err(Error::conflict(TransactionConflict {
                         key: condition.key().clone(),
                         expected: condition.expectation(),
-                        actual: actual.clone(),
+                        actual: *actual,
                     }));
                 }
             }
@@ -784,9 +800,28 @@ impl LocalTenantService {
                     .transact_get_with_response_budget(keys.to_vec(), budget.max_response_bytes)
                     .await
             }
+            None => {
+                let states = keys
+                    .iter()
+                    .map(|_| RevisionState::missing(dodb_core::Revision::ZERO))
+                    .collect::<Vec<_>>();
+                let response = Response::TransactGet(states.clone());
+                ensure_synthesized_response_budget(&response, budget.max_response_bytes)?;
+                Ok(states)
+            }
+        }
+    }
+
+    async fn observe_states(
+        &self,
+        tenant: TenantId,
+        keys: &[DocumentKey],
+    ) -> Result<Vec<ObservedState>, Error> {
+        match self.read_shard(tenant).await? {
+            Some(shard) => shard.observe(keys.to_vec()).await,
             None => Ok(keys
                 .iter()
-                .map(|_| RevisionState::missing(dodb_core::Revision::ZERO))
+                .map(|_| ObservedState::missing(dodb_core::Revision::ZERO))
                 .collect()),
         }
     }
@@ -866,6 +901,20 @@ fn storage_document(document: dodb_storage::Document) -> Document {
     }
 }
 
+fn ensure_synthesized_response_budget(response: &Response, maximum: usize) -> Result<(), Error> {
+    let limits = ProtocolLimits {
+        max_response_frame_size: maximum,
+        ..ProtocolLimits::default()
+    };
+    encode_response(&ResponseEnvelope::Success(response.clone()), limits)
+        .map(|_| ())
+        .map_err(|error| {
+            Error::response_too_large(format!(
+                "synthesized response exceeds the configured response limit: {error}"
+            ))
+        })
+}
+
 /// Returns the deterministic logical identity for a `(tenant, shard)` pair.
 ///
 /// The storage UUID is only 128 bits, so it is a domain-separated digest rather
@@ -906,7 +955,7 @@ fn validate_condition_keys(conditions: &[TransactionCondition]) -> Result<(), Er
     Ok(())
 }
 
-fn condition_matches(condition: &TransactionCondition, actual: &RevisionState) -> bool {
+fn condition_matches(condition: &TransactionCondition, actual: &ObservedState) -> bool {
     match condition {
         TransactionCondition::RevisionEquals {
             expected_revision, ..

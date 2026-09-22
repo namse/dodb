@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::{DocumentKey, Lsn, Revision, RevisionState};
+use crate::{DocumentKey, Lsn, ObservedState, Revision};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WriteIntent {
@@ -123,7 +123,7 @@ pub struct TransactionResult {
 pub struct TransactionConflict {
     pub key: DocumentKey,
     pub expected: ConditionExpectation,
-    pub actual: RevisionState,
+    pub actual: ObservedState,
 }
 
 impl fmt::Display for TransactionConflict {

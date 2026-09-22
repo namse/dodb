@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use dodb_core::{
-    DocumentKey, Error, PrimaryKey, Result, Revision, RevisionState, SortKey, TransactionMutation,
-    TransactionRequest, TransactionResult,
+    DocumentKey, Error, ObservedState, PrimaryKey, Result, Revision, RevisionState, SortKey,
+    TransactionMutation, TransactionRequest, TransactionResult,
 };
 
 use super::format::{MAX_OVERFLOW_PAGES, PageData, ValueRef};
@@ -187,6 +187,15 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
         }
     }
 
+    pub async fn observe(&self, keys: Vec<DocumentKey>) -> Result<Vec<ObservedState>> {
+        match self.send(CoordinatorOperation::Observe(keys)).await? {
+            CoordinatorResponse::Observe(result) => Ok(result),
+            _ => Err(Error::invariant(
+                "coordinator returned the wrong observed state response",
+            )),
+        }
+    }
+
     pub async fn checkpoint(&self) -> Result<CheckpointReport> {
         match self.send(CoordinatorOperation::Checkpoint).await? {
             CoordinatorResponse::Checkpoint(report) => Ok(report),
@@ -220,7 +229,10 @@ impl<F: DurableFile + Send + 'static, W: DurableFile + Send + 'static> AsyncShar
             ))));
         }
         let view = state.view.as_ref()?;
-        let mut budget = super::ResponseBudget::new(max_response_bytes);
+        let mut budget = match super::ResponseBudget::new(max_response_bytes) {
+            Ok(budget) => budget,
+            Err(error) => return Some(Err(error)),
+        };
         let result = match request {
             BatchRequest::Get { key } => view
                 .get_with_budget(key, &mut budget)
@@ -319,6 +331,7 @@ enum CoordinatorOperation {
         keys: Vec<DocumentKey>,
         max_response_bytes: usize,
     },
+    Observe(Vec<DocumentKey>),
     Checkpoint,
     Snapshot(PathBuf),
 }
@@ -327,6 +340,7 @@ enum CoordinatorResponse {
     Batch(BatchResponse),
     Transaction(TransactionResult),
     TransactGet(Vec<RevisionState>),
+    Observe(Vec<ObservedState>),
     Checkpoint(CheckpointReport),
     Snapshot(SnapshotReport),
 }
@@ -613,6 +627,9 @@ fn process_segment<F: DurableFile, W: DurableFile>(
             } => store
                 .transact_get_with_response_budget(keys, *max_response_bytes)
                 .map(CoordinatorResponse::TransactGet),
+            CoordinatorOperation::Observe(keys) => {
+                store.observe(keys).map(CoordinatorResponse::Observe)
+            }
             CoordinatorOperation::Checkpoint => {
                 store.checkpoint().map(CoordinatorResponse::Checkpoint)
             }
@@ -759,6 +776,10 @@ fn operation_size(operation: &CoordinatorOperation) -> usize {
             }))
             .fold(0usize, usize::saturating_add),
         CoordinatorOperation::TransactGet { keys, .. } => keys
+            .iter()
+            .map(|key| key.encode().len())
+            .fold(0usize, usize::saturating_add),
+        CoordinatorOperation::Observe(keys) => keys
             .iter()
             .map(|key| key.encode().len())
             .fold(0usize, usize::saturating_add),

@@ -1,8 +1,8 @@
 use std::fmt;
 
 use dodb_core::{
-    ConditionExpectation, DocumentKey, Error, Revision, RevisionState, TransactionCondition,
-    TransactionConflict, TransactionMutation, TransactionRequest,
+    ConditionExpectation, DocumentKey, Error, ObservedState, Revision, RevisionState,
+    TransactionCondition, TransactionConflict, TransactionMutation, TransactionRequest,
 };
 use dodb_service::{Document, Request, Response, TransactionOutcome};
 
@@ -185,7 +185,7 @@ pub struct ApplicationError {
 pub struct ConflictDetails {
     pub key: DocumentKey,
     pub expected: ConditionExpectation,
-    pub actual: RevisionState,
+    pub actual: ObservedState,
 }
 
 impl ApplicationError {
@@ -289,7 +289,7 @@ impl From<&TransactionConflict> for ConflictDetails {
         Self {
             key: conflict.key.clone(),
             expected: conflict.expected,
-            actual: conflict.actual.clone(),
+            actual: conflict.actual,
         }
     }
 }
@@ -785,6 +785,27 @@ fn decode_revision_state(
     }
 }
 
+fn encode_observed_state(writer: &mut Writer, state: ObservedState) {
+    match state {
+        ObservedState::Present { revision } => {
+            writer.u8(0);
+            writer.u64(revision.get());
+        }
+        ObservedState::Missing { revision } => {
+            writer.u8(1);
+            writer.u64(revision.get());
+        }
+    }
+}
+
+fn decode_observed_state(reader: &mut Reader<'_>) -> Result<ObservedState, ProtocolError> {
+    match reader.u8()? {
+        0 => Ok(ObservedState::present(Revision::new(reader.u64()?))),
+        1 => Ok(ObservedState::missing(Revision::new(reader.u64()?))),
+        other => Err(ProtocolError::InvalidRevisionState(other)),
+    }
+}
+
 fn encode_conditions(
     writer: &mut Writer,
     conditions: &[TransactionCondition],
@@ -1073,7 +1094,8 @@ fn encode_conflict(
         ConditionExpectation::Exists => writer.u8(1),
         ConditionExpectation::NotExists => writer.u8(2),
     }
-    encode_revision_state(writer, &conflict.actual, limits)
+    encode_observed_state(writer, conflict.actual);
+    Ok(())
 }
 
 fn decode_conflict(
@@ -1090,7 +1112,7 @@ fn decode_conflict(
     Ok(ConflictDetails {
         key,
         expected,
-        actual: decode_revision_state(reader, limits)?,
+        actual: decode_observed_state(reader)?,
     })
 }
 
@@ -1366,7 +1388,7 @@ mod tests {
             conflict: Some(ConflictDetails {
                 key: key(&[1], &[2]),
                 expected: ConditionExpectation::RevisionEquals(Revision::new(8)),
-                actual: RevisionState::missing(Revision::new(9)),
+                actual: ObservedState::missing(Revision::new(9)),
             }),
         };
         let encoded = encode_response(&ResponseEnvelope::Error(error.clone()), limits).unwrap();
@@ -1478,7 +1500,7 @@ mod tests {
         let conflict = TransactionConflict {
             key: key(&[1], &[2]),
             expected: ConditionExpectation::Exists,
-            actual: RevisionState::missing(Revision::new(10)),
+            actual: ObservedState::missing(Revision::new(10)),
         };
         let mapped = ApplicationError::from_core(&Error::conflict(conflict.clone()));
         assert_eq!(mapped.kind, ApplicationErrorKind::Conflict);

@@ -10,6 +10,34 @@ pub enum RevisionState {
     Missing { revision: Revision },
 }
 
+/// The committed presence and identity of one logical document key without
+/// materializing its value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservedState {
+    Present { revision: Revision },
+    Missing { revision: Revision },
+}
+
+impl ObservedState {
+    pub const fn present(revision: Revision) -> Self {
+        Self::Present { revision }
+    }
+
+    pub const fn missing(revision: Revision) -> Self {
+        Self::Missing { revision }
+    }
+
+    pub const fn revision(self) -> Revision {
+        match self {
+            Self::Present { revision } | Self::Missing { revision } => revision,
+        }
+    }
+
+    pub const fn is_missing(self) -> bool {
+        matches!(self, Self::Missing { .. })
+    }
+}
+
 impl RevisionState {
     pub fn present(value: impl Into<Vec<u8>>, revision: Revision) -> Self {
         Self::Present {
@@ -37,6 +65,17 @@ impl RevisionState {
 
     pub fn is_missing(&self) -> bool {
         matches!(self, Self::Missing { .. })
+    }
+
+    pub const fn observed(&self) -> ObservedState {
+        match self {
+            Self::Present { revision, .. } => ObservedState::Present {
+                revision: *revision,
+            },
+            Self::Missing { revision } => ObservedState::Missing {
+                revision: *revision,
+            },
+        }
     }
 }
 

@@ -166,7 +166,8 @@ cross-key snapshot promise for ordinary independent Gets, Query, or Scan.
 The wire error categories are InvalidRequest, Overloaded, Conflict,
 ResponseTooLarge, StorageFailure, Corruption, DurabilityFailure, Internal, and
 UnsupportedProtocol. Conflict includes the key, expected condition, and
-actual `Present(value, revision)` or `Missing(revision)` state. The category is
+actual `Present(revision)` or `Missing(revision)` observed state without a
+document value. The category is
 machine-readable; human-readable detail is supplementary.
 
 An application error response is distinct from a QUIC stream or connection

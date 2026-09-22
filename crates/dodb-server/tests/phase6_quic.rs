@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use dodb_client::{ClientError, ClientTlsConfig, DodbClient};
 use dodb_core::{
-    ConditionExpectation, DocumentKey, Error, Revision, RevisionState, TenantId,
+    ConditionExpectation, DocumentKey, Error, ObservedState, Revision, RevisionState, TenantId,
     TransactionCondition, TransactionMutation, TransactionRequest,
 };
 use dodb_server::{
@@ -146,6 +146,19 @@ async fn stop_server<S: DodbService + 'static>(
     client.close();
     server.shutdown().await;
     task.await.unwrap().unwrap();
+}
+
+async fn wait_for_active_connections<S: DodbService + 'static>(
+    server: &DodbServer<S>,
+    expected: u64,
+) {
+    for _ in 0..1_000 {
+        if server.metrics().snapshot().active_connections >= expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("server did not observe {expected} active connections");
 }
 
 async fn abruptly_disconnect(
@@ -316,7 +329,7 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
     match aba_conflict {
         ClientError::Application(error) => {
             let conflict = error.conflict.as_ref().unwrap();
-            assert_eq!(conflict.actual, RevisionState::missing(deleted_revision));
+            assert_eq!(conflict.actual, ObservedState::missing(deleted_revision));
         }
         other => panic!("unexpected ABA error: {other}"),
     }
@@ -452,6 +465,56 @@ async fn global_request_backpressure_preserves_unrelated_in_flight_streams() {
 }
 
 #[tokio::test]
+async fn idle_connection_does_not_hoard_global_request_capacity() {
+    let tls = test_tls();
+    let service = Arc::new(BlockingService {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        first_request: AtomicBool::new(false),
+    });
+    let server = Arc::new(
+        DodbServer::bind(
+            Arc::clone(&service),
+            DodbServerConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                tls: ServerTlsConfig::from_der(
+                    vec![tls.certificate.clone()],
+                    tls.private_key.clone(),
+                )
+                .unwrap(),
+                protocol_limits: dodb_protocol::ProtocolLimits::default(),
+                max_connections: 2,
+                max_concurrent_streams: 8,
+                max_concurrent_requests: 1,
+            },
+        )
+        .unwrap(),
+    );
+    let task_server = Arc::clone(&server);
+    let task = tokio::spawn(async move { task_server.run().await });
+    let idle_client = connect_client(&server, &tls, TenantId::new(74)).await;
+    wait_for_active_connections(&server, 1).await;
+    tokio::task::yield_now().await;
+
+    let request_client = connect_client(&server, &tls, TenantId::new(75)).await;
+    let entered = service.entered.notified();
+    let request = tokio::spawn(async move {
+        request_client
+            .get(key(b"cross-connection", b"request"))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .expect("request on the second connection was blocked by the idle first connection");
+    service.release.notify_one();
+    assert_eq!(
+        request.await.unwrap().unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+    stop_server(idle_client, server, task).await;
+}
+
+#[tokio::test]
 async fn aggregate_read_budget_returns_structured_result_too_large_errors() {
     let directory = tempfile::tempdir().unwrap();
     let tls = test_tls();
@@ -494,6 +557,77 @@ async fn aggregate_read_budget_returns_structured_result_too_large_errors() {
             );
         }
         other => panic!("unexpected transactional read error: {other}"),
+    }
+    stop_server(client, server, task).await;
+}
+
+#[tokio::test]
+async fn conflict_does_not_materialize_large_value_or_exceed_small_response_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let limits = dodb_protocol::ProtocolLimits {
+        max_response_frame_size: 256,
+        ..dodb_protocol::ProtocolLimits::default()
+    };
+    let (server, task) =
+        start_server_with_limits(directory.path().to_owned(), &tls, limits, 8).await;
+    let client = connect_client_with_limits(&server, &tls, TenantId::new(76), limits).await;
+    let conflict_key = key(b"large", b"value");
+    let revision = client
+        .put(conflict_key.clone(), vec![7; 2 * 1024 * 1024])
+        .await
+        .unwrap();
+
+    let error = client
+        .transact(TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: conflict_key.clone(),
+                expected_revision: Revision::ZERO,
+            }],
+            vec![TransactionMutation::Delete { key: conflict_key }],
+        ))
+        .await
+        .unwrap_err();
+    match error {
+        ClientError::Application(error) => {
+            assert_eq!(error.kind, dodb_protocol::ApplicationErrorKind::Conflict);
+            assert_eq!(
+                error.mutation_outcome,
+                dodb_protocol::MutationOutcome::NotApplied
+            );
+            assert_eq!(
+                error.conflict.as_ref().unwrap().actual,
+                ObservedState::present(revision)
+            );
+        }
+        other => panic!("unexpected large-value conflict error: {other}"),
+    }
+    stop_server(client, server, task).await;
+}
+
+#[tokio::test]
+async fn synthesized_missing_transact_get_respects_response_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let limits = dodb_protocol::ProtocolLimits {
+        max_response_frame_size: 128,
+        ..dodb_protocol::ProtocolLimits::default()
+    };
+    let (server, task) =
+        start_server_with_limits(directory.path().to_owned(), &tls, limits, 8).await;
+    let client = connect_client_with_limits(&server, &tls, TenantId::new(77), limits).await;
+    let keys = (0u64..20)
+        .map(|index| key(b"empty", &index.to_be_bytes()))
+        .collect();
+
+    match client.transact_get(keys).await.unwrap_err() {
+        ClientError::Application(error) => {
+            assert_eq!(
+                error.kind,
+                dodb_protocol::ApplicationErrorKind::ResponseTooLarge
+            );
+        }
+        other => panic!("unexpected synthesized read error: {other}"),
     }
     stop_server(client, server, task).await;
 }

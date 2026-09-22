@@ -129,7 +129,7 @@ impl ReferenceDb {
                 return Err(Error::conflict(dodb_core::TransactionConflict {
                     key: condition.key().clone(),
                     expected: condition.expectation(),
-                    actual,
+                    actual: actual.observed(),
                 }));
             }
         }
@@ -276,6 +276,7 @@ impl ReferenceTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dodb_core::ObservedState;
 
     fn key(pk: u8, sk: u8) -> DocumentKey {
         DocumentKey::new(vec![pk], vec![sk])
@@ -417,7 +418,7 @@ mod tests {
                 assert_eq!(conflict.key, key);
                 assert_eq!(
                     conflict.actual,
-                    RevisionState::missing(deleted_revision.into())
+                    ObservedState::missing(deleted_revision.into())
                 );
             }
             other => panic!("expected a structured conflict, got {other:?}"),
