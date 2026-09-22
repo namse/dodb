@@ -727,15 +727,6 @@ impl LocalTenantService {
                     rows.into_iter().map(storage_document).collect(),
                 ))
             }
-            Request::Batch { mutations } => {
-                let shard = self.open_shard(tenant).await?;
-                let result = shard
-                    .execute_transaction(TransactionRequest::new(Vec::new(), mutations))
-                    .await?;
-                Ok(Response::Batch(TransactionOutcome::committed(
-                    result.commit_lsn,
-                )))
-            }
             Request::TransactGet { keys } => Ok(Response::TransactGet(
                 self.read_states(tenant, &keys, budget).await?,
             )),

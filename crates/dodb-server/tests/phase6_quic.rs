@@ -49,6 +49,26 @@ async fn start_server_with_limits(
     Arc<DodbServer<LocalTenantService>>,
     tokio::task::JoinHandle<Result<(), dodb_server::ServerError>>,
 ) {
+    start_server_with_limits_at(
+        data_dir,
+        tls,
+        protocol_limits,
+        max_concurrent_requests,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+}
+
+async fn start_server_with_limits_at(
+    data_dir: std::path::PathBuf,
+    tls: &TestTls,
+    protocol_limits: dodb_protocol::ProtocolLimits,
+    max_concurrent_requests: usize,
+    listen_addr: std::net::SocketAddr,
+) -> (
+    Arc<DodbServer<LocalTenantService>>,
+    tokio::task::JoinHandle<Result<(), dodb_server::ServerError>>,
+) {
     let service = Arc::new(
         LocalTenantService::new(LocalTenantServiceConfig {
             data_dir,
@@ -60,7 +80,7 @@ async fn start_server_with_limits(
         DodbServer::bind(
             service,
             DodbServerConfig {
-                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                listen_addr,
                 tls: ServerTlsConfig::from_der(
                     vec![tls.certificate.clone()],
                     tls.private_key.clone(),
@@ -286,19 +306,22 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
         RevisionState::present(vec![0, 0xff, 1], first_revision)
     );
     let second_key = key(&[1], &[2]);
-    let batch = client
-        .batch(vec![
-            TransactionMutation::Put {
-                key: second_key.clone(),
-                value: vec![3, 4],
-            },
-            TransactionMutation::Delete {
-                key: key(&[5], &[6]),
-            },
-        ])
+    let transaction = client
+        .transact(TransactionRequest::new(
+            Vec::new(),
+            vec![
+                TransactionMutation::Put {
+                    key: second_key.clone(),
+                    value: vec![3, 4],
+                },
+                TransactionMutation::Delete {
+                    key: key(&[5], &[6]),
+                },
+            ],
+        ))
         .await
         .unwrap();
-    assert!(batch.commit_lsn.is_some());
+    assert!(transaction.commit_lsn.is_some());
     let rows = client
         .query(dodb_core::PrimaryKey::new(vec![1]), None, 10)
         .await
@@ -692,6 +715,81 @@ async fn persisted_state_is_available_after_server_reopen() {
         );
         stop_server(client, server, task).await;
     }
+}
+
+#[tokio::test]
+async fn shared_client_reconnects_after_same_address_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let tenant = TenantId::new(56);
+    let persisted_key = key(b"reconnect", b"value");
+    let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+    let address = server.local_addr().unwrap();
+    let connection = DodbConnection::connect(
+        "0.0.0.0:0".parse().unwrap(),
+        address,
+        "localhost",
+        ClientTlsConfig::from_der(vec![tls.certificate.clone()]).unwrap(),
+        dodb_protocol::ProtocolLimits::default(),
+    )
+    .await
+    .unwrap();
+    let client = connection.for_tenant(tenant);
+    client
+        .put(persisted_key.clone(), vec![1, 2, 3])
+        .await
+        .unwrap();
+
+    server.close();
+    let first_failure = client.get(persisted_key.clone()).await.unwrap_err();
+    assert!(matches!(
+        first_failure,
+        ClientError::Transport(_) | ClientError::Endpoint(_)
+    ));
+    server.shutdown().await;
+    task.await.unwrap().unwrap();
+    drop(server);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let (restarted, restarted_task) = start_server_with_limits_at(
+        directory.path().to_owned(),
+        &tls,
+        dodb_protocol::ProtocolLimits::default(),
+        64,
+        address,
+    )
+    .await;
+    let connections_before_recovery = restarted.metrics().snapshot().connections_total;
+    let mut requests = Vec::new();
+    for _ in 0..16 {
+        let shared_client = client.clone();
+        let persisted_key = persisted_key.clone();
+        requests.push(tokio::spawn(async move {
+            shared_client.get(persisted_key).await
+        }));
+    }
+    for request in requests {
+        assert_eq!(
+            request.await.unwrap().unwrap().value(),
+            Some(&[1, 2, 3][..])
+        );
+    }
+    assert_eq!(
+        restarted.metrics().snapshot().connections_total - connections_before_recovery,
+        1,
+        "concurrent requests must share one reconnect dial"
+    );
+
+    connection.close();
+    match client.get(key(b"reconnect", b"after-close")).await {
+        Err(ClientError::Endpoint(detail)) => {
+            assert!(detail.contains("explicitly closed"));
+        }
+        other => panic!("explicit close unexpectedly allowed reconnect: {other:?}"),
+    }
+
+    restarted.shutdown().await;
+    restarted_task.await.unwrap().unwrap();
 }
 
 struct FailWalSync;

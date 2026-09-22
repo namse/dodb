@@ -441,9 +441,8 @@ pub fn request_opcode(request: &Request) -> u8 {
         Request::Delete { .. } => 3,
         Request::Query { .. } => 4,
         Request::Scan { .. } => 5,
-        Request::Batch { .. } => 6,
-        Request::TransactGet { .. } => 7,
-        Request::Transact { .. } => 8,
+        Request::TransactGet { .. } => 6,
+        Request::Transact { .. } => 7,
     }
 }
 
@@ -454,9 +453,8 @@ pub fn response_opcode(response: &Response) -> u8 {
         Response::Delete(_) => 3,
         Response::Query(_) => 4,
         Response::Scan(_) => 5,
-        Response::Batch(_) => 6,
-        Response::TransactGet(_) => 7,
-        Response::Transact(_) => 8,
+        Response::TransactGet(_) => 6,
+        Response::Transact(_) => 7,
     }
 }
 
@@ -573,7 +571,6 @@ fn encode_request_payload(
             encode_optional_key(writer, exclusive_after_key.as_ref(), limits)?;
             encode_limit(writer, *limit, limits.max_scan_limit)?;
         }
-        Request::Batch { mutations } => encode_mutations(writer, mutations, limits)?,
         Request::TransactGet { keys } => encode_keys(writer, keys, limits.max_keys, limits)?,
         Request::Transact { request } => {
             encode_conditions(writer, &request.conditions, limits)?;
@@ -620,13 +617,10 @@ fn decode_request_payload(
             exclusive_after_key: decode_optional_key(reader, limits)?,
             limit: reader.limit(limits.max_scan_limit)?,
         }),
-        6 => Ok(Request::Batch {
-            mutations: decode_mutations(reader, limits)?,
-        }),
-        7 => Ok(Request::TransactGet {
+        6 => Ok(Request::TransactGet {
             keys: decode_keys(reader, limits.max_keys, limits)?,
         }),
-        8 => Ok(Request::Transact {
+        7 => Ok(Request::Transact {
             request: TransactionRequest::new(
                 decode_conditions(reader, limits)?,
                 decode_mutations(reader, limits)?,
@@ -647,9 +641,7 @@ fn encode_response_payload(
         Response::Query(documents) | Response::Scan(documents) => {
             encode_documents(writer, documents, limits)?
         }
-        Response::Batch(outcome) | Response::Transact(outcome) => {
-            encode_transaction_outcome(writer, *outcome)
-        }
+        Response::Transact(outcome) => encode_transaction_outcome(writer, *outcome),
         Response::TransactGet(states) => encode_revision_states(writer, states, limits)?,
     }
     Ok(())
@@ -666,11 +658,10 @@ fn decode_response_payload(
         3 => Ok(Response::Delete(Revision::new(reader.u64()?))),
         4 => Ok(Response::Query(decode_documents(reader, limits)?)),
         5 => Ok(Response::Scan(decode_documents(reader, limits)?)),
-        6 => Ok(Response::Batch(decode_transaction_outcome(reader)?)),
-        7 => Ok(Response::TransactGet(decode_revision_states(
+        6 => Ok(Response::TransactGet(decode_revision_states(
             reader, limits,
         )?)),
-        8 => Ok(Response::Transact(decode_transaction_outcome(reader)?)),
+        7 => Ok(Response::Transact(decode_transaction_outcome(reader)?)),
         other => Err(ProtocolError::InvalidOpcode(other)),
     }
 }
@@ -1287,7 +1278,7 @@ impl<'input> Reader<'input> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dodb_core::{Lsn, PrimaryKey, SortKey, TenantId};
+    use dodb_core::{PrimaryKey, SortKey, TenantId};
 
     fn key(pk: &[u8], sk: &[u8]) -> DocumentKey {
         DocumentKey::new(pk.to_vec(), sk.to_vec())
@@ -1329,11 +1320,6 @@ mod tests {
                 exclusive_after_key: Some(key(&[3], &[4])),
                 limit: 11,
             },
-            Request::Batch {
-                mutations: vec![TransactionMutation::Delete {
-                    key: key(&[5], &[6]),
-                }],
-            },
             Request::TransactGet {
                 keys: vec![key(&[], &[7]), key(&[8], &[])],
             },
@@ -1362,7 +1348,6 @@ mod tests {
                 revision: Revision::new(5),
             }]),
             Response::Scan(Vec::new()),
-            Response::Batch(TransactionOutcome::committed(Lsn::new(6))),
             Response::TransactGet(vec![RevisionState::missing(Revision::new(7))]),
             Response::Transact(TransactionOutcome::conditions_satisfied()),
         ];
