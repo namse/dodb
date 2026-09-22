@@ -829,6 +829,11 @@ the historical short-run `phase4-bench` numbers described in Section 3.7.
   revisions, transaction groups, reopen, checkpoint, and WAL recovery.
 - Establish a serial B-link performance control before adding batching.
 
+The completed Phase 1 implementation and control measurements are recorded in
+[`phase1-results.md`](phase1-results.md). Phase 2 work must not start from
+memory or from the code alone; that result record is part of the Phase 1
+source of truth.
+
 ### Phase 2 — optimistic/versioned multicore reads
 
 - Add versioned page cells, epoch pinning/reclamation, and atomic committed
