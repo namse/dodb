@@ -332,6 +332,7 @@ enum CoordinatorOperation {
     },
     Observe(Vec<DocumentKey>),
     Checkpoint,
+    CheckInvariants,
 }
 
 enum CoordinatorResponse {
@@ -631,9 +632,9 @@ fn process_segment<F: DurableFile, W: DurableFile>(
             CoordinatorOperation::Checkpoint => {
                 store.checkpoint().map(CoordinatorResponse::Checkpoint)
             }
-            CoordinatorOperation::CheckInvariants => {
-                store.check_invariants().map(CoordinatorResponse::Invariants)
-            }
+            CoordinatorOperation::CheckInvariants => store
+                .check_invariants()
+                .map(CoordinatorResponse::Invariants),
         })
         .collect();
     Ok(responses)

@@ -148,7 +148,9 @@ impl GeneratedOperation {
                 ..
             } => exclusive_after_key.iter().collect(),
             Self::TransactGet { keys, .. } => keys.iter().collect(),
-            Self::Transact { mutations, .. } => mutations.iter().map(|mutation| &mutation.key).collect(),
+            Self::Transact { mutations, .. } => {
+                mutations.iter().map(|mutation| &mutation.key).collect()
+            }
         }
     }
 }
@@ -169,7 +171,7 @@ impl Default for WorkloadConfig {
     fn default() -> Self {
         Self {
             tenant_count: 16,
-            hot_key_count: 64,
+            hot_key_count: 8,
             wide_key_count: 16_384,
             hot_percent: 80,
             operation_weights: [35, 20, 10, 10, 5, 10, 10],
@@ -257,21 +259,24 @@ impl OperationGenerator {
                 key: self.key(tenant),
             },
             OperationKind::Put => {
-                let key = self.key(tenant);
-                GeneratedOperation::Put {
-                    tenant,
-                    key,
-                    value: self.value(operation_index),
+                let mut key = self.key(tenant);
+                let value = self.value_for_key(operation_index, &key);
+                if value.len() > 512 {
+                    key = self.unique_value_key(tenant, operation_index, 0);
                 }
+                GeneratedOperation::Put { tenant, key, value }
             }
             OperationKind::Delete => GeneratedOperation::Delete {
                 tenant,
-                key: self.key(tenant),
+                key: self.wide_key(tenant),
             },
             OperationKind::Query => {
                 let pk = self.primary_key(tenant);
                 let exclusive_after_sk = (self.rng.below(4) == 0).then(|| {
-                    dodb_core::SortKey::new(format!("hot-sk-{}", self.rng.below(self.config.hot_key_count)))
+                    dodb_core::SortKey::new(format!(
+                        "hot-sk-{}",
+                        self.rng.below(u64::from(self.config.hot_key_count))
+                    ))
                 });
                 GeneratedOperation::Query {
                     tenant,
@@ -293,11 +298,19 @@ impl OperationGenerator {
                 }
             }
             OperationKind::Transact => {
-                let mutation_count = 1 + self.rng.below(self.config.max_transaction_mutations as u64) as usize;
+                let mutation_count =
+                    1 + self.rng.below(self.config.max_transaction_mutations as u64) as usize;
                 let mut mutations = Vec::with_capacity(mutation_count);
                 while mutations.len() < mutation_count {
-                    let key = self.key(tenant);
-                    if mutations.iter().any(|mutation: &PlannedMutation| mutation.key == key) {
+                    let key = if mutation_count > 1 {
+                        self.unique_value_key(tenant, operation_index, mutations.len() as u64)
+                    } else {
+                        self.key(tenant)
+                    };
+                    if mutations
+                        .iter()
+                        .any(|mutation: &PlannedMutation| mutation.key == key)
+                    {
                         continue;
                     }
                     let kind = if self.rng.below(4) == 0 {
@@ -305,11 +318,24 @@ impl OperationGenerator {
                     } else {
                         PlannedMutationKind::Put
                     };
-                    mutations.push(PlannedMutation {
-                        key,
-                        kind,
-                        value: self.value(operation_index),
-                    });
+                    let key = if matches!(kind, PlannedMutationKind::Delete)
+                        && key
+                            .pk
+                            .as_bytes()
+                            .windows(5)
+                            .any(|window| window == b"-hot-")
+                    {
+                        self.unique_value_key(tenant, operation_index, mutations.len() as u64)
+                    } else {
+                        key
+                    };
+                    let value = self.value_for_key(operation_index, &key);
+                    let key = if value.len() > 512 {
+                        self.unique_value_key(tenant, operation_index, mutations.len() as u64)
+                    } else {
+                        key
+                    };
+                    mutations.push(PlannedMutation { key, kind, value });
                 }
                 GeneratedOperation::Transact { tenant, mutations }
             }
@@ -322,13 +348,17 @@ impl OperationGenerator {
             return None;
         }
         let tenant = TenantId::new((operation_index % self.config.tenant_count) + 1);
-        let key = self.hot_key(tenant, 0);
+        let key = DocumentKey::new(
+            format!(
+                "tenant-{}-hot-transition-pk-{}",
+                tenant.get(),
+                operation_index / 64
+            ),
+            "transition-sk",
+        );
+        let value = self.value_for_key(operation_index, &key);
         Some(match step {
-            0 | 2 => GeneratedOperation::Put {
-                tenant,
-                key,
-                value: self.value(operation_index),
-            },
+            0 | 2 => GeneratedOperation::Put { tenant, key, value },
             _ => GeneratedOperation::Delete { tenant, key },
         })
     }
@@ -347,14 +377,19 @@ impl OperationGenerator {
 
     fn key(&mut self, tenant: TenantId) -> DocumentKey {
         if self.rng.below(100) < u64::from(self.config.hot_percent) {
-            self.hot_key(tenant, self.rng.below(u64::from(self.config.hot_key_count)) as u32)
+            let index = self.rng.below(u64::from(self.config.hot_key_count)) as u32;
+            self.hot_key(tenant, index)
         } else {
-            let index = self.rng.below(u64::from(self.config.wide_key_count));
-            DocumentKey::new(
-                format!("tenant-{}-wide-pk-{}", tenant.get(), index % 64),
-                format!("wide-sk-{index}"),
-            )
+            self.wide_key(tenant)
         }
+    }
+
+    fn wide_key(&mut self, tenant: TenantId) -> DocumentKey {
+        let index = self.rng.below(u64::from(self.config.wide_key_count));
+        DocumentKey::new(
+            format!("tenant-{}-wide-pk-{}", tenant.get(), index % 64),
+            format!("wide-sk-{index}"),
+        )
     }
 
     fn hot_key(&self, tenant: TenantId, index: u32) -> DocumentKey {
@@ -364,11 +399,26 @@ impl OperationGenerator {
         )
     }
 
+    fn unique_value_key(&self, tenant: TenantId, operation_index: u64, salt: u64) -> DocumentKey {
+        DocumentKey::new(
+            format!("tenant-{}-wide-value-pk", tenant.get()),
+            format!("wide-value-{operation_index}-{salt}"),
+        )
+    }
+
     fn primary_key(&mut self, tenant: TenantId) -> PrimaryKey {
         if self.rng.below(100) < u64::from(self.config.hot_percent) {
-            PrimaryKey::new(format!("tenant-{}-hot-pk-{}", tenant.get(), self.rng.below(8)))
+            PrimaryKey::new(format!(
+                "tenant-{}-hot-pk-{}",
+                tenant.get(),
+                self.rng.below(8)
+            ))
         } else {
-            PrimaryKey::new(format!("tenant-{}-wide-pk-{}", tenant.get(), self.rng.below(64)))
+            PrimaryKey::new(format!(
+                "tenant-{}-wide-pk-{}",
+                tenant.get(),
+                self.rng.below(64)
+            ))
         }
     }
 
@@ -398,6 +448,27 @@ impl OperationGenerator {
         value.truncate(size);
         value
     }
+
+    fn value_for_key(&mut self, operation_index: u64, key: &DocumentKey) -> Vec<u8> {
+        if key
+            .pk
+            .as_bytes()
+            .windows(5)
+            .any(|window| window == b"-hot-")
+        {
+            let size = 64;
+            let prefix = format!("soak_operation_id={operation_index};payload=");
+            let mut value = Vec::with_capacity(size.max(prefix.len()));
+            value.extend_from_slice(prefix.as_bytes());
+            while value.len() < size {
+                value.push((operation_index as u8).wrapping_add(value.len() as u8));
+            }
+            value.truncate(size);
+            value
+        } else {
+            self.value(operation_index)
+        }
+    }
 }
 
 /// A logical model of the committed state. Revisions are copied from actual
@@ -406,6 +477,46 @@ impl OperationGenerator {
 pub struct ReferenceModel {
     states: BTreeMap<TenantId, BTreeMap<DocumentKey, RevisionState>>,
     history: BTreeMap<(TenantId, DocumentKey), Vec<RevisionState>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnknownMutationResolution {
+    Applied,
+    NotApplied,
+    Partial,
+}
+
+pub fn classify_unknown_mutation(
+    operation: &GeneratedOperation,
+    before: &[RevisionState],
+    actual: &[RevisionState],
+    current: &[RevisionState],
+) -> UnknownMutationResolution {
+    if actual == current {
+        return UnknownMutationResolution::NotApplied;
+    }
+    let applied = match operation {
+        GeneratedOperation::Put { value, .. } => {
+            actual.len() == 1
+                && matches!(&actual[0], RevisionState::Present { value: actual_value, .. } if actual_value == value)
+        }
+        GeneratedOperation::Delete { .. } => actual.len() == 1 && actual[0].is_missing(),
+        GeneratedOperation::Transact { mutations, .. } => {
+            actual.len() == mutations.len()
+                && mutations.iter().zip(actual.iter()).all(|(mutation, state)| match mutation.kind {
+                    PlannedMutationKind::Put => matches!(state, RevisionState::Present { value, .. } if value == &mutation.value),
+                    PlannedMutationKind::Delete => state.is_missing(),
+                })
+        }
+        _ => false,
+    };
+    if applied {
+        UnknownMutationResolution::Applied
+    } else if actual == before {
+        UnknownMutationResolution::NotApplied
+    } else {
+        UnknownMutationResolution::Partial
+    }
 }
 
 impl ReferenceModel {
@@ -434,7 +545,13 @@ impl ReferenceModel {
         }
     }
 
-    pub fn apply_put(&mut self, tenant: TenantId, key: DocumentKey, value: Vec<u8>, revision: Revision) {
+    pub fn apply_put(
+        &mut self,
+        tenant: TenantId,
+        key: DocumentKey,
+        value: Vec<u8>,
+        revision: Revision,
+    ) {
         self.apply(tenant, key, RevisionState::present(value, revision));
     }
 
@@ -443,13 +560,27 @@ impl ReferenceModel {
     }
 
     pub fn knows_state(&self, tenant: TenantId, key: &DocumentKey, state: &RevisionState) -> bool {
-        self.history
-            .get(&(tenant, key.clone()))
-            .is_some_and(|history| history.iter().any(|known| known == state))
+        (*state == RevisionState::missing(Revision::ZERO))
+            || self
+                .history
+                .get(&(tenant, key.clone()))
+                .is_some_and(|history| history.iter().any(|known| known == state))
             || self.state(tenant, key) == *state
     }
 
-    pub fn scan(&self, tenant: TenantId, cursor: Option<&DocumentKey>, limit: usize) -> Vec<Document> {
+    pub fn knows_revision(&self, tenant: TenantId, key: &DocumentKey, revision: Revision) -> bool {
+        self.history
+            .get(&(tenant, key.clone()))
+            .is_some_and(|history| history.iter().any(|state| state.revision() == revision))
+            || self.state(tenant, key).revision() == revision
+    }
+
+    pub fn scan(
+        &self,
+        tenant: TenantId,
+        cursor: Option<&DocumentKey>,
+        limit: usize,
+    ) -> Vec<Document> {
         self.states
             .get(&tenant)
             .into_iter()
@@ -481,15 +612,39 @@ impl ReferenceModel {
         self.scan(tenant, None, usize::MAX)
             .into_iter()
             .filter(|document| {
-                &document.key.pk == pk
-                    && cursor.is_none_or(|cursor| &document.key.sk > cursor)
+                &document.key.pk == pk && cursor.is_none_or(|cursor| &document.key.sk > cursor)
             })
             .take(limit)
             .collect()
     }
 
+    pub fn documents(&self, tenant: TenantId) -> Vec<Document> {
+        self.scan(tenant, None, usize::MAX)
+    }
+
+    pub fn keys(&self, tenant: TenantId) -> Vec<DocumentKey> {
+        self.states
+            .get(&tenant)
+            .into_iter()
+            .flat_map(|states| states.keys().cloned())
+            .collect()
+    }
+
+    pub fn all_documents(&self) -> Vec<(TenantId, Document)> {
+        self.tenants()
+            .flat_map(|(tenant, documents)| {
+                documents
+                    .into_iter()
+                    .map(move |document| (tenant, document))
+            })
+            .collect()
+    }
+
     pub fn tenants(&self) -> impl Iterator<Item = (TenantId, Vec<Document>)> + '_ {
-        self.states.keys().copied().map(|tenant| (tenant, self.scan(tenant, None, usize::MAX)))
+        self.states
+            .keys()
+            .copied()
+            .map(|tenant| (tenant, self.scan(tenant, None, usize::MAX)))
     }
 
     pub fn known_key_count(&self) -> usize {
@@ -533,6 +688,10 @@ impl RecentOperations {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -616,11 +775,16 @@ pub fn trend_diagnostic(metric: &str, samples: &[(f64, u64)], warmup: Duration) 
         };
     }
     let cutoff = samples.first().map_or(0.0, |sample| sample.0) + warmup.as_secs_f64();
-    let late = samples.iter().filter(|sample| sample.0 >= cutoff).collect::<Vec<_>>();
+    let late = samples
+        .iter()
+        .filter(|sample| sample.0 >= cutoff)
+        .collect::<Vec<_>>();
     let window = (late.len() / 3).max(1);
     let means = [
         mean_window(&late[..window]),
-        mean_window(&late[late.len().saturating_sub(2 * window)..late.len().saturating_sub(window)]),
+        mean_window(
+            &late[late.len().saturating_sub(2 * window)..late.len().saturating_sub(window)],
+        ),
         mean_window(&late[late.len().saturating_sub(window)..]),
     ];
     let first = means[0].round() as u64;
@@ -628,8 +792,8 @@ pub fn trend_diagnostic(metric: &str, samples: &[(f64, u64)], warmup: Duration) 
     let growth = last.saturating_sub(first);
     let threshold = first.max(4) / 4;
     let warning = means[1] >= means[0] && means[2] >= means[1] && growth > threshold;
-    let elapsed = late.last().map_or(1.0, |sample| sample.0)
-        - late.first().map_or(0.0, |sample| sample.0);
+    let elapsed =
+        late.last().map_or(1.0, |sample| sample.0) - late.first().map_or(0.0, |sample| sample.0);
     TrendDiagnostic {
         metric: metric.to_owned(),
         warning,
@@ -649,7 +813,7 @@ pub fn trend_diagnostic(metric: &str, samples: &[(f64, u64)], warmup: Duration) 
     }
 }
 
-fn mean_window(samples: &[& &(f64, u64)]) -> f64 {
+fn mean_window(samples: &[&(f64, u64)]) -> f64 {
     if samples.is_empty() {
         0.0
     } else {
@@ -691,12 +855,63 @@ mod tests {
         let tenant = TenantId::new(1);
         let document = key(b"p", b"s");
         let mut model = ReferenceModel::default();
-        assert_eq!(model.state(tenant, &document), RevisionState::missing(Revision::ZERO));
+        assert_eq!(
+            model.state(tenant, &document),
+            RevisionState::missing(Revision::ZERO)
+        );
         model.apply_put(tenant, document.clone(), b"a".to_vec(), Revision::new(4));
         model.apply_delete(tenant, document.clone(), Revision::new(5));
-        assert_eq!(model.state(tenant, &document), RevisionState::missing(Revision::new(5)));
+        assert_eq!(
+            model.state(tenant, &document),
+            RevisionState::missing(Revision::new(5))
+        );
         assert!(model.knows_state(tenant, &document, &RevisionState::missing(Revision::ZERO)));
-        assert!(model.knows_state(tenant, &document, &RevisionState::present(b"a".to_vec(), Revision::new(4))));
+        assert!(model.knows_state(
+            tenant,
+            &document,
+            &RevisionState::present(b"a".to_vec(), Revision::new(4))
+        ));
+    }
+
+    #[test]
+    fn unknown_multi_key_mutation_accepts_only_all_or_none() {
+        let tenant = TenantId::new(1);
+        let first = key(b"p", b"a");
+        let second = key(b"p", b"b");
+        let operation = GeneratedOperation::Transact {
+            tenant,
+            mutations: vec![
+                PlannedMutation {
+                    key: first.clone(),
+                    kind: PlannedMutationKind::Put,
+                    value: b"first".to_vec(),
+                },
+                PlannedMutation {
+                    key: second.clone(),
+                    kind: PlannedMutationKind::Put,
+                    value: b"second".to_vec(),
+                },
+            ],
+        };
+        let before = vec![RevisionState::missing(Revision::ZERO); 2];
+        let current = before.clone();
+        let applied = vec![
+            RevisionState::present(b"first".to_vec(), Revision::new(10)),
+            RevisionState::present(b"second".to_vec(), Revision::new(10)),
+        ];
+        assert_eq!(
+            classify_unknown_mutation(&operation, &before, &applied, &current),
+            UnknownMutationResolution::Applied
+        );
+        assert_eq!(
+            classify_unknown_mutation(
+                &operation,
+                &before,
+                &[applied[0].clone(), before[1].clone()],
+                &current,
+            ),
+            UnknownMutationResolution::Partial
+        );
     }
 
     #[test]
