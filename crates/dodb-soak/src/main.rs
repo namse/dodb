@@ -23,6 +23,7 @@ use rcgen::generate_simple_self_signed;
 use serde::Serialize;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::task::JoinSet;
 
 use dodb_soak::{
     DeterministicRng, ExpectedDocument, ExpectedState, GeneratedOperation, LatencyStats,
@@ -916,8 +917,11 @@ fn operation_summary(operation: &GeneratedOperation) -> String {
             "Scan {{ tenant: {}, exclusive_after_key: {exclusive_after_key:?}, limit: {limit} }}",
             tenant.get()
         ),
-        GeneratedOperation::TransactGet { tenant, keys } => {
-            format!("TransactGet {{ tenant: {}, keys: {keys:?} }}", tenant.get())
+        GeneratedOperation::ConcurrentGet { tenant, keys } => {
+            format!(
+                "ConcurrentGet {{ tenant: {}, keys: {keys:?} }}",
+                tenant.get()
+            )
         }
         GeneratedOperation::Transact { tenant, mutations } => {
             let mutations = mutations
@@ -1140,28 +1144,22 @@ async fn execute_operation(
                 .map(|_| "ok".to_owned()),
             Err(error) => handle_non_mutation_error(state, error, allow_transport_errors),
         },
-        GeneratedOperation::TransactGet { keys, .. } => {
-            match client.transact_get(keys.clone()).await {
-                Ok(actual) => {
-                    if actual.len() != keys.len() {
-                        Err("TransactGet returned the wrong number of states".to_owned())
-                    } else {
-                        state
-                            .model
-                            .lock()
-                            .map_err(|_| "reference model lock poisoned".to_owned())
-                            .and_then(|model| {
-                                keys.iter()
-                                    .zip(actual.iter())
-                                    .all(|(key, state)| model.matches_state(tenant, key, state))
-                                    .then_some("ok".to_owned())
-                                    .ok_or_else(|| {
-                                        "TransactGet returned an unrecognized value or revision"
-                                            .to_owned()
-                                    })
+        GeneratedOperation::ConcurrentGet { keys, .. } => {
+            match concurrent_gets(client, keys).await {
+                Ok(actual) => state
+                    .model
+                    .lock()
+                    .map_err(|_| "reference model lock poisoned".to_owned())
+                    .and_then(|model| {
+                        keys.iter()
+                            .zip(actual.iter())
+                            .all(|(key, state)| model.matches_state(tenant, key, state))
+                            .then_some("ok".to_owned())
+                            .ok_or_else(|| {
+                                "ConcurrentGet returned an unrecognized value or revision"
+                                    .to_owned()
                             })
-                    }
-                }
+                    }),
                 Err(error) => handle_non_mutation_error(state, error, allow_transport_errors),
             }
         }
@@ -1706,28 +1704,28 @@ async fn query_page_resilient(
     }
 }
 
-async fn transact_get_resilient(
+async fn concurrent_gets(
     client: &DodbClient,
     keys: &[DocumentKey],
-) -> Result<Vec<RevisionState>, String> {
-    match client.transact_get(keys.to_vec()).await {
-        Ok(states) => Ok(states),
-        Err(ClientError::Application(application))
-            if application.kind == ApplicationErrorKind::ResponseTooLarge && keys.len() > 1 =>
-        {
-            let mut states = Vec::with_capacity(keys.len());
-            for key in keys {
-                states.extend(
-                    client
-                        .transact_get(vec![key.clone()])
-                        .await
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            Ok(states)
-        }
-        Err(error) => Err(error.to_string()),
+) -> Result<Vec<RevisionState>, ClientError> {
+    let mut requests = JoinSet::new();
+    for (index, key) in keys.iter().cloned().enumerate() {
+        let client = client.clone();
+        requests.spawn(async move { (index, client.get(key).await) });
     }
+    let mut states = vec![None; keys.len()];
+    while let Some(result) = requests.join_next().await {
+        let (index, state) = result.map_err(|error| ClientError::Transport(error.to_string()))?;
+        states[index] = Some(state?);
+    }
+    states
+        .into_iter()
+        .map(|state| {
+            state.ok_or_else(|| {
+                ClientError::Transport("concurrent Get task returned no result".to_owned())
+            })
+        })
+        .collect()
 }
 
 async fn verify_full(
@@ -1805,13 +1803,17 @@ async fn verify_full(
         }
         let keys = model.keys(tenant);
         for chunk in keys.chunks(128) {
-            let actual = transact_get_resilient(client, chunk).await?;
+            let actual = concurrent_gets(client, chunk)
+                .await
+                .map_err(|error| error.to_string())?;
             if actual.len() != chunk.len() {
-                return Err("TransactGet verification length mismatch".to_owned());
+                return Err("concurrent Get verification length mismatch".to_owned());
             }
             for (key, state_value) in chunk.iter().zip(actual.iter()) {
                 if !model.matches_state(tenant, key, state_value) {
-                    return Err(format!("TransactGet mismatch for tenant {tenant_number}"));
+                    return Err(format!(
+                        "concurrent Get mismatch for tenant {tenant_number}"
+                    ));
                 }
             }
         }
@@ -1882,7 +1884,9 @@ async fn reconcile_unknown(
                 }
             }
         }
-        let actual = transact_get_resilient(operation_client(&clients, tenant), &keys).await?;
+        let actual = concurrent_gets(operation_client(&clients, tenant), &keys)
+            .await
+            .map_err(|error| error.to_string())?;
         let model = state
             .model
             .lock()
@@ -2593,7 +2597,7 @@ fn print_report(report: &Report) {
         report.operations_per_second
     );
     println!(
-        "gets={} puts={} deletes={} queries={} scans={} transact_gets={} transactions={}",
+        "gets={} puts={} deletes={} queries={} scans={} concurrent_gets={} transactions={}",
         report.operation_counts[0],
         report.operation_counts[1],
         report.operation_counts[2],

@@ -44,9 +44,10 @@ against earlier accepted candidates in the same group.
 Ordinary `get`, Query, and Scan calls are independent operations over the
 currently published committed read view and do not promise one common read
 instant with other operations. Each individual operation holds one read guard,
-so it does not traverse a mixture of page publications. `transact_get` remains
-coordinator-serialized and returns requested point states in input order from
-one committed coordinator state. A client can use ordinary reads plus
+so it does not traverse a mixture of page publications. The coordinator's
+point-read helper remains available internally for condition evaluation and
+returns requested states in input order from one committed coordinator state;
+it is not a public wire operation. A client can use ordinary reads plus
 `RevisionEquals` conditions to form an optimistic write request. A read issued
 after a successful write response uses the newly published view.
 

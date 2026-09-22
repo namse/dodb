@@ -59,10 +59,11 @@ complete committed logical transaction in WAL order.
 
 ## Read primitives and limitations
 
-`transact_get` is a point-read primitive that preserves input order and reads
-from one coordinator state. Independent `get` calls do not promise one common
-read instant, but their observed revisions can be supplied later as
-`RevisionEquals` conditions.
+The storage coordinator has an internal point-read helper that preserves input
+order and reads from one coordinator state. It is not exposed as a public wire
+operation. Independent network `Get` calls use separate request streams and do
+not promise one common read instant, but their observed revisions can be
+supplied later as `RevisionEquals` conditions.
 
 Transactional range queries and scans are not supported. Normal Query and Scan
 remain available outside transactions. Phase 3 does not implement MVCC,
@@ -74,9 +75,10 @@ network idempotency, or a network wire protocol.
 
 A physical coordinator batch reduces request overhead and can share one WAL
 sync. A logical transaction is the condition-plus-mutation all-or-nothing
-unit. Legacy storage batch APIs remain useful for synchronous storage tests;
-the async coordinator treats independent mutation requests as independent
-logical transactions.
+unit. The public condition-free multi-write path uses `Transact`; legacy
+storage batch APIs remain useful for synchronous storage tests. The async
+coordinator treats independent mutation requests as independent logical
+transactions.
 
 ## Validation coverage
 

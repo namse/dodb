@@ -9,8 +9,9 @@ or a lock manager.
 
 ## Phase 3 implementation investigation
 
-Before the changes, `AsyncShard` sent every `BatchRequest` through one bounded
-Tokio channel, including `Get`, Query, Scan, and `TransactGet`. The coordinator
+Before the changes, `AsyncShard` sent every internal `BatchRequest` through one
+bounded Tokio channel, including `Get`, Query, Scan, and its internal
+point-read grouping helper. The coordinator
 owned one mutable `BTreeStore`, collected at most 64 requests, and started a
 1 ms timer immediately after receiving the first request. A single-client
 benchmark therefore waited for that timer on every request. Queue admission
@@ -32,9 +33,11 @@ holds one read guard for its complete operation, so a single operation cannot
 traverse a half-published root or leaf chain. Reads never consult staged overlay
 pages.
 
-`TransactGet` remains on the coordinator and retains its one-state, input-order
-semantics. A write response is sent only after WAL durability and committed-view
-publication, so a read issued after that response observes the new value.
+The internal point-read grouping helper remains on the coordinator and retains
+its one-state, input-order semantics for service-side condition evaluation. It
+is not a network API; independent wire Gets use independent QUIC streams. A
+write response is sent only after WAL durability and committed-view publication,
+so a read issued after that response observes the new value.
 
 The view retains one immutable object for each page that has been reachable in
 the committed tree. This is bounded by the allocated tree rather than by the
@@ -44,7 +47,8 @@ committed read view is the async read-safety mechanism.
 
 ## Queueing and backpressure
 
-The write/request channel remains bounded. Mutation and `TransactGet` admission
+The write/request channel remains bounded. Mutation and internal grouped-read
+admission
 uses nonblocking `try_send`: a full channel returns structured `Overloaded`,
 which is retryable after load decreases. A closed coordinator remains an
 internal lifecycle error. Ordinary committed reads do not consume write queue

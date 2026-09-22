@@ -65,12 +65,6 @@ pub enum Request {
         exclusive_after_key: Option<DocumentKey>,
         limit: usize,
     },
-    Batch {
-        mutations: Vec<dodb_core::TransactionMutation>,
-    },
-    TransactGet {
-        keys: Vec<DocumentKey>,
-    },
     Transact {
         request: TransactionRequest,
     },
@@ -84,20 +78,15 @@ impl Request {
             Self::Delete { .. } => "delete",
             Self::Query { .. } => "query",
             Self::Scan { .. } => "scan",
-            Self::Batch { .. } => "batch",
-            Self::TransactGet { .. } => "transact_get",
             Self::Transact { .. } => "transact",
         }
     }
 
     pub fn is_mutation(&self) -> bool {
         match self {
-            Self::Put { .. } | Self::Delete { .. } | Self::Batch { .. } => true,
+            Self::Put { .. } | Self::Delete { .. } => true,
             Self::Transact { request } => !request.mutations.is_empty(),
-            Self::Get { .. }
-            | Self::Query { .. }
-            | Self::Scan { .. }
-            | Self::TransactGet { .. } => false,
+            Self::Get { .. } | Self::Query { .. } | Self::Scan { .. } => false,
         }
     }
 }
@@ -109,8 +98,6 @@ pub enum Response {
     Delete(Revision),
     Query(Vec<Document>),
     Scan(Vec<Document>),
-    Batch(TransactionOutcome),
-    TransactGet(Vec<RevisionState>),
     Transact(TransactionOutcome),
 }
 

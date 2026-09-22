@@ -252,11 +252,8 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
     );
     assert!(client.scan(None, 10).await.unwrap().is_empty());
     assert_eq!(
-        client
-            .transact_get(vec![missing_key.clone()])
-            .await
-            .unwrap(),
-        vec![RevisionState::missing(Revision::ZERO)]
+        client.get(missing_key.clone()).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
     );
     let condition_only = client
         .transact(TransactionRequest::new(
@@ -286,19 +283,22 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
         RevisionState::present(vec![0, 0xff, 1], first_revision)
     );
     let second_key = key(&[1], &[2]);
-    let batch = client
-        .batch(vec![
-            TransactionMutation::Put {
-                key: second_key.clone(),
-                value: vec![3, 4],
-            },
-            TransactionMutation::Delete {
-                key: key(&[5], &[6]),
-            },
-        ])
+    let transaction = client
+        .transact(TransactionRequest::new(
+            Vec::new(),
+            vec![
+                TransactionMutation::Put {
+                    key: second_key.clone(),
+                    value: vec![3, 4],
+                },
+                TransactionMutation::Delete {
+                    key: key(&[5], &[6]),
+                },
+            ],
+        ))
         .await
         .unwrap();
-    assert!(batch.commit_lsn.is_some());
+    assert!(transaction.commit_lsn.is_some());
     let rows = client
         .query(dodb_core::PrimaryKey::new(vec![1]), None, 10)
         .await
@@ -421,6 +421,7 @@ async fn concurrent_streams_and_tenant_isolation_are_preserved() {
     for task in write_tasks {
         task.await.unwrap().unwrap();
     }
+    let connections_before_reads = server.metrics().snapshot().connections_total;
     let mut read_tasks = Vec::new();
     for _ in 0..64 {
         let client = first_client.clone();
@@ -434,16 +435,13 @@ async fn concurrent_streams_and_tenant_isolation_are_preserved() {
         ));
     }
     assert_eq!(
-        second_client.get(shared_key).await.unwrap(),
-        RevisionState::missing(Revision::ZERO)
+        server.metrics().snapshot().connections_total,
+        connections_before_reads,
+        "concurrent independent Gets must reuse the shared QUIC connection"
     );
     assert_eq!(
-        first_client
-            .transact_get(vec![key(&[7], &[8])])
-            .await
-            .unwrap()
-            .len(),
-        1
+        second_client.get(shared_key).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
     );
     stop_server(first_client, server, task).await;
     second_client.close();
@@ -551,7 +549,7 @@ async fn idle_connection_does_not_hoard_global_request_capacity() {
 }
 
 #[tokio::test]
-async fn aggregate_read_budget_returns_structured_result_too_large_errors() {
+async fn aggregate_read_budget_returns_structured_query_and_scan_errors() {
     let directory = tempfile::tempdir().unwrap();
     let tls = test_tls();
     let limits = dodb_protocol::ProtocolLimits {
@@ -584,15 +582,6 @@ async fn aggregate_read_budget_returns_structured_result_too_large_errors() {
             }
             other => panic!("unexpected aggregate read error: {other}"),
         }
-    }
-    match client.transact_get(vec![first, second]).await.unwrap_err() {
-        ClientError::Application(error) => {
-            assert_eq!(
-                error.kind,
-                dodb_protocol::ApplicationErrorKind::ResponseTooLarge
-            );
-        }
-        other => panic!("unexpected transactional read error: {other}"),
     }
     stop_server(client, server, task).await;
 }
@@ -637,33 +626,6 @@ async fn conflict_does_not_materialize_large_value_or_exceed_small_response_budg
             );
         }
         other => panic!("unexpected large-value conflict error: {other}"),
-    }
-    stop_server(client, server, task).await;
-}
-
-#[tokio::test]
-async fn synthesized_missing_transact_get_respects_response_budget() {
-    let directory = tempfile::tempdir().unwrap();
-    let tls = test_tls();
-    let limits = dodb_protocol::ProtocolLimits {
-        max_response_frame_size: 128,
-        ..dodb_protocol::ProtocolLimits::default()
-    };
-    let (server, task) =
-        start_server_with_limits(directory.path().to_owned(), &tls, limits, 8).await;
-    let client = connect_client_with_limits(&server, &tls, TenantId::new(77), limits).await;
-    let keys = (0u64..20)
-        .map(|index| key(b"empty", &index.to_be_bytes()))
-        .collect();
-
-    match client.transact_get(keys).await.unwrap_err() {
-        ClientError::Application(error) => {
-            assert_eq!(
-                error.kind,
-                dodb_protocol::ApplicationErrorKind::ResponseTooLarge
-            );
-        }
-        other => panic!("unexpected synthesized read error: {other}"),
     }
     stop_server(client, server, task).await;
 }

@@ -50,8 +50,8 @@ informative than one partially completed long run:
 
 ## Workload and model
 
-The default mix covers Get, Put, Delete, Query, Scan, TransactGet, and Transact
-with weights approximately 35/20/10/10/5/10/10. The generator uses an 80%
+The default mix covers Get, Put, Delete, Query, Scan, concurrent independent
+Gets, and Transact with weights approximately 35/20/10/10/5/10/10. The generator uses an 80%
 hot-key and 20% wide-key distribution, multiple tenants, fixed-size hot values,
 and finite large-value probes. This keeps hot revision churn and contention
 fast while still exercising inline values, overflow pages, response budgeting,
@@ -77,7 +77,8 @@ The model stores tenant, document key, presence, and opaque revision history.
 Values at or below 512 bytes may be retained inline; larger values retain only
 their length and SHA-256 digest. Revisions are learned only from successful
 dodb responses. Full quiescent checks compare scans, queries, cursors, and
-TransactGet ordering, exact revisions, value lengths, and value digests.
+concurrent independent Get results, exact revisions, value lengths, and value
+digests.
 During concurrent traffic, observations may reflect a legal linearization point
 between model updates; generated mutation fingerprints are used to validate
 the returned value while the exact quiescent comparison remains authoritative.

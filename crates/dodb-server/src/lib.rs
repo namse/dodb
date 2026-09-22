@@ -762,18 +762,6 @@ impl LocalTenantService {
                     rows.into_iter().map(storage_document).collect(),
                 ))
             }
-            Request::Batch { mutations } => {
-                let shard = self.open_shard(tenant).await?;
-                let result = shard
-                    .execute_transaction(TransactionRequest::new(Vec::new(), mutations))
-                    .await?;
-                Ok(Response::Batch(TransactionOutcome::committed(
-                    result.commit_lsn,
-                )))
-            }
-            Request::TransactGet { keys } => Ok(Response::TransactGet(
-                self.read_states(tenant, &keys, budget).await?,
-            )),
             Request::Transact { request } => {
                 self.execute_transaction(tenant, request, budget).await
             }
@@ -821,30 +809,6 @@ impl LocalTenantService {
         Ok(Response::Transact(TransactionOutcome::committed(
             result.commit_lsn,
         )))
-    }
-
-    async fn read_states(
-        &self,
-        tenant: TenantId,
-        keys: &[DocumentKey],
-        budget: ExecutionBudget,
-    ) -> Result<Vec<RevisionState>, Error> {
-        match self.read_shard(tenant).await? {
-            Some(shard) => {
-                shard
-                    .transact_get_with_response_budget(keys.to_vec(), budget.max_response_bytes)
-                    .await
-            }
-            None => {
-                let states = keys
-                    .iter()
-                    .map(|_| RevisionState::missing(dodb_core::Revision::ZERO))
-                    .collect::<Vec<_>>();
-                let response = Response::TransactGet(states.clone());
-                ensure_synthesized_response_budget(&response, budget.max_response_bytes)?;
-                Ok(states)
-            }
-        }
     }
 
     async fn observe_states(

@@ -19,7 +19,7 @@ pub enum OperationKind {
     Delete,
     Query,
     Scan,
-    TransactGet,
+    ConcurrentGet,
     Transact,
 }
 
@@ -30,7 +30,7 @@ impl OperationKind {
         Self::Delete,
         Self::Query,
         Self::Scan,
-        Self::TransactGet,
+        Self::ConcurrentGet,
         Self::Transact,
     ];
 
@@ -41,7 +41,7 @@ impl OperationKind {
             Self::Delete => "delete",
             Self::Query => "query",
             Self::Scan => "scan",
-            Self::TransactGet => "transact_get",
+            Self::ConcurrentGet => "concurrent_get",
             Self::Transact => "transact",
         }
     }
@@ -53,7 +53,7 @@ impl OperationKind {
             Self::Delete => 2,
             Self::Query => 3,
             Self::Scan => 4,
-            Self::TransactGet => 5,
+            Self::ConcurrentGet => 5,
             Self::Transact => 6,
         }
     }
@@ -98,7 +98,7 @@ pub enum GeneratedOperation {
         exclusive_after_key: Option<DocumentKey>,
         limit: usize,
     },
-    TransactGet {
+    ConcurrentGet {
         tenant: TenantId,
         keys: Vec<DocumentKey>,
     },
@@ -116,7 +116,7 @@ impl GeneratedOperation {
             Self::Delete { .. } => OperationKind::Delete,
             Self::Query { .. } => OperationKind::Query,
             Self::Scan { .. } => OperationKind::Scan,
-            Self::TransactGet { .. } => OperationKind::TransactGet,
+            Self::ConcurrentGet { .. } => OperationKind::ConcurrentGet,
             Self::Transact { .. } => OperationKind::Transact,
         }
     }
@@ -128,7 +128,7 @@ impl GeneratedOperation {
             | Self::Delete { tenant, .. }
             | Self::Query { tenant, .. }
             | Self::Scan { tenant, .. }
-            | Self::TransactGet { tenant, .. }
+            | Self::ConcurrentGet { tenant, .. }
             | Self::Transact { tenant, .. } => *tenant,
         }
     }
@@ -148,7 +148,7 @@ impl GeneratedOperation {
                 exclusive_after_key,
                 ..
             } => exclusive_after_key.iter().collect(),
-            Self::TransactGet { keys, .. } => keys.iter().collect(),
+            Self::ConcurrentGet { keys, .. } => keys.iter().collect(),
             Self::Transact { mutations, .. } => {
                 mutations.iter().map(|mutation| &mutation.key).collect()
             }
@@ -339,9 +339,9 @@ impl OperationGenerator {
                     .then(|| self.key(tenant, operation_index)),
                 limit: self.limit(self.config.max_scan_limit),
             },
-            OperationKind::TransactGet => {
+            OperationKind::ConcurrentGet => {
                 let key_count = 1 + self.rng.below(4) as usize;
-                GeneratedOperation::TransactGet {
+                GeneratedOperation::ConcurrentGet {
                     tenant,
                     keys: (0..key_count)
                         .map(|_| self.key(tenant, operation_index))

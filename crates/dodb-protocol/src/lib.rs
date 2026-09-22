@@ -441,8 +441,6 @@ pub fn request_opcode(request: &Request) -> u8 {
         Request::Delete { .. } => 3,
         Request::Query { .. } => 4,
         Request::Scan { .. } => 5,
-        Request::Batch { .. } => 6,
-        Request::TransactGet { .. } => 7,
         Request::Transact { .. } => 8,
     }
 }
@@ -454,8 +452,6 @@ pub fn response_opcode(response: &Response) -> u8 {
         Response::Delete(_) => 3,
         Response::Query(_) => 4,
         Response::Scan(_) => 5,
-        Response::Batch(_) => 6,
-        Response::TransactGet(_) => 7,
         Response::Transact(_) => 8,
     }
 }
@@ -573,8 +569,6 @@ fn encode_request_payload(
             encode_optional_key(writer, exclusive_after_key.as_ref(), limits)?;
             encode_limit(writer, *limit, limits.max_scan_limit)?;
         }
-        Request::Batch { mutations } => encode_mutations(writer, mutations, limits)?,
-        Request::TransactGet { keys } => encode_keys(writer, keys, limits.max_keys, limits)?,
         Request::Transact { request } => {
             encode_conditions(writer, &request.conditions, limits)?;
             encode_mutations(writer, &request.mutations, limits)?;
@@ -620,12 +614,6 @@ fn decode_request_payload(
             exclusive_after_key: decode_optional_key(reader, limits)?,
             limit: reader.limit(limits.max_scan_limit)?,
         }),
-        6 => Ok(Request::Batch {
-            mutations: decode_mutations(reader, limits)?,
-        }),
-        7 => Ok(Request::TransactGet {
-            keys: decode_keys(reader, limits.max_keys, limits)?,
-        }),
         8 => Ok(Request::Transact {
             request: TransactionRequest::new(
                 decode_conditions(reader, limits)?,
@@ -647,10 +635,7 @@ fn encode_response_payload(
         Response::Query(documents) | Response::Scan(documents) => {
             encode_documents(writer, documents, limits)?
         }
-        Response::Batch(outcome) | Response::Transact(outcome) => {
-            encode_transaction_outcome(writer, *outcome)
-        }
-        Response::TransactGet(states) => encode_revision_states(writer, states, limits)?,
+        Response::Transact(outcome) => encode_transaction_outcome(writer, *outcome),
     }
     Ok(())
 }
@@ -666,10 +651,6 @@ fn decode_response_payload(
         3 => Ok(Response::Delete(Revision::new(reader.u64()?))),
         4 => Ok(Response::Query(decode_documents(reader, limits)?)),
         5 => Ok(Response::Scan(decode_documents(reader, limits)?)),
-        6 => Ok(Response::Batch(decode_transaction_outcome(reader)?)),
-        7 => Ok(Response::TransactGet(decode_revision_states(
-            reader, limits,
-        )?)),
         8 => Ok(Response::Transact(decode_transaction_outcome(reader)?)),
         other => Err(ProtocolError::InvalidOpcode(other)),
     }
@@ -725,30 +706,6 @@ fn decode_documents(
         });
     }
     Ok(documents)
-}
-
-fn encode_revision_states(
-    writer: &mut Writer,
-    states: &[RevisionState],
-    limits: ProtocolLimits,
-) -> Result<(), ProtocolError> {
-    encode_count(writer, states.len(), limits.max_keys)?;
-    for state in states {
-        encode_revision_state(writer, state, limits)?;
-    }
-    Ok(())
-}
-
-fn decode_revision_states(
-    reader: &mut Reader<'_>,
-    limits: ProtocolLimits,
-) -> Result<Vec<RevisionState>, ProtocolError> {
-    let count = reader.count(limits.max_keys)?;
-    let mut states = Vec::with_capacity(count);
-    for _ in 0..count {
-        states.push(decode_revision_state(reader, limits)?);
-    }
-    Ok(states)
 }
 
 fn encode_revision_state(
@@ -897,32 +854,6 @@ fn decode_mutations(
         });
     }
     Ok(mutations)
-}
-
-fn encode_keys(
-    writer: &mut Writer,
-    keys: &[DocumentKey],
-    maximum: usize,
-    limits: ProtocolLimits,
-) -> Result<(), ProtocolError> {
-    encode_count(writer, keys.len(), maximum)?;
-    for key in keys {
-        encode_key(writer, key, limits)?;
-    }
-    Ok(())
-}
-
-fn decode_keys(
-    reader: &mut Reader<'_>,
-    maximum: usize,
-    limits: ProtocolLimits,
-) -> Result<Vec<DocumentKey>, ProtocolError> {
-    let count = reader.count(maximum)?;
-    let mut keys = Vec::with_capacity(count);
-    for _ in 0..count {
-        keys.push(decode_key(reader, limits)?);
-    }
-    Ok(keys)
 }
 
 fn encode_key(
@@ -1287,7 +1218,7 @@ impl<'input> Reader<'input> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dodb_core::{Lsn, PrimaryKey, SortKey, TenantId};
+    use dodb_core::{PrimaryKey, SortKey, TenantId};
 
     fn key(pk: &[u8], sk: &[u8]) -> DocumentKey {
         DocumentKey::new(pk.to_vec(), sk.to_vec())
@@ -1329,14 +1260,6 @@ mod tests {
                 exclusive_after_key: Some(key(&[3], &[4])),
                 limit: 11,
             },
-            Request::Batch {
-                mutations: vec![TransactionMutation::Delete {
-                    key: key(&[5], &[6]),
-                }],
-            },
-            Request::TransactGet {
-                keys: vec![key(&[], &[7]), key(&[8], &[])],
-            },
             request(),
         ];
         for original in requests {
@@ -1362,8 +1285,6 @@ mod tests {
                 revision: Revision::new(5),
             }]),
             Response::Scan(Vec::new()),
-            Response::Batch(TransactionOutcome::committed(Lsn::new(6))),
-            Response::TransactGet(vec![RevisionState::missing(Revision::new(7))]),
             Response::Transact(TransactionOutcome::conditions_satisfied()),
         ];
         for original in responses {
@@ -1436,6 +1357,14 @@ mod tests {
             decode_request_frame(&invalid_opcode, limits),
             Err(ProtocolError::InvalidOpcode(99))
         ));
+        for reserved_opcode in [6, 7] {
+            let mut reserved = valid.clone();
+            reserved[HEADER_SIZE + 8] = reserved_opcode;
+            assert!(matches!(
+                decode_request_frame(&reserved, limits),
+                Err(ProtocolError::InvalidOpcode(opcode)) if opcode == reserved_opcode
+            ));
+        }
         let mut trailing = valid.clone();
         trailing.push(1);
         assert!(matches!(

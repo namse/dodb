@@ -61,13 +61,14 @@ payload        payload length bytes
 The codec checks the magic, version, message type, checked length arithmetic,
 payload length, operation discriminants, count limits, boolean flags, response
 types, and trailing bytes. Requests use explicit operation codes for Get, Put,
-Delete, Query, Scan, Batch, TransactGet, and Transact. Responses use the same
-operation code for successful results and a separate status for structured
-application errors.
+Delete, Query, Scan, and Transact. Transact retains opcode 8; opcodes 6 and 7
+are reserved and rejected. Responses use the same operation code for
+successful results and a separate status for structured application errors.
 
-Batch is an atomic condition-free collection of Put/Delete mutations. The
-existing transaction primitive remains the general atomic operation with
-conditions. The protocol does not expose B+Tree pages, WAL records, page LSNs,
+The public protocol has no generic Batch operation: condition-free multi-key
+writes use Transact with an empty condition list. The protocol also has no
+multi-read operation; independent Gets use independent QUIC streams. The
+protocol does not expose B+Tree pages, WAL records, page LSNs,
 superblock slots, checkpoint state, or storage-provider backup details.
 
 The default network limits are:
@@ -87,11 +88,11 @@ may lower the limits but cannot raise key or value limits above the storage
 contract through `ProtocolLimits`. Canonical key length includes component
 terminators and zero-byte escapes, so component limits alone are not the key
 contract. Query primary-key cursors, Scan cursors, conditions, mutations,
-TransactGet keys, and structured conflict keys use the same canonical check.
+structured conflict keys use the same canonical check.
 
 The server supplies an `ExecutionBudget` derived from the response frame limit.
-The local service passes it into bounded committed reads. Query, Scan, and
-TransactGet reserve aggregate response space before each value is materialized;
+The local service passes it into bounded committed reads. Query and Scan
+reserve aggregate response space before each value is materialized;
 an incomplete result is rejected as structured `ResponseTooLarge` rather than
 silently truncated. This keeps a legal single maximum-size value usable while
 bounding one response before encoding.
@@ -134,7 +135,7 @@ tenant and keeps the cache entry while the process lives. The cache lock covers
 the existence check and open operation, so concurrent first mutations cannot
 create duplicate shard coordinators.
 
-Read-only Get, Query, Scan, and TransactGet requests against a tenant with no
+Read-only Get, Query, and Scan requests against a tenant with no
 database return an empty state and do not create data or WAL files. A
 condition-only Transact reads the same missing revision-zero state and also
 does not create files. The first mutation opens the paired files and creates
@@ -146,22 +147,23 @@ for this phase rather than a persisted per-incarnation identity.
 
 ## Transaction semantics
 
-Put and Delete are single-key atomic mutations. Batch submits multiple
-condition-free mutations as one transaction. Transact preserves
+Put and Delete are single-key atomic mutations. Transact submits multiple
+condition-free or conditional mutations as one atomic transaction and preserves
 `RevisionEquals`, `Exists`, and `NotExists`, including the revision of a
 missing key and the missing-revision ABA check.
 
 The storage transaction primitive requires at least one mutation. A
 condition-only Transact is therefore handled by the service boundary: it
 rejects duplicate condition keys, gathers the unique keys with one
-coordinator-serialized `TransactGet`, evaluates conditions in input order, and
+coordinator-serialized internal point-read operation, evaluates conditions in input order, and
 returns the first deterministic structured Conflict. On success it returns an
 outcome with no commit LSN and performs no mutation. It never implements this
 operation as independently observed ordinary Gets.
 
-Ordinary Query and Scan retain ordered results and exclusive cursors. TransactGet
-retains input order and one committed point-read state. It does not create a
-cross-key read-snapshot promise for ordinary independent Gets, Query, or Scan.
+Ordinary Query and Scan retain ordered results and exclusive cursors. The
+storage coordinator may use an internal point-read grouping while evaluating a
+condition-only transaction, but that helper is not a public wire operation.
+Independent Gets do not promise one cross-key read snapshot.
 
 ## Errors and unknown outcomes
 
@@ -204,12 +206,12 @@ mismatch, canonical key boundaries with zero-byte expansion, structured
 Conflict, mutation outcome certainty, and structured server errors.
 
 The loopback Quinn tests cover TLS connection setup, mutations, Get, Query,
-Scan, TransactGet, atomic Batch, transaction commit and conflict, condition
-only transactions, concurrent streams, same-tenant write ordering, tenant
-isolation, missing-revision ABA, lazy file creation, disconnect/reconnect
-through server restart, persisted WAL-backed state after reopen, global request
-backpressure, and an injected WAL durability failure reported as an unknown
-mutation outcome.
+Scan, condition-free and conditional Transact, condition-only transactions,
+concurrent independent streams, same-tenant write ordering, tenant isolation,
+missing-revision ABA, lazy file creation, disconnect/reconnect through server
+restart, persisted WAL-backed state after reopen, global request backpressure,
+and an injected WAL durability failure reported as an unknown mutation
+outcome.
 
 ## Deferred features
 

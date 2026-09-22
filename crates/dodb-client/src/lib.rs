@@ -296,32 +296,6 @@ impl DodbClient {
         }
     }
 
-    pub async fn batch(
-        &self,
-        mutations: Vec<TransactionMutation>,
-    ) -> Result<TransactionOutcome, ClientError> {
-        match self
-            .execute(dodb_service::Request::Batch { mutations })
-            .await?
-        {
-            Response::Batch(outcome) => Ok(outcome),
-            _ => Err(unexpected_response(6, 0)),
-        }
-    }
-
-    pub async fn transact_get(
-        &self,
-        keys: Vec<DocumentKey>,
-    ) -> Result<Vec<RevisionState>, ClientError> {
-        match self
-            .execute(dodb_service::Request::TransactGet { keys })
-            .await?
-        {
-            Response::TransactGet(states) => Ok(states),
-            _ => Err(unexpected_response(7, 0)),
-        }
-    }
-
     pub async fn transact(
         &self,
         request: TransactionRequest,
