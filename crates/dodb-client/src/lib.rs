@@ -1,10 +1,10 @@
 use std::fmt;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use dodb_core::{
-    DocumentKey, Revision, RevisionState, TenantId, TransactionMutation, TransactionRequest,
-};
+use dodb_core::{DocumentKey, Revision, RevisionState, TenantId, TransactionRequest};
 use dodb_protocol::{
     ApplicationError, MutationOutcome, ProtocolError, ProtocolLimits, ResponseEnvelope,
     decode_header, decode_response_parts, encode_request,
@@ -12,6 +12,10 @@ use dodb_protocol::{
 use dodb_service::{Document, Response, TransactionOutcome};
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint, VarInt};
+use tokio::sync::Notify;
+
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(50);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -50,6 +54,18 @@ impl fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+impl ClientError {
+    fn invalidates_connection(&self) -> bool {
+        matches!(
+            self,
+            Self::Endpoint(_)
+                | Self::Transport(_)
+                | Self::Protocol(_)
+                | Self::UnknownMutationOutcome { cause: None, .. }
+        )
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientTlsConfig {
@@ -96,57 +112,108 @@ pub struct DodbConnection {
 
 struct DodbConnectionInner {
     endpoint: Endpoint,
-    connection: quinn::Connection,
+    server_addr: SocketAddr,
+    server_name: String,
     limits: ProtocolLimits,
+    state: Mutex<ConnectionState>,
+    reconnect_notify: Notify,
+}
+
+struct ConnectionState {
+    current: Option<InstalledConnection>,
+    generation: u64,
+    reconnecting: bool,
+    failures: u32,
+    next_attempt_at: Option<Instant>,
+    closed: bool,
+}
+
+#[derive(Clone)]
+struct InstalledConnection {
+    connection: quinn::Connection,
+    generation: u64,
 }
 
 impl DodbConnection {
     /// Opens one authenticated QUIC connection that can serve any number of
     /// tenant-scoped handles.
     pub async fn connect(
-        bind_addr: std::net::SocketAddr,
-        server_addr: std::net::SocketAddr,
+        bind_addr: SocketAddr,
+        server_addr: SocketAddr,
         server_name: &str,
         tls: ClientTlsConfig,
         limits: ProtocolLimits,
     ) -> Result<Self, ClientError> {
-        limits.validate().map_err(ClientError::Protocol)?;
         let mut endpoint = Endpoint::client(bind_addr)
             .map_err(|error| ClientError::Endpoint(error.to_string()))?;
         endpoint.set_default_client_config(tls.to_quinn_config()?);
-        let connection = endpoint
-            .connect(server_addr, server_name)
-            .map_err(|error| ClientError::Endpoint(error.to_string()))?
-            .await
-            .map_err(|error| ClientError::Transport(error.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(DodbConnectionInner {
-                endpoint,
-                connection,
-                limits,
-            }),
-        })
+        let connection = Self::from_endpoint(endpoint, server_addr, server_name, limits)?;
+        connection.ensure_connection().await?;
+        Ok(connection)
     }
 
     pub async fn connect_with_endpoint(
         mut endpoint: Endpoint,
-        server_addr: std::net::SocketAddr,
+        server_addr: SocketAddr,
         server_name: &str,
         tls: ClientTlsConfig,
         limits: ProtocolLimits,
     ) -> Result<Self, ClientError> {
-        limits.validate().map_err(ClientError::Protocol)?;
         endpoint.set_default_client_config(tls.to_quinn_config()?);
-        let connection = endpoint
-            .connect(server_addr, server_name)
-            .map_err(|error| ClientError::Endpoint(error.to_string()))?
-            .await
-            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let connection = Self::from_endpoint(endpoint, server_addr, server_name, limits)?;
+        connection.ensure_connection().await?;
+        Ok(connection)
+    }
+
+    /// Creates a shared connection manager without dialing until its first request.
+    pub fn connect_lazy(
+        bind_addr: SocketAddr,
+        server_addr: SocketAddr,
+        server_name: &str,
+        tls: ClientTlsConfig,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ClientError> {
+        let mut endpoint = Endpoint::client(bind_addr)
+            .map_err(|error| ClientError::Endpoint(error.to_string()))?;
+        endpoint.set_default_client_config(tls.to_quinn_config()?);
+        Self::from_endpoint(endpoint, server_addr, server_name, limits)
+    }
+
+    /// Creates a shared connection manager around an existing endpoint without
+    /// dialing until its first request.
+    pub fn connect_lazy_with_endpoint(
+        mut endpoint: Endpoint,
+        server_addr: SocketAddr,
+        server_name: &str,
+        tls: ClientTlsConfig,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ClientError> {
+        endpoint.set_default_client_config(tls.to_quinn_config()?);
+        Self::from_endpoint(endpoint, server_addr, server_name, limits)
+    }
+
+    fn from_endpoint(
+        endpoint: Endpoint,
+        server_addr: SocketAddr,
+        server_name: &str,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ClientError> {
+        limits.validate().map_err(ClientError::Protocol)?;
         Ok(Self {
             inner: Arc::new(DodbConnectionInner {
                 endpoint,
-                connection,
+                server_addr,
+                server_name: server_name.to_owned(),
                 limits,
+                state: Mutex::new(ConnectionState {
+                    current: None,
+                    generation: 0,
+                    reconnecting: false,
+                    failures: 0,
+                    next_attempt_at: None,
+                    closed: false,
+                }),
+                reconnect_notify: Notify::new(),
             }),
         })
     }
@@ -158,19 +225,155 @@ impl DodbConnection {
         }
     }
 
-    pub fn remote_addr(&self) -> std::net::SocketAddr {
-        self.inner.connection.remote_address()
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.inner.server_addr
     }
 
     /// Explicitly shuts down the shared endpoint and connection.
     pub fn close(&self) {
-        self.inner
-            .connection
-            .close(VarInt::from_u32(0), b"client shutdown");
+        let connection = {
+            let mut state = self.inner.state.lock().expect("connection state poisoned");
+            state.closed = true;
+            state.reconnecting = false;
+            state.next_attempt_at = None;
+            state.current.take()
+        };
+        if let Some(connection) = connection {
+            connection
+                .connection
+                .close(VarInt::from_u32(0), b"client shutdown");
+        }
         self.inner
             .endpoint
             .close(VarInt::from_u32(0), b"client shutdown");
+        self.inner.reconnect_notify.notify_waiters();
     }
+
+    async fn ensure_connection(&self) -> Result<InstalledConnection, ClientError> {
+        loop {
+            let notified = self.inner.reconnect_notify.notified();
+            let action = {
+                let mut state = self.inner.state.lock().expect("connection state poisoned");
+                if state.closed {
+                    return Err(ClientError::Endpoint(
+                        "client connection is explicitly closed".to_owned(),
+                    ));
+                }
+                if let Some(current) = &state.current
+                    && current.connection.close_reason().is_none()
+                {
+                    return Ok(current.clone());
+                }
+                state.current.take();
+                if state.reconnecting {
+                    ReconnectAction::Wait
+                } else if let Some(next_attempt_at) = state.next_attempt_at {
+                    if next_attempt_at > Instant::now() {
+                        ReconnectAction::Sleep(
+                            next_attempt_at.saturating_duration_since(Instant::now()),
+                        )
+                    } else {
+                        state.next_attempt_at = None;
+                        state.reconnecting = true;
+                        ReconnectAction::Dial
+                    }
+                } else {
+                    state.reconnecting = true;
+                    ReconnectAction::Dial
+                }
+            };
+            match action {
+                ReconnectAction::Wait => notified.await,
+                ReconnectAction::Sleep(duration) => tokio::time::sleep(duration).await,
+                ReconnectAction::Dial => return self.dial().await,
+            }
+        }
+    }
+
+    async fn dial(&self) -> Result<InstalledConnection, ClientError> {
+        let result = match self
+            .inner
+            .endpoint
+            .connect(self.inner.server_addr, &self.inner.server_name)
+        {
+            Ok(connecting) => connecting
+                .await
+                .map_err(|error| ClientError::Transport(error.to_string())),
+            Err(error) => Err(ClientError::Endpoint(error.to_string())),
+        };
+        let result = {
+            let mut state = self.inner.state.lock().expect("connection state poisoned");
+            state.reconnecting = false;
+            match result {
+                Ok(connection) if state.closed => {
+                    connection.close(VarInt::from_u32(0), b"client shutdown");
+                    Err(ClientError::Endpoint(
+                        "client connection is explicitly closed".to_owned(),
+                    ))
+                }
+                Ok(connection) => {
+                    state.generation = state.generation.wrapping_add(1);
+                    state.failures = 0;
+                    state.next_attempt_at = None;
+                    let installed = InstalledConnection {
+                        connection,
+                        generation: state.generation,
+                    };
+                    state.current = Some(installed.clone());
+                    Ok(installed)
+                }
+                Err(error) => {
+                    if !state.closed {
+                        state.failures = state.failures.saturating_add(1);
+                        state.next_attempt_at =
+                            Some(Instant::now() + reconnect_delay(state.failures));
+                    }
+                    Err(error)
+                }
+            }
+        };
+        self.inner.reconnect_notify.notify_waiters();
+        result
+    }
+
+    fn invalidate(&self, generation: u64) {
+        let connection = {
+            let mut state = self.inner.state.lock().expect("connection state poisoned");
+            if state.closed
+                || !generation_is_current(
+                    state.current.as_ref().map(|current| current.generation),
+                    generation,
+                )
+            {
+                None
+            } else {
+                state.current.take()
+            }
+        };
+        if let Some(connection) = connection {
+            connection
+                .connection
+                .close(VarInt::from_u32(0), b"connection invalidated");
+        }
+    }
+}
+
+enum ReconnectAction {
+    Wait,
+    Sleep(Duration),
+    Dial,
+}
+
+fn generation_is_current(current_generation: Option<u64>, failed_generation: u64) -> bool {
+    current_generation == Some(failed_generation)
+}
+
+fn reconnect_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(5);
+    RECONNECT_BACKOFF_BASE
+        .checked_mul(1u32 << shift)
+        .unwrap_or(RECONNECT_BACKOFF_MAX)
+        .min(RECONNECT_BACKOFF_MAX)
 }
 
 #[derive(Clone)]
@@ -314,14 +517,35 @@ impl DodbClient {
         let expected_response_type = response_opcode_for_request(&request);
         let encoded_request = encode_request(self.tenant, &request, self.connection.inner.limits)
             .map_err(ClientError::Protocol)?;
-        let (mut send, mut receive) = self
-            .connection
-            .inner
-            .connection
+        let installed = self.connection.ensure_connection().await?;
+        let result = self
+            .execute_on_connection(
+                &installed.connection,
+                mutation,
+                expected_response_type,
+                &encoded_request,
+            )
+            .await;
+        if let Err(error) = &result
+            && error.invalidates_connection()
+        {
+            self.connection.invalidate(installed.generation);
+        }
+        result
+    }
+
+    async fn execute_on_connection(
+        &self,
+        connection: &quinn::Connection,
+        mutation: bool,
+        expected_response_type: u8,
+        encoded_request: &[u8],
+    ) -> Result<Response, ClientError> {
+        let (mut send, mut receive) = connection
             .open_bi()
             .await
-            .map_err(|error| ClientError::Transport(error.to_string()))?;
-        if let Err(error) = send.write_all(&encoded_request).await {
+            .map_err(|error| uncertain_mutation(mutation, error.to_string()))?;
+        if let Err(error) = send.write_all(encoded_request).await {
             return Err(uncertain_mutation(
                 mutation,
                 format!("request write failed: {error}"),
@@ -415,5 +639,28 @@ fn uncertain_protocol(mutation: bool, error: ProtocolError) -> ClientError {
         }
     } else {
         ClientError::Protocol(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{generation_is_current, reconnect_delay};
+
+    #[test]
+    fn late_failure_cannot_invalidate_a_newer_generation() {
+        assert!(!generation_is_current(Some(11), 10));
+        assert!(generation_is_current(Some(10), 10));
+        assert!(!generation_is_current(None, 10));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(reconnect_delay(1), Duration::from_millis(50));
+        assert_eq!(reconnect_delay(2), Duration::from_millis(100));
+        assert_eq!(reconnect_delay(5), Duration::from_millis(800));
+        assert_eq!(reconnect_delay(6), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(32), Duration::from_secs(1));
     }
 }
