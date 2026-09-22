@@ -90,19 +90,23 @@ impl ClientTlsConfig {
 }
 
 #[derive(Clone)]
-pub struct DodbClient {
+pub struct DodbConnection {
+    inner: Arc<DodbConnectionInner>,
+}
+
+struct DodbConnectionInner {
     endpoint: Endpoint,
     connection: quinn::Connection,
-    tenant: TenantId,
     limits: ProtocolLimits,
 }
 
-impl DodbClient {
+impl DodbConnection {
+    /// Opens one authenticated QUIC connection that can serve any number of
+    /// tenant-scoped handles.
     pub async fn connect(
         bind_addr: std::net::SocketAddr,
         server_addr: std::net::SocketAddr,
         server_name: &str,
-        tenant: TenantId,
         tls: ClientTlsConfig,
         limits: ProtocolLimits,
     ) -> Result<Self, ClientError> {
@@ -116,10 +120,11 @@ impl DodbClient {
             .await
             .map_err(|error| ClientError::Transport(error.to_string()))?;
         Ok(Self {
-            endpoint,
-            connection,
-            tenant,
-            limits,
+            inner: Arc::new(DodbConnectionInner {
+                endpoint,
+                connection,
+                limits,
+            }),
         })
     }
 
@@ -127,7 +132,6 @@ impl DodbClient {
         mut endpoint: Endpoint,
         server_addr: std::net::SocketAddr,
         server_name: &str,
-        tenant: TenantId,
         tls: ClientTlsConfig,
         limits: ProtocolLimits,
     ) -> Result<Self, ClientError> {
@@ -139,11 +143,79 @@ impl DodbClient {
             .await
             .map_err(|error| ClientError::Transport(error.to_string()))?;
         Ok(Self {
-            endpoint,
-            connection,
-            tenant,
-            limits,
+            inner: Arc::new(DodbConnectionInner {
+                endpoint,
+                connection,
+                limits,
+            }),
         })
+    }
+
+    pub fn for_tenant(&self, tenant: TenantId) -> DodbClient {
+        DodbClient {
+            connection: self.clone(),
+            tenant,
+        }
+    }
+
+    pub fn remote_addr(&self) -> std::net::SocketAddr {
+        self.inner.connection.remote_address()
+    }
+
+    /// Explicitly shuts down the shared endpoint and connection.
+    pub fn close(&self) {
+        self.inner
+            .connection
+            .close(VarInt::from_u32(0), b"client shutdown");
+        self.inner
+            .endpoint
+            .close(VarInt::from_u32(0), b"client shutdown");
+    }
+}
+
+#[derive(Clone)]
+pub struct DodbClient {
+    connection: DodbConnection,
+    tenant: TenantId,
+}
+
+impl DodbClient {
+    /// Opens a connection and returns a tenant-scoped handle.
+    ///
+    /// New code serving multiple tenants should use [`DodbConnection::connect`]
+    /// once and call [`DodbConnection::for_tenant`] for each tenant.
+    pub async fn connect(
+        bind_addr: std::net::SocketAddr,
+        server_addr: std::net::SocketAddr,
+        server_name: &str,
+        tenant: TenantId,
+        tls: ClientTlsConfig,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ClientError> {
+        Ok(
+            DodbConnection::connect(bind_addr, server_addr, server_name, tls, limits)
+                .await?
+                .for_tenant(tenant),
+        )
+    }
+
+    pub async fn connect_with_endpoint(
+        endpoint: Endpoint,
+        server_addr: std::net::SocketAddr,
+        server_name: &str,
+        tenant: TenantId,
+        tls: ClientTlsConfig,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ClientError> {
+        Ok(
+            DodbConnection::connect_with_endpoint(endpoint, server_addr, server_name, tls, limits)
+                .await?
+                .for_tenant(tenant),
+        )
+    }
+
+    pub fn connection(&self) -> &DodbConnection {
+        &self.connection
     }
 
     pub fn tenant(&self) -> TenantId {
@@ -151,13 +223,17 @@ impl DodbClient {
     }
 
     pub fn remote_addr(&self) -> std::net::SocketAddr {
-        self.connection.remote_address()
+        self.connection.remote_addr()
     }
 
+    /// Releases this tenant handle without shutting down other handles.
+    ///
+    /// Call [`DodbConnection::close`] on the shared connection when the
+    /// owner is ready to shut down the transport.
     pub fn close(&self) {
-        self.connection
-            .close(VarInt::from_u32(0), b"client shutdown");
-        self.endpoint.close(VarInt::from_u32(0), b"client shutdown");
+        // Kept as a source-compatible convenience for the original
+        // tenant-bound client API. The shared connection has explicit
+        // ownership and is closed through DodbConnection.
     }
 
     pub async fn get(&self, key: DocumentKey) -> Result<RevisionState, ClientError> {
@@ -262,9 +338,11 @@ impl DodbClient {
     async fn execute(&self, request: dodb_service::Request) -> Result<Response, ClientError> {
         let mutation = request.is_mutation();
         let expected_response_type = response_opcode_for_request(&request);
-        let encoded_request =
-            encode_request(self.tenant, &request, self.limits).map_err(ClientError::Protocol)?;
+        let encoded_request = encode_request(self.tenant, &request, self.connection.inner.limits)
+            .map_err(ClientError::Protocol)?;
         let (mut send, mut receive) = self
+            .connection
+            .inner
             .connection
             .open_bi()
             .await
@@ -291,12 +369,12 @@ impl DodbClient {
         let header =
             decode_header(&header_bytes).map_err(|error| uncertain_protocol(mutation, error))?;
         let frame_length = dodb_protocol::HEADER_SIZE.saturating_add(header.payload_length);
-        if frame_length > self.limits.max_response_frame_size {
+        if frame_length > self.connection.inner.limits.max_response_frame_size {
             return Err(uncertain_protocol(
                 mutation,
                 ProtocolError::PayloadTooLarge {
                     length: frame_length,
-                    maximum: self.limits.max_response_frame_size,
+                    maximum: self.connection.inner.limits.max_response_frame_size,
                 },
             ));
         }
@@ -314,8 +392,13 @@ impl DodbClient {
         if !trailing.is_empty() {
             return Err(uncertain_protocol(mutation, ProtocolError::TrailingBytes));
         }
-        match decode_response_parts(header, &payload, Some(expected_response_type), self.limits)
-            .map_err(|error| uncertain_protocol(mutation, error))?
+        match decode_response_parts(
+            header,
+            &payload,
+            Some(expected_response_type),
+            self.connection.inner.limits,
+        )
+        .map_err(|error| uncertain_protocol(mutation, error))?
         {
             ResponseEnvelope::Success(response) => Ok(response),
             ResponseEnvelope::Error(error) => {

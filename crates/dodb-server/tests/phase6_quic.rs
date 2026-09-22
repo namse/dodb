@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use dodb_client::{ClientError, ClientTlsConfig, DodbClient};
+use dodb_client::{ClientError, ClientTlsConfig, DodbClient, DodbConnection};
 use dodb_core::{
     ConditionExpectation, DocumentKey, Error, ObservedState, Revision, RevisionState, TenantId,
     TransactionCondition, TransactionMutation, TransactionRequest,
@@ -192,6 +192,42 @@ async fn abruptly_disconnect(
     }
     connection.close(quinn::VarInt::from_u32(0), b"abrupt test disconnect");
     endpoint.close(quinn::VarInt::from_u32(0), b"abrupt test disconnect");
+}
+
+#[tokio::test]
+async fn tenant_handles_share_one_connection_and_close_independently() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls = test_tls();
+    let (server, task) = start_server(directory.path().to_owned(), &tls).await;
+    let connection = DodbConnection::connect(
+        "0.0.0.0:0".parse().unwrap(),
+        server.local_addr().unwrap(),
+        "localhost",
+        ClientTlsConfig::from_der(vec![tls.certificate.clone()]).unwrap(),
+        dodb_protocol::ProtocolLimits::default(),
+    )
+    .await
+    .unwrap();
+    let first = connection.for_tenant(TenantId::new(101));
+    let second = connection.for_tenant(TenantId::new(102));
+    wait_for_active_connections(&server, 1).await;
+    assert_eq!(server.metrics().snapshot().active_connections, 1);
+
+    let shared_key = key(b"shared", b"key");
+    first.put(shared_key.clone(), vec![1]).await.unwrap();
+    assert_eq!(
+        second.get(shared_key.clone()).await.unwrap(),
+        RevisionState::missing(Revision::ZERO)
+    );
+
+    first.close();
+    drop(first);
+    assert_eq!(second.get(shared_key).await.unwrap().value(), None);
+    assert_eq!(server.metrics().snapshot().active_connections, 1);
+
+    connection.close();
+    server.shutdown().await;
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

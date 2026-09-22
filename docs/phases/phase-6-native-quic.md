@@ -98,7 +98,9 @@ bounding one response before encoding.
 
 ## QUIC and TLS
 
-Quinn 0.11 provides one reusable connection per client. Each application
+Quinn 0.11 provides one reusable connection per connection owner. The client
+exposes a `DodbConnection` owner and cheap tenant-scoped `DodbClient` handles;
+one connection can serve many tenants concurrently. Each application
 request opens one bidirectional stream, writes one request frame, finishes the
 send side, and reads one response frame. Independent streams are concurrent;
 the client does not serialize them behind a connection mutex and does not
@@ -216,3 +218,7 @@ authorization, idempotency, distributed routing, ownership transfer,
 replication, secondary replicas, shard migration, distributed transactions,
 service discovery, load balancing, and operational checkpoint/snapshot/restore
 control surfaces for later phases.
+Dropping or releasing a tenant handle does not close the shared transport.
+The connection owner explicitly calls `DodbConnection::close()` during
+shutdown. The original tenant-bound `DodbClient::connect` constructor remains
+available as a convenience API.
