@@ -228,3 +228,53 @@ npm run formal:checkpoint:simulate
 npm run formal:checkpoint:verify:tlc
 npm run formal:checkpoint:verify:apalache
 ```
+
+## End-to-end contract-composition model
+
+`end_to_end_pipeline.qnt` composes the contracts checked by the smaller models
+into one representative request pipeline. The fixed request stream is
+`PutA`, `ConditionOnlyA`, `ConflictingPutB`, `PutB`, `ReadBarrier`, and
+`CheckpointBarrier`. Physical groups are selected nondeterministically in FIFO
+order with a maximum size of four requests. A physical boundary can split the
+contiguous mutation segment at any position before the read barrier.
+
+The serial reference expects the ordered response list `ACommitted`,
+`ConditionSatisfied`, `ConflictResult`, `BCommitted`, `ReadBoth`, and
+`CheckpointSucceeded`. Its logical states progress from `(A=0, B=0)` to
+`(A=1, B=0)` after `PutA` and then to `(A=1, B=2)` after `PutB`.
+
+The staged transaction semantics use logical commit ordinals: `PutA` commits
+ordinal 1, the condition-only request succeeds without consuming an ordinal,
+the conflicting conditional `PutB` has no effect and consumes no ordinal, and
+the final `PutB` commits ordinal 2. These ordinals are model revisions, not raw
+WAL LSNs. Each mutation segment uses staged state so later requests see prior
+successful mutations in that segment.
+
+Successful segment completion abstracts the contract sequence WAL durable,
+committed store published, committed read view published, then responses
+issued. Responses remain private until durability and publication complete. The
+read barrier observes `A revision 1` and `B revision 2` only through the
+committed read view. The checkpoint barrier
+abstracts durable checkpoint state followed by safe WAL history reclamation,
+preserving the logical history floor and next commit ordinal. Recovery uses the
+durable WAL state before reclamation and the checkpoint state after reclamation.
+
+The integration model does not re-prove the internal WAL, publication, or
+checkpoint algorithms. It checks that the contracts proven by the smaller
+models compose into one consistent request pipeline.
+
+Physical grouping may change the number of WAL syncs, but not the serial
+logical result, response order, barrier observation, or recoverable committed
+state. `walSyncCount` is a performance-related outcome of those group
+boundaries.
+
+This model is not a proof of the Rust implementation itself. Rust/model
+correspondence remains a separate validation target.
+
+```sh
+npm run formal:e2e:typecheck
+npm run formal:e2e:test
+npm run formal:e2e:simulate
+npm run formal:e2e:verify:tlc
+npm run formal:e2e:verify:apalache
+```

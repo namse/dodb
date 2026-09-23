@@ -39,6 +39,11 @@
     "formal:checkpoint:test": "quint test formal/quint/checkpoint_reset.qnt --backend=rust",
     "formal:checkpoint:simulate": "quint run formal/quint/checkpoint_reset.qnt --invariant=state_invariants --max-samples=10000 --max-steps=30 --seed=0x20260923 --witnesses checkpointPathAReached checkpointPathBReached checkpointPathCZeroReached checkpointPathCFiveReached checkpointPathDOldWalReached checkpointPathDEmptyWalReached checkpointPathEReached checkpointPathFReached checkpointPathGReached checkpointPathHReached",
     "formal:checkpoint:verify:tlc": "quint verify formal/quint/checkpoint_reset.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=30 --invariants state_invariants",
-    "formal:checkpoint:verify:apalache": "quint verify formal/quint/checkpoint_reset.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=30 --invariants state_invariants"
+    "formal:checkpoint:verify:apalache": "quint verify formal/quint/checkpoint_reset.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=30 --invariants state_invariants",
+    "formal:e2e:typecheck": "quint typecheck formal/quint/end_to_end_pipeline.qnt",
+    "formal:e2e:test": "quint test formal/quint/end_to_end_pipeline.qnt --backend=rust",
+    "formal:e2e:simulate": "quint run formal/quint/end_to_end_pipeline.qnt --step stepWithoutCrash --invariant=state_invariants --max-samples=20000 --max-steps=40 --seed=0x20260923 --witnesses pathAReached pathBReached pathCReached pathGReached && quint run formal/quint/end_to_end_pipeline.qnt --invariant=state_invariants --max-samples=20000 --max-steps=40 --seed=0x20260923 --witnesses pathDReached pathEReached pathFReached && quint run formal/quint/end_to_end_pipeline.qnt --step stepCrashAfterCheckpoint --invariant=state_invariants --max-samples=2000 --max-steps=40 --seed=0x20260923 --witnesses pathHReached",
+    "formal:e2e:verify:tlc": "quint verify formal/quint/end_to_end_pipeline.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=40 --invariants state_invariants",
+    "formal:e2e:verify:apalache": "quint verify formal/quint/end_to_end_pipeline.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=40 --invariants state_invariants"
   }
 }
