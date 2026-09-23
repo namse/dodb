@@ -1,5 +1,14 @@
 # Phase 1 Results — Serial B-link Format and Correctness Control
 
+> Historical measurement notice: the performance numbers in this document
+> were measured on the previous machine and remain historical only. The
+> current Phase 1 control baseline is in
+> [`rebaseline-results.md`](rebaseline-results.md), with separate raw
+> artifacts under
+> `docs/experiments/results/rebaseline-macbookpro17-1-macos26.4-8c8t/phase1/`.
+> The Phase 1 correctness and format results remain valid and are not
+> invalidated by the machine change.
+
 This record is the Phase 1 companion to
 [`b-link-batched-engine.md`](b-link-batched-engine.md). It describes the
 experimental engine at the historical implementation commit

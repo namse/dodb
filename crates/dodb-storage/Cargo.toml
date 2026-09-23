@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 crc32c.workspace = true
 dodb-core = { path = "../dodb-core" }
+libc.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

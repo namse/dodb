@@ -11,6 +11,17 @@ Experiment branch: `experiment/b-link-batched-engine`
 
 Phase 2 result: [`phase2-results.md`](phase2-results.md)
 
+Performance status:
+
+- Old Phase 0/1/2 performance numbers are previous-machine historical
+  measurements only.
+- The current benchmark baseline is the new-machine rebaseline in
+  [`rebaseline-results.md`](rebaseline-results.md).
+- The new raw artifacts are separated under
+  `docs/experiments/results/rebaseline-macbookpro17-1-macos26.4-8c8t/`.
+- Correctness, format, publication, and recovery results are not invalidated
+  by replacing the performance machine.
+
 The Phase 1 implementation SHA recorded in the earlier result document is a
 historical identity only. Phase 2 started from the requested branch HEAD,
 `23dc4b38b9249e2f7814c099866be100ef0a54a0`, and its implementation and test

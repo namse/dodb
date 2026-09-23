@@ -1560,29 +1560,45 @@ struct MachineInfo {
 impl MachineInfo {
     fn collect() -> Self {
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-        let cpu_model = cpuinfo
-            .lines()
-            .find_map(|line| line.strip_prefix("model name\t: "))
-            .or_else(|| {
-                cpuinfo
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Model\t\t: "))
-            })
-            .unwrap_or("unknown")
-            .to_owned();
-        let cpu_cores = cpuinfo
-            .lines()
-            .find_map(|line| line.strip_prefix("cpu cores\t: "))
-            .and_then(|value| value.parse().ok());
-        let os = std::fs::read_to_string("/etc/os-release")
-            .ok()
-            .and_then(|contents| {
-                contents
-                    .lines()
-                    .find_map(|line| line.strip_prefix("PRETTY_NAME="))
-                    .map(|value| value.trim_matches('"').to_owned())
-            })
-            .unwrap_or_else(|| "unknown".to_owned());
+        let cpu_model = if cfg!(target_os = "macos") {
+            command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+        } else {
+            cpuinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("model name\t: "))
+                .or_else(|| {
+                    cpuinfo
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Model\t\t: "))
+                })
+                .unwrap_or("unknown")
+                .to_owned()
+        };
+        let cpu_cores = if cfg!(target_os = "macos") {
+            command_output("sysctl", &["-n", "hw.physicalcpu"])
+                .parse()
+                .ok()
+        } else {
+            cpuinfo
+                .lines()
+                .find_map(|line| line.strip_prefix("cpu cores\t: "))
+                .and_then(|value| value.parse().ok())
+        };
+        let os = if cfg!(target_os = "macos") {
+            let product_name = command_output("sw_vers", &["-productName"]);
+            let product_version = command_output("sw_vers", &["-productVersion"]);
+            format!("{product_name} {product_version}")
+        } else {
+            std::fs::read_to_string("/etc/os-release")
+                .ok()
+                .and_then(|contents| {
+                    contents
+                        .lines()
+                        .find_map(|line| line.strip_prefix("PRETTY_NAME="))
+                        .map(|value| value.trim_matches('"').to_owned())
+                })
+                .unwrap_or_else(|| "unknown".to_owned())
+        };
         Self {
             cpu_model,
             logical_cpus: std::thread::available_parallelism()
@@ -1607,15 +1623,35 @@ fn command_output(command: &str, args: &[&str]) -> String {
 }
 
 fn process_cpu_ticks() -> Option<u64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let after_command = stat.rsplit_once(") ")?.1;
-    let fields: Vec<_> = after_command.split_whitespace().collect();
-    let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
-    let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
-    Some(user_ticks.saturating_add(system_ticks))
+    #[cfg(target_os = "macos")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if result != 0 {
+            return None;
+        }
+        let usage = unsafe { usage.assume_init() };
+        let user_micros = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
+        let system_micros =
+            usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
+        return Some(user_micros.saturating_add(system_micros));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let after_command = stat.rsplit_once(") ")?.1;
+        let fields: Vec<_> = after_command.split_whitespace().collect();
+        let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+        let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+        Some(user_ticks.saturating_add(system_ticks))
+    }
 }
 
 fn clock_ticks_per_second() -> u64 {
+    if cfg!(target_os = "macos") {
+        return 1_000_000;
+    }
     command_output("getconf", &["CLK_TCK"])
         .parse()
         .unwrap_or(100)

@@ -1,5 +1,14 @@
 # Phase 0 Baseline Benchmark Results
 
+> Historical measurement notice: the numbers in this document were measured
+> on the previous machine and are preserved for historical context only. They
+> are not the current performance baseline. The current baseline is the new
+> machine rebaseline in [`rebaseline-results.md`](rebaseline-results.md),
+> with raw artifacts under
+> `docs/experiments/results/rebaseline-macbookpro17-1-macos26.4-8c8t/`.
+> The correctness results and storage semantics described here are not
+> invalidated by the machine change.
+
 This is the executed Phase 0 record for
 [`b-link-batched-engine.md`](b-link-batched-engine.md). It measures the
 current `main` B+Tree through the new sustained benchmark harness. It does not

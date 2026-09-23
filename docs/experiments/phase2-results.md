@@ -1,5 +1,14 @@
 # Phase 2 Results — Optimistic/Versioned Multicore Reads
 
+> Historical measurement notice: the performance numbers in this document
+> were measured on the previous machine and remain historical only. The
+> current Phase 2 baseline is in
+> [`rebaseline-results.md`](rebaseline-results.md), with separate raw
+> artifacts under
+> `docs/experiments/results/rebaseline-macbookpro17-1-macos26.4-8c8t/phase2/`.
+> The Phase 2 correctness, publication, and recovery results remain valid and
+> are not invalidated by the machine change.
+
 This is the Phase 2 companion to
 [`b-link-batched-engine.md`](b-link-batched-engine.md). The goal was to keep
 serial Blink writes unchanged while removing the Phase 1 benchmark adapter's
