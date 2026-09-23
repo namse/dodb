@@ -340,6 +340,7 @@ dependencies = [
  "dodb-core",
  "dodb-storage",
  "proptest",
+ "tokio",
 ]
 
 [[package]]
