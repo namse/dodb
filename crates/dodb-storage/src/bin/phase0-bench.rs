@@ -165,6 +165,7 @@ impl TransactionMode {
 enum SyncMode {
     Real,
     Injected,
+    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +202,7 @@ impl SyncMode {
         match value {
             "real" => Self::Real,
             "delay" | "injected" => Self::Injected,
+            "disabled" | "none" | "no-sync" => Self::Disabled,
             other => panic!("unknown sync mode {other:?}"),
         }
     }
@@ -209,6 +211,7 @@ impl SyncMode {
         match self {
             Self::Real => "real",
             Self::Injected => "injected",
+            Self::Disabled => "disabled",
         }
     }
 }
@@ -469,7 +472,7 @@ fn print_help() {
          --duration 2s --warmup 1s --repetitions 3\n\
          --cache-capacity 256 --working-set 4096 --key-size 16 --value-size 64\n\
          --group-limit 64 --group-bytes 4194304 --queue-capacity 256\n\
-         --collection-delay 500us --sync-mode real|injected --sync-delay 1ms\n\
+         --collection-delay 500us --sync-mode real|injected|disabled --sync-delay 1ms\n\
          --transaction-mode unconditional|insert-if-absent\n\
          --tokio-workers 12 --seed 0xd0db2026 --output target/phase0/results.jsonl"
     );
@@ -924,21 +927,34 @@ fn value_bytes(length: usize, operation: u64, offset: usize) -> Vec<u8> {
 
 struct BenchFile {
     inner: ProductionFile,
+    sync_mode: SyncMode,
     sync_delay: Duration,
 }
 
 impl BenchFile {
-    fn open(path: &Path, sync_delay: Duration) -> Result<Self> {
+    fn open(path: &Path, sync_mode: SyncMode, sync_delay: Duration) -> Result<Self> {
         Ok(Self {
             inner: ProductionFile::open(path)?,
+            sync_mode,
             sync_delay,
         })
     }
+}
 
-    fn delay(&self) {
-        if !self.sync_delay.is_zero() {
-            std::thread::sleep(self.sync_delay);
+fn perform_benchmark_sync(
+    mode: SyncMode,
+    delay: Duration,
+    real_sync: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    match mode {
+        SyncMode::Real => real_sync(),
+        SyncMode::Injected => {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            real_sync()
         }
+        SyncMode::Disabled => Ok(()),
     }
 }
 
@@ -960,13 +976,15 @@ impl DurableFile for BenchFile {
     }
 
     fn sync_data(&mut self) -> Result<()> {
-        self.delay();
-        self.inner.sync_data()
+        let mode = self.sync_mode;
+        let delay = self.sync_delay;
+        perform_benchmark_sync(mode, delay, || self.inner.sync_data())
     }
 
     fn sync_all(&mut self) -> Result<()> {
-        self.delay();
-        self.inner.sync_all()
+        let mode = self.sync_mode;
+        let delay = self.sync_delay;
+        perform_benchmark_sync(mode, delay, || self.inner.sync_all())
     }
 }
 
@@ -1972,6 +1990,7 @@ fn effective_sync(args: &Args, scenario: &Scenario) -> (SyncMode, Duration) {
         match args.sync_mode {
             SyncMode::Real => (SyncMode::Real, Duration::ZERO),
             SyncMode::Injected => (SyncMode::Injected, scenario.sync_delay),
+            SyncMode::Disabled => (SyncMode::Disabled, Duration::ZERO),
         }
     }
 }
@@ -2062,13 +2081,13 @@ async fn open_adapter(
     let data_path = benchmark_path(scenario, repetition, seed);
     let wal_path = data_path.with_extension("wal");
     remove_database_files(&data_path);
-    let (_, sync_delay) = effective_sync(args, scenario);
+    let (sync_mode, sync_delay) = effective_sync(args, scenario);
     let config = DatabaseConfig::default().with_cache_capacity(args.cache_capacity);
     match args.engine {
         EngineKind::MainBtree => {
             let mut store = BTreeStore::open_with_wal(
-                BenchFile::open(&data_path, sync_delay)?,
-                BenchFile::open(&wal_path, sync_delay)?,
+                BenchFile::open(&data_path, sync_mode, sync_delay)?,
+                BenchFile::open(&wal_path, sync_mode, sync_delay)?,
                 config,
             )?;
             let seeded = seed_store(&mut store, args, scenario)?;
@@ -2080,8 +2099,8 @@ async fn open_adapter(
         }
         EngineKind::SerialBlink => {
             let mut store = BlinkStore::open_with_wal(
-                BenchFile::open(&data_path, sync_delay)?,
-                BenchFile::open(&wal_path, sync_delay)?,
+                BenchFile::open(&data_path, sync_mode, sync_delay)?,
+                BenchFile::open(&wal_path, sync_mode, sync_delay)?,
                 config,
             )?;
             let requests = seed_requests(args, scenario);
@@ -2094,8 +2113,8 @@ async fn open_adapter(
         }
         EngineKind::VersionedBlink => {
             let mut store = BlinkStore::open_with_wal(
-                BenchFile::open(&data_path, sync_delay)?,
-                BenchFile::open(&wal_path, sync_delay)?,
+                BenchFile::open(&data_path, sync_mode, sync_delay)?,
+                BenchFile::open(&wal_path, sync_mode, sync_delay)?,
                 config,
             )?;
             let requests = seed_requests(args, scenario);
@@ -2108,8 +2127,8 @@ async fn open_adapter(
         }
         EngineKind::PlannedBlink => {
             let mut store = BlinkStore::open_with_wal(
-                BenchFile::open(&data_path, sync_delay)?,
-                BenchFile::open(&wal_path, sync_delay)?,
+                BenchFile::open(&data_path, sync_mode, sync_delay)?,
+                BenchFile::open(&wal_path, sync_mode, sync_delay)?,
                 config,
             )?;
             store.enable_planned_execution();
@@ -2656,6 +2675,47 @@ mod tests {
         assert_eq!(parse_duration("50us"), Duration::from_micros(50));
         assert_eq!(parse_duration("1ms"), Duration::from_millis(1));
         assert_eq!(parse_duration("2s"), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn disabled_sync_mode_aliases_parse_and_report_canonical_name() {
+        assert_eq!(SyncMode::parse("disabled"), SyncMode::Disabled);
+        assert_eq!(SyncMode::parse("none"), SyncMode::Disabled);
+        assert_eq!(SyncMode::parse("no-sync"), SyncMode::Disabled);
+        assert_eq!(SyncMode::Disabled.as_str(), "disabled");
+    }
+
+    #[test]
+    fn real_benchmark_sync_calls_real_sync_once() {
+        let mut closure_calls = 0;
+        let result = perform_benchmark_sync(SyncMode::Real, Duration::ZERO, || {
+            closure_calls += 1;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(closure_calls, 1);
+    }
+
+    #[test]
+    fn injected_benchmark_sync_calls_real_sync_once() {
+        let mut closure_calls = 0;
+        let result = perform_benchmark_sync(SyncMode::Injected, Duration::ZERO, || {
+            closure_calls += 1;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(closure_calls, 1);
+    }
+
+    #[test]
+    fn disabled_benchmark_sync_does_not_call_real_sync() {
+        let mut closure_calls = 0;
+        let result = perform_benchmark_sync(SyncMode::Disabled, Duration::ZERO, || {
+            closure_calls += 1;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(closure_calls, 0);
     }
 
     #[test]
