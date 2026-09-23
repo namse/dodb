@@ -13,11 +13,14 @@ Phase 2 result: [`phase2-results.md`](phase2-results.md)
 
 Phase 3 result: [`phase3-results.md`](phase3-results.md)
 
+Current OCI Phase 3 diagnostic result:
+[`phase3-oci-results.md`](phase3-oci-results.md)
+
 Phase 3 Mac runs are development smoke/profiling only. They are not the
 production benchmark, adoption evidence, or a final performance conclusion.
 The production target is an OCI A1 instance with 2 OCPU, 12 GiB RAM, and a
-100 GB block volume; the same implementation commit will be measured there
-before any adoption decision.
+200 GB block volume. The available OCI run is a deliberately partial
+diagnostic; it is not an adoption decision.
 
 Performance status:
 

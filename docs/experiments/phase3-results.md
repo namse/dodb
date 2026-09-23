@@ -12,7 +12,7 @@ Implementation commit used for the smoke runs: `4ad2ee895c43d930a234955fee17b86e
 The Mac results in this document are development smoke/profiling only. They
 are not a production benchmark, adoption evidence, an adoption-threshold
 decision, or a final main-versus-experimental performance conclusion. The
-production target is OCI A1 with 2 OCPU, 12 GiB RAM, and a 100 GB block
+production target is OCI A1 with 2 OCPU, 12 GiB RAM, and a 200 GB block
 volume. The same implementation commit must be measured there before an
 adoption decision.
 
@@ -323,10 +323,13 @@ short smoke counters. PageCatalog copy-on-write or chunked storage was not
 introduced because the measured Phase 3 priority was planner/coalescing and
 the existing immutable-generation contract is already preserved.
 
-## 11. OCI benchmark to run later
+## 11. OCI benchmark follow-up
 
-These commands are examples for the OCI A1 run and were not executed in this
-phase. Build and run the same final commit on OCI, then compare `main-btree`
+The partial OCI diagnostic results for the final Phase 3 branch HEAD are in
+[`phase3-oci-results.md`](phase3-oci-results.md). They are not a complete
+production benchmark or an adoption decision. The commands below remain
+historical examples and were not the commands used for that diagnostic. A
+future complete benchmark should compare `main-btree`
 with `planned-blink` under identical files, seeds, runtime workers, cache,
 working set, durability mode, and repetitions:
 
