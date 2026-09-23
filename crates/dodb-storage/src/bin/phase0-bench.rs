@@ -174,6 +174,7 @@ enum EngineKind {
     SerialBlink,
     VersionedBlink,
     PlannedBlink,
+    ParallelBlink,
 }
 
 impl EngineKind {
@@ -183,6 +184,7 @@ impl EngineKind {
             "serial-blink" | "blink" => Self::SerialBlink,
             "versioned-blink" | "blink-versioned" | "phase2" => Self::VersionedBlink,
             "planned-blink" | "blink-planned" | "phase3" => Self::PlannedBlink,
+            "parallel-blink" | "blink-parallel" | "phase4" => Self::ParallelBlink,
             other => panic!("unknown engine {other:?}"),
         }
     }
@@ -193,6 +195,7 @@ impl EngineKind {
             Self::SerialBlink => "serial-blink",
             Self::VersionedBlink => "versioned-blink",
             Self::PlannedBlink => "planned-blink",
+            Self::ParallelBlink => "parallel-blink",
         }
     }
 }
@@ -277,6 +280,7 @@ struct Args {
     sync_delay: Duration,
     transaction_mode: TransactionMode,
     tokio_workers: usize,
+    blink_workers: usize,
     seed: u64,
     output: PathBuf,
 }
@@ -309,6 +313,7 @@ impl Default for Args {
             transaction_mode: TransactionMode::Unconditional,
             tokio_workers: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
+            blink_workers: 2,
             seed: 0xd0db_2026_0000_0001,
             output: PathBuf::from(DEFAULT_OUTPUT),
         }
@@ -394,6 +399,9 @@ impl Args {
                 "--tokio-workers" => {
                     args.tokio_workers = parse_usize(&take_value(&mut values, &flag), &flag)
                 }
+                "--blink-workers" => {
+                    args.blink_workers = parse_usize(&take_value(&mut values, &flag), &flag)
+                }
                 "--seed" => args.seed = parse_u64(&take_value(&mut values, &flag), &flag),
                 "--output" => args.output = PathBuf::from(take_value(&mut values, &flag)),
                 other => panic!("unknown argument {other:?}; use --help"),
@@ -406,6 +414,7 @@ impl Args {
     fn validate(&self) {
         assert!(self.repetitions > 0, "repetitions must be positive");
         assert!(self.tokio_workers > 0, "tokio-workers must be positive");
+        assert!(self.blink_workers > 0, "blink-workers must be positive");
         assert!(self.working_set > 0, "working-set must be positive");
         assert!(self.key_size >= 2, "key-size must be at least 2 bytes");
         assert!(self.read_limit > 0, "read-limit must be positive");
@@ -464,7 +473,7 @@ fn print_help() {
     println!(
         "phase0-bench sustained baseline\n\n\
          Usage: cargo run --release -p dodb-storage --bin phase0-bench -- [options]\n\n\
-         --engine main-btree|serial-blink|versioned-blink|planned-blink\n\
+         --engine main-btree|serial-blink|versioned-blink|planned-blink|parallel-blink\n\
          Suites: write, read, mixed, delay-sweep, sync-sweep, all\n\
          Options: --writers 1,4 --readers 1,4 --widths 1,16\n\
          --distributions uniform,same-leaf-heavy,different-leaf-heavy\n\
@@ -474,7 +483,7 @@ fn print_help() {
          --group-limit 64 --group-bytes 4194304 --queue-capacity 256\n\
          --collection-delay 500us --sync-mode real|injected|disabled --sync-delay 1ms\n\
          --transaction-mode unconditional|insert-if-absent\n\
-         --tokio-workers 12 --seed 0xd0db2026 --output target/phase0/results.jsonl"
+         --tokio-workers 12 --blink-workers 2 --seed 0xd0db2026 --output target/phase0/results.jsonl"
     );
 }
 
@@ -1461,6 +1470,19 @@ struct MetricDelta {
     publication_swap_nanos: u64,
     retired_generation_drop_nanos: u64,
     dirty_tracking_nanos: u64,
+    parallel_groups: u64,
+    parallel_leaf_jobs: u64,
+    parallel_transactions: u64,
+    parallel_mutations: u64,
+    parallel_worker_dispatches: u64,
+    parallel_worker_nanos: u64,
+    parallel_join_nanos: u64,
+    parallel_fallback_groups: u64,
+    parallel_fallback_multi_leaf: u64,
+    parallel_fallback_dependency: u64,
+    parallel_fallback_overflow: u64,
+    parallel_fallback_structural: u64,
+    parallel_skipped_single_leaf: u64,
 }
 
 impl MetricDelta {
@@ -1679,6 +1701,55 @@ impl MetricDelta {
             dirty_tracking_nanos: subtraction(
                 batch_after.dirty_tracking_nanos,
                 batch_before.dirty_tracking_nanos,
+            ),
+            parallel_groups: subtraction(batch_after.parallel_groups, batch_before.parallel_groups),
+            parallel_leaf_jobs: subtraction(
+                batch_after.parallel_leaf_jobs,
+                batch_before.parallel_leaf_jobs,
+            ),
+            parallel_transactions: subtraction(
+                batch_after.parallel_transactions,
+                batch_before.parallel_transactions,
+            ),
+            parallel_mutations: subtraction(
+                batch_after.parallel_mutations,
+                batch_before.parallel_mutations,
+            ),
+            parallel_worker_dispatches: subtraction(
+                batch_after.parallel_worker_dispatches,
+                batch_before.parallel_worker_dispatches,
+            ),
+            parallel_worker_nanos: subtraction(
+                batch_after.parallel_worker_nanos,
+                batch_before.parallel_worker_nanos,
+            ),
+            parallel_join_nanos: subtraction(
+                batch_after.parallel_join_nanos,
+                batch_before.parallel_join_nanos,
+            ),
+            parallel_fallback_groups: subtraction(
+                batch_after.parallel_fallback_groups,
+                batch_before.parallel_fallback_groups,
+            ),
+            parallel_fallback_multi_leaf: subtraction(
+                batch_after.parallel_fallback_multi_leaf,
+                batch_before.parallel_fallback_multi_leaf,
+            ),
+            parallel_fallback_dependency: subtraction(
+                batch_after.parallel_fallback_dependency,
+                batch_before.parallel_fallback_dependency,
+            ),
+            parallel_fallback_overflow: subtraction(
+                batch_after.parallel_fallback_overflow,
+                batch_before.parallel_fallback_overflow,
+            ),
+            parallel_fallback_structural: subtraction(
+                batch_after.parallel_fallback_structural,
+                batch_before.parallel_fallback_structural,
+            ),
+            parallel_skipped_single_leaf: subtraction(
+                batch_after.parallel_skipped_single_leaf,
+                batch_before.parallel_skipped_single_leaf,
             ),
         }
     }
@@ -2185,6 +2256,22 @@ async fn open_adapter(
             let adapter = BlinkAdapter::start_versioned(store, benchmark_config(args, scenario));
             Ok((Arc::new(adapter), data_path, seeded))
         }
+        EngineKind::ParallelBlink => {
+            let mut store = BlinkStore::open_with_wal(
+                BenchFile::open(&data_path, sync_mode, sync_delay)?,
+                BenchFile::open(&wal_path, sync_mode, sync_delay)?,
+                config,
+            )?;
+            store.enable_planned_execution();
+            let requests = seed_requests(args, scenario);
+            let seeded = requests.iter().map(|request| request.mutations.len()).sum();
+            for chunk in requests.chunks(64) {
+                store.apply_transaction_group(chunk)?;
+            }
+            store.enable_parallel_execution(args.blink_workers)?;
+            let adapter = BlinkAdapter::start_versioned(store, benchmark_config(args, scenario));
+            Ok((Arc::new(adapter), data_path, seeded))
+        }
     }
 }
 
@@ -2321,6 +2408,7 @@ fn build_record(
     json.string("kernel", &machine.kernel);
     json.string("rust_version", &machine.rust_version);
     json.usize("tokio_workers", args.tokio_workers);
+    json.usize("blink_workers", args.blink_workers);
     json.string("suite", scenario.suite.as_str());
     json.string("workload", scenario.workload);
     json.usize("writers", scenario.writers);
@@ -2511,6 +2599,46 @@ fn build_record(
         delta.retired_generation_drop_nanos,
     );
     json.u64("dirty_tracking_nanos_total", delta.dirty_tracking_nanos);
+    json.u64("parallel_groups_delta", delta.parallel_groups);
+    json.u64("parallel_leaf_jobs_delta", delta.parallel_leaf_jobs);
+    json.u64("parallel_transactions_delta", delta.parallel_transactions);
+    json.u64("parallel_mutations_delta", delta.parallel_mutations);
+    json.u64(
+        "parallel_worker_dispatches_delta",
+        delta.parallel_worker_dispatches,
+    );
+    json.u64("parallel_worker_nanos_total", delta.parallel_worker_nanos);
+    json.u64("parallel_join_nanos_total", delta.parallel_join_nanos);
+    if delta.parallel_join_nanos > 0 {
+        json.f64(
+            "effective_worker_parallelism",
+            delta.parallel_worker_nanos as f64 / delta.parallel_join_nanos as f64,
+        );
+    }
+    json.u64(
+        "parallel_fallback_groups_delta",
+        delta.parallel_fallback_groups,
+    );
+    json.u64(
+        "parallel_fallback_multi_leaf_delta",
+        delta.parallel_fallback_multi_leaf,
+    );
+    json.u64(
+        "parallel_fallback_dependency_delta",
+        delta.parallel_fallback_dependency,
+    );
+    json.u64(
+        "parallel_fallback_overflow_delta",
+        delta.parallel_fallback_overflow,
+    );
+    json.u64(
+        "parallel_fallback_structural_delta",
+        delta.parallel_fallback_structural,
+    );
+    json.u64(
+        "parallel_skipped_single_leaf_delta",
+        delta.parallel_skipped_single_leaf,
+    );
     json.string(
         "component_timing_scope",
         "existing cumulative coordinator/storage/WAL metrics; per-request component percentiles unavailable without production hot-path instrumentation",
@@ -2684,6 +2812,21 @@ mod tests {
             transaction_mode: TransactionMode::Unconditional,
             read_limit: 16,
         }
+    }
+
+    #[test]
+    fn parallel_engine_aliases_and_worker_default_are_stable() {
+        assert_eq!(
+            EngineKind::parse("parallel-blink"),
+            EngineKind::ParallelBlink
+        );
+        assert_eq!(
+            EngineKind::parse("blink-parallel"),
+            EngineKind::ParallelBlink
+        );
+        assert_eq!(EngineKind::parse("phase4"), EngineKind::ParallelBlink);
+        assert_eq!(EngineKind::ParallelBlink.as_str(), "parallel-blink");
+        assert_eq!(Args::default().blink_workers, 2);
     }
 
     #[test]
