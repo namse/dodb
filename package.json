@@ -34,6 +34,11 @@
     "formal:publication:test": "quint test formal/quint/publication_visibility.qnt --backend=rust",
     "formal:publication:simulate": "quint run formal/quint/publication_visibility.qnt --invariant=state_invariants --max-samples=5000 --max-steps=25 --seed=0x20260923 --witnesses publicationPathAReached publicationPathBReached publicationPathCReached publicationPathDReached publicationPathEReached publicationPathFReached",
     "formal:publication:verify:tlc": "quint verify formal/quint/publication_visibility.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants",
-    "formal:publication:verify:apalache": "quint verify formal/quint/publication_visibility.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants"
+    "formal:publication:verify:apalache": "quint verify formal/quint/publication_visibility.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants",
+    "formal:checkpoint:typecheck": "quint typecheck formal/quint/checkpoint_reset.qnt",
+    "formal:checkpoint:test": "quint test formal/quint/checkpoint_reset.qnt --backend=rust",
+    "formal:checkpoint:simulate": "quint run formal/quint/checkpoint_reset.qnt --invariant=state_invariants --max-samples=10000 --max-steps=30 --seed=0x20260923 --witnesses checkpointPathAReached checkpointPathBReached checkpointPathCZeroReached checkpointPathCFiveReached checkpointPathDOldWalReached checkpointPathDEmptyWalReached checkpointPathEReached checkpointPathFReached checkpointPathGReached checkpointPathHReached",
+    "formal:checkpoint:verify:tlc": "quint verify formal/quint/checkpoint_reset.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=30 --invariants state_invariants",
+    "formal:checkpoint:verify:apalache": "quint verify formal/quint/checkpoint_reset.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=30 --invariants state_invariants"
   }
 }

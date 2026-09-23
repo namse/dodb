@@ -196,3 +196,35 @@ npm run formal:publication:simulate
 npm run formal:publication:verify:tlc
 npm run formal:publication:verify:apalache
 ```
+
+## Checkpoint and WAL reset model
+
+`checkpoint_reset.qnt` starts with A+B durable in the old WAL and models
+checkpointing the latest logical state through data-file durable flush,
+alternate checkpoint-superblock durability, the invariant gate, WAL truncation,
+WAL reset INIT history boundary, and crash recovery from old, empty, torn-init,
+and new WAL states. It checks checkpoint recovery and next-LSN/history
+monotonicity across each crash point, including completion failure after reset.
+
+A checkpoint makes the data file authoritative before reclaiming WAL history.
+
+Data survival alone is insufficient: after WAL reset, the recovered next LSN
+must not move behind the reclaimed history boundary.
+
+The abstract production sequence is dirty pages and current transaction
+superblock writes followed by data sync; alternate checkpoint metadata write and
+sync; `check_invariants()`; WAL truncate and sync; new INIT write and sync; then
+checkpoint completion. An empty WAL reinitializes from the checkpoint hint,
+and a torn reset INIT is repaired and reinitialized from that same hint. A
+failure before checkpoint completion leaves an already durable checkpoint in
+place. Exact page writes, checksums, superblock encoding, byte-level INIT
+prefixes, and B+Tree page layout are outside this model and remain covered by
+Rust tests.
+
+```sh
+npm run formal:checkpoint:typecheck
+npm run formal:checkpoint:test
+npm run formal:checkpoint:simulate
+npm run formal:checkpoint:verify:tlc
+npm run formal:checkpoint:verify:apalache
+```
