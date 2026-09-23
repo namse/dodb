@@ -43,6 +43,13 @@ to check that one invalid request does not block later requests in the group;
 it does not formalize all Rust input-validation cases, such as duplicate
 conditions or mutations and oversized input.
 
+`coordinator_segments.qnt` models FIFO coordinator segmentation for one fixed
+request sequence. Mutation-like requests, including `ConditionOnly`, are
+consumed as maximal contiguous segments; each barrier is processed separately
+and records the current logical state. Independent serial and segmentation
+references check each processed prefix. The model does not reimplement
+transaction semantics.
+
 Validation reads the immutable `baseState`. Mutation preparation computes a
 private `stagedState` with one commit LSN for every changed key. Only
 `commitPrepared` changes `committedState` and advances `nextLsn`. A
@@ -83,6 +90,11 @@ npm run formal:group:test
 npm run formal:group:simulate
 npm run formal:group:verify:tlc
 npm run formal:group:verify:apalache
+npm run formal:segments:typecheck
+npm run formal:segments:test
+npm run formal:segments:simulate
+npm run formal:segments:verify:tlc
+npm run formal:segments:verify:apalache
 ```
 
 The initial verification bound is two keys, two setup commits, finite values,
