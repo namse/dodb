@@ -85,9 +85,9 @@ impl TransactionRequest {
 
     /// Rejects ambiguous requests before any storage preparation takes place.
     pub fn validate(&self) -> crate::Result<()> {
-        if self.mutations.is_empty() {
+        if self.conditions.is_empty() && self.mutations.is_empty() {
             return Err(crate::Error::invalid_request(
-                "a transaction must contain at least one mutation",
+                "a transaction must contain at least one condition or mutation",
             ));
         }
 
@@ -113,9 +113,12 @@ impl TransactionRequest {
 }
 
 /// The committed identity returned for one successful logical transaction.
+///
+/// Condition-only transactions successfully validate their read predicates
+/// without creating a logical commit, so their commit identity is `None`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionResult {
-    pub commit_lsn: Lsn,
+    pub commit_lsn: Option<Lsn>,
 }
 
 /// Structured expected-vs-actual information for an optimistic conflict.

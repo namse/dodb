@@ -490,8 +490,11 @@ fn randomized_transaction_groups_match_the_reference_model() {
         for (request, result) in requests.into_iter().zip(actual) {
             match result {
                 Ok(transaction) => {
+                    let commit_lsn = transaction
+                        .commit_lsn
+                        .expect("mutation transaction should have a commit LSN");
                     reference
-                        .transact_at(request, transaction.commit_lsn)
+                        .transact_at(request, commit_lsn)
                         .expect("reference should accept a successful real transaction");
                 }
                 Err(dodb_core::Error::Conflict(_)) => {

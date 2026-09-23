@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use dodb_core::{
-    DocumentKey, Error, ObservedState, RevisionState, ShardId, TenantId, TransactionCondition,
+    Error, ObservedState, RevisionState, ShardId, TenantId, TransactionCondition,
     TransactionConflict, TransactionRequest,
 };
 use dodb_protocol::{
@@ -774,55 +774,39 @@ impl LocalTenantService {
         request: TransactionRequest,
         _budget: ExecutionBudget,
     ) -> Result<Response, Error> {
-        if request.mutations.is_empty() {
-            validate_condition_keys(&request.conditions)?;
-            if request.conditions.is_empty() {
-                return Err(Error::invalid_request(
-                    "a condition-only transaction must contain at least one condition",
-                ));
-            }
-            let keys = request
-                .conditions
-                .iter()
-                .map(|condition| condition.key().clone())
-                .collect::<Vec<_>>();
-            let states = self.observe_states(tenant, &keys).await?;
-            let state_map = keys.into_iter().zip(states).collect::<BTreeMap<_, _>>();
-            for condition in &request.conditions {
-                let actual = state_map
-                    .get(condition.key())
-                    .ok_or_else(|| Error::invariant("condition key missing from point snapshot"))?;
-                if !condition_matches(condition, actual) {
-                    return Err(Error::conflict(TransactionConflict {
-                        key: condition.key().clone(),
-                        expected: condition.expectation(),
-                        actual: *actual,
-                    }));
+        request.validate()?;
+        let commit_lsn =
+            if request.mutations.is_empty() {
+                match self.read_shard(tenant).await? {
+                    Some(shard) => shard.execute_transaction(request).await?.commit_lsn,
+                    None => {
+                        let actual = ObservedState::missing(dodb_core::Revision::ZERO);
+                        for condition in &request.conditions {
+                            if !condition_matches(condition, &actual) {
+                                return Err(Error::conflict(TransactionConflict {
+                                    key: condition.key().clone(),
+                                    expected: condition.expectation(),
+                                    actual,
+                                }));
+                            }
+                        }
+                        None
+                    }
                 }
-            }
-            return Ok(Response::Transact(
-                TransactionOutcome::conditions_satisfied(),
-            ));
-        }
-        let shard = self.open_shard(tenant).await?;
-        let result = shard.execute_transaction(request).await?;
-        Ok(Response::Transact(TransactionOutcome::committed(
-            result.commit_lsn,
-        )))
-    }
-
-    async fn observe_states(
-        &self,
-        tenant: TenantId,
-        keys: &[DocumentKey],
-    ) -> Result<Vec<ObservedState>, Error> {
-        match self.read_shard(tenant).await? {
-            Some(shard) => shard.observe(keys.to_vec()).await,
-            None => Ok(keys
-                .iter()
-                .map(|_| ObservedState::missing(dodb_core::Revision::ZERO))
-                .collect()),
-        }
+            } else {
+                let result = self
+                    .open_shard(tenant)
+                    .await?
+                    .execute_transaction(request)
+                    .await?;
+                Some(result.commit_lsn.ok_or_else(|| {
+                    Error::invariant("mutation transaction returned no commit LSN")
+                })?)
+            };
+        Ok(Response::Transact(match commit_lsn {
+            Some(commit_lsn) => TransactionOutcome::committed(commit_lsn),
+            None => TransactionOutcome::conditions_satisfied(),
+        }))
     }
 
     async fn read_shard(
@@ -940,18 +924,6 @@ fn database_uuid(tenant: TenantId, shard: ShardId) -> [u8; 16] {
     uuid[..8].copy_from_slice(&first.to_be_bytes());
     uuid[8..].copy_from_slice(&second.to_be_bytes());
     uuid
-}
-
-fn validate_condition_keys(conditions: &[TransactionCondition]) -> Result<(), Error> {
-    let mut keys = BTreeSet::new();
-    for condition in conditions {
-        if !keys.insert(condition.key().clone()) {
-            return Err(Error::invalid_request(
-                "a transaction contains multiple conditions for one key",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn condition_matches(condition: &TransactionCondition, actual: &ObservedState) -> bool {

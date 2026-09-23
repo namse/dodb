@@ -325,6 +325,35 @@ async fn loopback_protocol_preserves_storage_semantics_and_lazy_creation() {
         .await
         .unwrap();
     assert!(first_revision > Revision::ZERO);
+    let existing_condition_only = client
+        .transact(TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: missing_key.clone(),
+                expected_revision: first_revision,
+            }],
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        existing_condition_only,
+        TransactionOutcome::conditions_satisfied()
+    );
+    let stale_condition_only = client
+        .transact(TransactionRequest::new(
+            vec![TransactionCondition::RevisionEquals {
+                key: missing_key.clone(),
+                expected_revision: Revision::ZERO,
+            }],
+            Vec::new(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_condition_only,
+        ClientError::Application(error)
+            if error.kind == dodb_protocol::ApplicationErrorKind::Conflict
+    ));
     assert_eq!(
         client.get(missing_key.clone()).await.unwrap(),
         RevisionState::present(vec![0, 0xff, 1], first_revision)

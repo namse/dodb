@@ -669,12 +669,17 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         for request in requests {
             let preparation_started = Instant::now();
             match overlay.prepare_transaction(request) {
-                Ok(candidate) => {
-                    let commit_lsn = candidate
-                        .commit_lsn
-                        .ok_or_else(|| Error::invariant("transaction has no commit LSN"))?;
+                Ok(Some(candidate)) => {
+                    let commit_lsn = candidate.commit_lsn.ok_or_else(|| {
+                        Error::invariant("mutation transaction has no commit LSN")
+                    })?;
                     prepared.push(candidate);
-                    results.push(Ok(TransactionResult { commit_lsn }));
+                    results.push(Ok(TransactionResult {
+                        commit_lsn: Some(commit_lsn),
+                    }));
+                }
+                Ok(None) => {
+                    results.push(Ok(TransactionResult { commit_lsn: None }));
                 }
                 Err(error @ Error::Conflict(_))
                 | Err(error @ Error::InvalidRequest(_))
@@ -1335,7 +1340,10 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
         Ok(())
     }
 
-    fn prepare_transaction(&mut self, request: &TransactionRequest) -> Result<PreparedBatch> {
+    fn prepare_transaction(
+        &mut self,
+        request: &TransactionRequest,
+    ) -> Result<Option<PreparedBatch>> {
         let validation_started = Instant::now();
         request.validate()?;
         for mutation in &request.mutations {
@@ -1363,6 +1371,10 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
         self.store
             .add_validation_time(elapsed_nanos(validation_started));
 
+        if request.mutations.is_empty() {
+            return Ok(None);
+        }
+
         for mutation in &request.mutations {
             match mutation {
                 TransactionMutation::Put { key, value } => {
@@ -1373,7 +1385,7 @@ impl<'a, F: DurableFile, W: DurableFile> Overlay<'a, F, W> {
                 }
             }
         }
-        self.finish_transaction()
+        self.finish_transaction().map(Some)
     }
 
     fn finish_transaction(&mut self) -> Result<PreparedBatch> {

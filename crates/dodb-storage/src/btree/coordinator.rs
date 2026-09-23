@@ -583,21 +583,31 @@ fn process_segment<F: DurableFile, W: DurableFile>(
             .into_iter()
             .zip(operations)
             .map(|(result, operation)| {
-                result.map(|transaction| match operation {
+                result.and_then(|transaction| match operation {
                     CoordinatorOperation::Batch {
                         request: BatchRequest::Put { .. },
                         ..
-                    } => CoordinatorResponse::Batch(BatchResponse::Put(Revision::from(
-                        transaction.commit_lsn,
-                    ))),
+                    } => transaction
+                        .commit_lsn
+                        .ok_or_else(|| Error::invariant("put transaction has no commit LSN"))
+                        .map(|commit_lsn| {
+                            CoordinatorResponse::Batch(BatchResponse::Put(Revision::from(
+                                commit_lsn,
+                            )))
+                        }),
                     CoordinatorOperation::Batch {
                         request: BatchRequest::Delete { .. },
                         ..
-                    } => CoordinatorResponse::Batch(BatchResponse::Delete(Revision::from(
-                        transaction.commit_lsn,
-                    ))),
+                    } => transaction
+                        .commit_lsn
+                        .ok_or_else(|| Error::invariant("delete transaction has no commit LSN"))
+                        .map(|commit_lsn| {
+                            CoordinatorResponse::Batch(BatchResponse::Delete(Revision::from(
+                                commit_lsn,
+                            )))
+                        }),
                     CoordinatorOperation::Transaction(_) => {
-                        CoordinatorResponse::Transaction(transaction)
+                        Ok(CoordinatorResponse::Transaction(transaction))
                     }
                     _ => unreachable!("non-mutation operation entered a write group"),
                 })

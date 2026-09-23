@@ -518,8 +518,8 @@ async fn async_shard_keeps_logical_transaction_lsns_distinct() {
     let first = shard.execute_transaction(put_transaction(a.clone(), b"a"));
     let second = shard.execute_transaction(put_transaction(b.clone(), b"b"));
     let (first, second) = tokio::join!(first, second);
-    let first = first.unwrap().commit_lsn;
-    let second = second.unwrap().commit_lsn;
+    let first = first.unwrap().commit_lsn.unwrap();
+    let second = second.unwrap().commit_lsn.unwrap();
     assert_ne!(first, second);
     assert_eq!(shard.transact_get(vec![a, b]).await.unwrap().len(), 2);
     shard.close().await.unwrap();
@@ -780,8 +780,9 @@ fn transaction_workflow_validates_all_point_dependencies_and_commits_atomically(
         ],
     );
     let result = store.transact(request).unwrap();
-    assert_eq!(store.get(&a).unwrap().revision(), result.commit_lsn.into());
-    assert_eq!(store.get(&c).unwrap().revision(), result.commit_lsn.into());
+    let commit_lsn = result.commit_lsn.unwrap();
+    assert_eq!(store.get(&a).unwrap().revision(), commit_lsn.into());
+    assert_eq!(store.get(&c).unwrap().revision(), commit_lsn.into());
     assert_eq!(store.get(&b).unwrap().revision(), b_revision);
 }
 
@@ -853,9 +854,9 @@ fn transaction_group_assigns_separate_lsns_and_stages_shared_pages_in_order() {
             put_transaction(a.clone(), b"a-again"),
         ])
         .unwrap();
-    let first = results[0].as_ref().unwrap().commit_lsn;
-    let second = results[1].as_ref().unwrap().commit_lsn;
-    let third = results[2].as_ref().unwrap().commit_lsn;
+    let first = results[0].as_ref().unwrap().commit_lsn.unwrap();
+    let second = results[1].as_ref().unwrap().commit_lsn.unwrap();
+    let third = results[2].as_ref().unwrap().commit_lsn.unwrap();
     assert!(first < second && second < third);
     let metrics = store.wal_metrics().unwrap().unwrap();
     assert_eq!(metrics.committed_batches, 3);
@@ -946,6 +947,102 @@ fn transact_get_preserves_input_order_and_revisions() {
 }
 
 #[test]
+fn condition_only_transaction_succeeds_without_a_logical_commit() {
+    let mut store =
+        BTreeStore::open_with_wal(MemoryFile::default(), MemoryFile::default(), config(8)).unwrap();
+    let existing = key(b"condition-only", b"existing");
+    let other_existing = key(b"condition-only", b"other-existing");
+    let missing = key(b"condition-only", b"missing");
+    let revision = store.put(existing.clone(), b"value").unwrap();
+    store.put(other_existing.clone(), b"other-value").unwrap();
+    let state_before = store.get(&existing).unwrap();
+    let generation_before = store.current_superblock().generation;
+    let wal_before = store.wal_metrics().unwrap().unwrap();
+
+    let result = store
+        .transact(TransactionRequest::new(
+            vec![
+                TransactionCondition::RevisionEquals {
+                    key: existing.clone(),
+                    expected_revision: revision,
+                },
+                TransactionCondition::Exists {
+                    key: other_existing,
+                },
+                TransactionCondition::NotExists { key: missing },
+            ],
+            Vec::new(),
+        ))
+        .unwrap();
+
+    assert_eq!(result.commit_lsn, None);
+    assert_eq!(store.get(&existing).unwrap(), state_before);
+    assert_eq!(store.current_superblock().generation, generation_before);
+    assert_eq!(store.wal_metrics().unwrap().unwrap(), wal_before);
+}
+
+#[test]
+fn condition_only_transaction_reports_stale_and_presence_conflicts() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let existing = key(b"condition-only", b"existing");
+    let missing = key(b"condition-only", b"missing");
+    let revision = store.put(existing.clone(), b"value").unwrap();
+
+    let stale = store.transact(TransactionRequest::new(
+        vec![TransactionCondition::RevisionEquals {
+            key: existing.clone(),
+            expected_revision: Revision::new(revision.get().saturating_sub(1)),
+        }],
+        Vec::new(),
+    ));
+    assert!(matches!(stale, Err(Error::Conflict(_))));
+
+    let missing_exists = store.transact(TransactionRequest::new(
+        vec![TransactionCondition::Exists {
+            key: missing.clone(),
+        }],
+        Vec::new(),
+    ));
+    assert!(matches!(missing_exists, Err(Error::Conflict(_))));
+
+    let existing_not_exists = store.transact(TransactionRequest::new(
+        vec![TransactionCondition::NotExists { key: existing }],
+        Vec::new(),
+    ));
+    assert!(matches!(existing_not_exists, Err(Error::Conflict(_))));
+}
+
+#[test]
+fn multiple_condition_only_predicates_are_atomic() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let existing = key(b"condition-only", b"existing");
+    let missing = key(b"condition-only", b"missing");
+    let other_missing = key(b"condition-only", b"other-missing");
+    let revision = store.put(existing.clone(), b"value").unwrap();
+
+    let result = store.transact(TransactionRequest::new(
+        vec![
+            TransactionCondition::RevisionEquals {
+                key: existing.clone(),
+                expected_revision: revision,
+            },
+            TransactionCondition::NotExists {
+                key: missing.clone(),
+            },
+            TransactionCondition::Exists { key: other_missing },
+        ],
+        Vec::new(),
+    ));
+    match result {
+        Err(Error::Conflict(conflict)) => {
+            assert_eq!(conflict.key, key(b"condition-only", b"other-missing"));
+        }
+        other => panic!("expected a condition conflict, got {other:?}"),
+    }
+    assert_eq!(store.get(&existing).unwrap().revision(), revision);
+}
+
+#[test]
 fn ambiguous_transaction_mutations_are_rejected_without_changes() {
     let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
     let key = key(b"p", b"duplicate");
@@ -967,4 +1064,25 @@ fn ambiguous_transaction_mutations_are_rejected_without_changes() {
         store.get(&key).unwrap(),
         RevisionState::missing(Revision::ZERO)
     );
+}
+
+#[test]
+fn duplicate_conditions_and_empty_transactions_are_rejected() {
+    let mut store = BTreeStore::open(MemoryFile::default(), config(8)).unwrap();
+    let key = key(b"p", b"duplicate-condition");
+    let duplicate_conditions = TransactionRequest::new(
+        vec![
+            TransactionCondition::Exists { key: key.clone() },
+            TransactionCondition::NotExists { key },
+        ],
+        Vec::new(),
+    );
+    assert!(matches!(
+        store.transact(duplicate_conditions),
+        Err(Error::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        store.transact(TransactionRequest::new(Vec::new(), Vec::new())),
+        Err(Error::InvalidRequest(_))
+    ));
 }
