@@ -7,6 +7,8 @@ Branch: `experiment/b-link-batched-engine`
 
 Starting HEAD: `863017b08ba0d344d18c7c2b8b4866cbe1070c5f`
 
+Implementation commit used for the smoke runs: `4ad2ee895c43d930a234955fee17b86e6750e32a`
+
 The Mac results in this document are development smoke/profiling only. They
 are not a production benchmark, adoption evidence, an adoption-threshold
 decision, or a final main-versus-experimental performance conclusion. The
@@ -198,9 +200,9 @@ release binary are:
 | Engine/workload | Logical transactions | Full-state clones | Clones/group | Clones/transaction |
 | --- | ---: | ---: | ---: | ---: |
 | `serial-blink`, 1 writer, width 1, uniform | 35 | 105 | 3.00 | 3.00 |
-| `planned-blink`, 1 writer, width 1, uniform | 37 | 37 | 1.00 | 1.00 |
-| `serial-blink`, 16 writers, width 1, uniform | 213 | 455 | 15.69 | 2.14 |
-| `planned-blink`, 16 writers, width 1, uniform | 253 | 32 | 1.00 | 0.13 |
+| `planned-blink`, 1 writer, width 1, uniform | 36 | 36 | 1.00 | 1.00 |
+| `serial-blink`, 16 writers, width 1, uniform | 224 | 476 | 17.00 | 2.13 |
+| `planned-blink`, 16 writers, width 1, uniform | 245 | 30 | 1.00 | 0.12 |
 
 The counts come from separate short runs with different request totals and
 are clone-attribution evidence, not a throughput comparison. The planned
@@ -211,8 +213,8 @@ Representative planner locality observations:
 
 | Planned workload | Leaf groups | Same-leaf groups | Route reuse | Coalesced mutations | Independent leaf groups | Leaf loads |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 16 writers, width 16, same-leaf-heavy | 91 | 91 | 3,781 | 3,417 | 0 | 455 |
-| 16 writers, width 1, different-leaf-heavy | 238 | 2 | 2 | 0 | 238 | 240 |
+| 16 writers, width 16, same-leaf-heavy | 96 | 96 | 3,632 | 3,299 | 0 | 429 |
+| 16 writers, width 1, different-leaf-heavy | 238 | 4 | 4 | 0 | 238 | 242 |
 
 The first row demonstrates same-leaf setup reuse. The second demonstrates
 that the planner can expose independent leaf groups when transactions are
@@ -263,29 +265,29 @@ regressions and planner behavior:
 
 | 16 writers, width 16 | `serial-blink` tx/s | `versioned-blink` tx/s | `planned-blink` tx/s |
 | --- | ---: | ---: | ---: |
-| uniform | 690.7 | 647.3 | 644.0 |
-| same-leaf-heavy | 1,064.1 | 1,118.2 | 1,153.3 |
-| different-leaf-heavy | 1,112.9 | 1,100.3 | 1,090.3 |
+| uniform | 650.4 | 651.4 | 625.5 |
+| same-leaf-heavy | 1,150.2 | 1,092.8 | 1,091.2 |
+| different-leaf-heavy | 1,477.8 | 1,114.8 | 1,072.7 |
 
 The values vary with the short run and are not used as Phase 3 performance
 evidence or adoption evidence. No official 1/4/16/32/64/128 sweep was run.
 
 Read regression smoke produced zero errors and kept the direct versioned read
-path active. At 16 readers, `planned-blink` measured approximately 1.91M
-Get/s, 0.75M Query/s, and 0.97M Scan/s in this run; the corresponding
-`versioned-blink` controls were approximately 1.90M, 0.94M, and 1.11M/s.
+path active. At 16 readers, `planned-blink` measured approximately 1.89M
+Get/s, 0.94M Query/s, and 1.01M Scan/s in this run; the corresponding
+`versioned-blink` controls were approximately 1.87M, 0.92M, and 1.09M/s.
 The result is only a regression signal for this Mac and workload.
 
 Mixed smoke also produced zero errors:
 
 | Mix, 16 readers / 16 writers | Planned write tx/s | Planned read ops/s | Planning time | Physical execution time |
 | --- | ---: | ---: | ---: | ---: |
-| 95/5 | 1,230.8 | 23,985.2 | 2.59 ms | 10.16 ms |
-| 50/50 | 1,691.3 | 1,914.7 | 3.01 ms | 10.38 ms |
+| 95/5 | 1,505.6 | 29,214.7 | 3.96 ms | 10.74 ms |
+| 50/50 | 1,720.1 | 1,962.0 | 3.64 ms | 12.57 ms |
 
 The times are cumulative counters for the short process run, not per-request
-latencies. The same runs reported catalog construction of 0.51 ms and 0.54
-ms, and generation publication of 0.43 ms and 0.55 ms. WAL sync time was much
+latencies. The same runs reported catalog construction of 0.64 ms and 0.51
+ms, and generation publication of 0.61 ms and 0.78 ms. WAL sync time was much
 larger than planner time under this injected-sync file path. Within the
 planner/tree portion, serial physical execution is currently the largest
 measured Phase 3 component; the WAL image and durability path remain
