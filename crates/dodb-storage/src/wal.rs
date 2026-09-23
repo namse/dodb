@@ -136,6 +136,9 @@ pub struct WalMetrics {
     pub page_images: usize,
     pub append_nanos: u64,
     pub sync_nanos: u64,
+    pub group_encode_nanos: u64,
+    pub group_write_nanos: u64,
+    pub physical_write_calls: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +159,13 @@ struct PendingBatch {
     digest_input: Vec<u8>,
 }
 
+struct EncodedWalGroup {
+    bytes: Vec<u8>,
+    reports: Vec<WalAppendReport>,
+    next_lsn: Lsn,
+    next_batch_id: u64,
+}
+
 /// A WAL file with a validated in-memory index of complete commits.
 pub struct WalLog<F: DurableFile> {
     file: F,
@@ -170,6 +180,9 @@ pub struct WalLog<F: DurableFile> {
     page_images: usize,
     append_nanos: u64,
     sync_nanos: u64,
+    group_encode_nanos: u64,
+    group_write_nanos: u64,
+    physical_write_calls: u64,
     page_image_format: WalPageImageFormat,
 }
 
@@ -272,6 +285,9 @@ impl<F: DurableFile> WalLog<F> {
             page_images,
             append_nanos: 0,
             sync_nanos: 0,
+            group_encode_nanos: 0,
+            group_write_nanos: 0,
+            physical_write_calls: 0,
             page_image_format,
         })
     }
@@ -300,6 +316,9 @@ impl<F: DurableFile> WalLog<F> {
             page_images: 0,
             append_nanos: 0,
             sync_nanos: 0,
+            group_encode_nanos: 0,
+            group_write_nanos: 0,
+            physical_write_calls: 0,
             page_image_format,
         };
         let payload = wal.identity_payload(start_after_lsn);
@@ -417,6 +436,9 @@ impl<F: DurableFile> WalLog<F> {
             page_images: self.page_images,
             append_nanos: self.append_nanos,
             sync_nanos: self.sync_nanos,
+            group_encode_nanos: self.group_encode_nanos,
+            group_write_nanos: self.group_write_nanos,
+            physical_write_calls: self.physical_write_calls,
         })
     }
 
@@ -453,31 +475,42 @@ impl<F: DurableFile> WalLog<F> {
 
         let append_started = Instant::now();
         hit(&mut injector, "before_wal_append")?;
-        let mut next_lsn = self.next_lsn;
-        let mut next_batch_id = self.next_batch_id;
-        let mut reports = Vec::with_capacity(commits.len());
-        let mut committed = Vec::with_capacity(commits.len());
+        let (reports, next_lsn, next_batch_id) = if injector.is_some() {
+            self.append_group_fault_injectable(commits, &mut injector)?
+        } else {
+            let encode_started = Instant::now();
+            let encoded = self.encode_group(commits)?;
+            self.group_encode_nanos = self
+                .group_encode_nanos
+                .checked_add(elapsed_nanos(encode_started)?)
+                .ok_or_else(|| Error::invariant("WAL group-encode timing overflow"))?;
 
-        for commit in commits {
-            let report =
-                self.append_group_commit(commit, next_lsn, next_batch_id, &mut injector)?;
-            next_lsn = Lsn::new(
-                report
-                    .commit_lsn
-                    .get()
-                    .checked_add(1)
-                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
-            );
-            next_batch_id = next_batch_id
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
-            committed.push(CommittedWalBatch {
+            let write_started = Instant::now();
+            let write_result = (|| {
+                let offset = self.file.len()?;
+                write_all_at_counted(
+                    &mut self.file,
+                    offset,
+                    &encoded.bytes,
+                    &mut self.physical_write_calls,
+                )
+            })();
+            self.group_write_nanos = self
+                .group_write_nanos
+                .checked_add(elapsed_nanos(write_started)?)
+                .ok_or_else(|| Error::invariant("WAL group-write timing overflow"))?;
+            write_result?;
+            (encoded.reports, encoded.next_lsn, encoded.next_batch_id)
+        };
+
+        let committed = commits
+            .iter()
+            .map(|commit| CommittedWalBatch {
                 batch_id: commit.batch_id,
                 commit_lsn: commit.commit_lsn,
                 pages: commit.pages.clone(),
-            });
-            reports.push(report);
-        }
+            })
+            .collect::<Vec<_>>();
 
         self.append_nanos = self
             .append_nanos
@@ -527,6 +560,170 @@ impl<F: DurableFile> WalLog<F> {
             .ok_or_else(|| Error::invariant("WAL page-image count overflow"))?;
 
         Ok(reports)
+    }
+
+    fn append_group_fault_injectable(
+        &mut self,
+        commits: &[WalCommit],
+        injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<(Vec<WalAppendReport>, Lsn, u64)> {
+        let mut next_lsn = self.next_lsn;
+        let mut next_batch_id = self.next_batch_id;
+        let mut reports = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let report = self.append_group_commit(commit, next_lsn, next_batch_id, injector)?;
+            next_lsn = Lsn::new(
+                report
+                    .commit_lsn
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            );
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
+            reports.push(report);
+        }
+        Ok((reports, next_lsn, next_batch_id))
+    }
+
+    fn encode_group(&self, commits: &[WalCommit]) -> Result<EncodedWalGroup> {
+        let mut capacity = 0usize;
+        for commit in commits {
+            if commit.pages.is_empty() {
+                return Err(Error::invalid_input(
+                    "a WAL commit must contain at least one page image",
+                ));
+            }
+            let page_frames = commit
+                .pages
+                .len()
+                .checked_mul(WAL_HEADER_SIZE + PAGE_IMAGE_PAYLOAD_SIZE + WAL_TRAILER_SIZE)
+                .ok_or_else(|| Error::invalid_input("WAL group size overflows"))?;
+            let commit_frame = WAL_HEADER_SIZE
+                .checked_add(COMMIT_PAYLOAD_SIZE)
+                .and_then(|size| size.checked_add(WAL_TRAILER_SIZE))
+                .ok_or_else(|| Error::invalid_input("WAL group size overflows"))?;
+            capacity = capacity
+                .checked_add(page_frames)
+                .and_then(|size| size.checked_add(commit_frame))
+                .ok_or_else(|| Error::invalid_input("WAL group size overflows"))?;
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve(capacity)
+            .map_err(|_| Error::invalid_input("WAL group buffer is too large"))?;
+        let mut reports = Vec::with_capacity(commits.len());
+        let mut next_lsn = self.next_lsn;
+        let mut next_batch_id = self.next_batch_id;
+
+        for commit in commits {
+            let first_record_lsn = next_lsn;
+            if commit.batch_id != next_batch_id {
+                return Err(Error::invariant(format!(
+                    "WAL batch id {}, expected {}",
+                    commit.batch_id, next_batch_id
+                )));
+            }
+            let page_count = u64::try_from(commit.pages.len())
+                .map_err(|_| Error::invalid_input("WAL page count does not fit u64"))?;
+            let expected_commit_lsn = first_record_lsn
+                .get()
+                .checked_add(page_count)
+                .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
+            if commit.commit_lsn.get() != expected_commit_lsn {
+                return Err(Error::invariant(format!(
+                    "WAL commit LSN {}, expected {}",
+                    commit.commit_lsn.get(),
+                    expected_commit_lsn
+                )));
+            }
+
+            let digest_capacity = commit
+                .pages
+                .len()
+                .checked_mul(PAGE_IMAGE_PAYLOAD_SIZE)
+                .ok_or_else(|| Error::invalid_input("WAL digest input is too large"))?;
+            let mut digest_input = Vec::new();
+            digest_input
+                .try_reserve(digest_capacity)
+                .map_err(|_| Error::invalid_input("WAL digest input is too large"))?;
+            let mut bytes_written = 0usize;
+            for (page_index, page) in commit.pages.iter().enumerate() {
+                validate_page_image_lsn(page, commit.commit_lsn)?;
+                let payload = encode_page_image(page, self.page_image_format)?;
+                digest_input.extend_from_slice(&payload);
+                let record_lsn = first_record_lsn
+                    .get()
+                    .checked_add(
+                        u64::try_from(page_index)
+                            .map_err(|_| Error::invalid_input("WAL record index overflows"))?,
+                    )
+                    .map(Lsn::new)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
+                let record_index = u32::try_from(page_index)
+                    .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
+                let frame = encode_frame(
+                    self.format_version,
+                    WalRecordType::PageImage,
+                    record_lsn,
+                    commit.batch_id,
+                    record_index,
+                    &payload,
+                )?;
+                bytes_written = bytes_written
+                    .checked_add(frame.len())
+                    .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+                bytes.extend_from_slice(&frame);
+            }
+
+            let digest = crc32c::crc32c(&digest_input);
+            let mut commit_payload = [0u8; COMMIT_PAYLOAD_SIZE];
+            commit_payload[0..8].copy_from_slice(&first_record_lsn.get().to_le_bytes());
+            commit_payload[8..12].copy_from_slice(
+                &u32::try_from(commit.pages.len())
+                    .map_err(|_| Error::invalid_input("WAL page count does not fit u32"))?
+                    .to_le_bytes(),
+            );
+            commit_payload[12..16].copy_from_slice(&digest.to_le_bytes());
+            let commit_record_index = u32::try_from(commit.pages.len())
+                .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
+            let commit_frame = encode_frame(
+                self.format_version,
+                WalRecordType::Commit,
+                commit.commit_lsn,
+                commit.batch_id,
+                commit_record_index,
+                &commit_payload,
+            )?;
+            bytes_written = bytes_written
+                .checked_add(commit_frame.len())
+                .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+            bytes.extend_from_slice(&commit_frame);
+            reports.push(WalAppendReport {
+                first_record_lsn,
+                commit_lsn: commit.commit_lsn,
+                page_count: commit.pages.len(),
+                bytes_written,
+            });
+            next_lsn = Lsn::new(
+                commit
+                    .commit_lsn
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            );
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
+        }
+
+        Ok(EncodedWalGroup {
+            bytes,
+            reports,
+            next_lsn,
+            next_batch_id,
+        })
     }
 
     fn append_group_commit(
@@ -650,22 +847,29 @@ impl<F: DurableFile> WalLog<F> {
 
         let offset = self.file.len()?;
         hit(injector, "during_wal_header_write")?;
-        write_all_at(&mut self.file, offset, &frame[..WAL_HEADER_SIZE])?;
+        write_all_at_counted(
+            &mut self.file,
+            offset,
+            &frame[..WAL_HEADER_SIZE],
+            &mut self.physical_write_calls,
+        )?;
         hit(injector, "during_wal_payload_write")?;
-        write_all_at(
+        write_all_at_counted(
             &mut self.file,
             offset
                 .checked_add(WAL_HEADER_SIZE as u64)
                 .ok_or_else(|| Error::invalid_input("WAL offset overflows"))?,
             &frame[WAL_HEADER_SIZE..payload_end],
+            &mut self.physical_write_calls,
         )?;
         hit(injector, "during_wal_trailer_write")?;
-        write_all_at(
+        write_all_at_counted(
             &mut self.file,
             offset
                 .checked_add(payload_end as u64)
                 .ok_or_else(|| Error::invalid_input("WAL offset overflows"))?,
             &frame[payload_end..],
+            &mut self.physical_write_calls,
         )?;
         Ok(frame_length)
     }
@@ -1166,15 +1370,24 @@ fn read_exact_at<F: DurableFile>(file: &mut F, offset: u64, length: usize) -> Re
     Ok(bytes)
 }
 
-fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Result<()> {
+fn write_all_at_counted<F: DurableFile>(
+    file: &mut F,
+    offset: u64,
+    bytes: &[u8],
+    physical_write_calls: &mut u64,
+) -> Result<()> {
     let mut position = 0usize;
     while position < bytes.len() {
-        let count = file.write_at(
+        let write_result = file.write_at(
             offset
                 .checked_add(position as u64)
                 .ok_or_else(|| Error::invalid_input("WAL write offset overflows"))?,
             &bytes[position..],
-        )?;
+        );
+        *physical_write_calls = physical_write_calls
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("WAL physical write count overflow"))?;
+        let count = write_result?;
         if count == 0 {
             return Err(Error::Io(std::io::Error::new(
                 ErrorKind::WriteZero,
@@ -1190,9 +1403,76 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
 mod tests {
     use super::*;
     use crate::page::{PageHeader, PageType, encode_page};
+    use std::cell::Cell;
 
     #[derive(Default)]
     struct MemoryFile(Vec<u8>);
+
+    struct CountingFile {
+        inner: MemoryFile,
+        write_calls: u64,
+        len_calls: Cell<u64>,
+        sync_calls: u64,
+        max_write: Option<usize>,
+    }
+
+    impl CountingFile {
+        fn new(max_write: Option<usize>) -> Self {
+            Self {
+                inner: MemoryFile::default(),
+                write_calls: 0,
+                len_calls: Cell::new(0),
+                sync_calls: 0,
+                max_write,
+            }
+        }
+
+        fn reset_counts(&mut self) {
+            self.write_calls = 0;
+            self.len_calls.set(0);
+            self.sync_calls = 0;
+        }
+    }
+
+    impl DurableFile for CountingFile {
+        fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+            self.inner.read_at(offset, buffer)
+        }
+
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
+            let write_length = self
+                .max_write
+                .map_or(bytes.len(), |limit| bytes.len().min(limit));
+            self.write_calls += 1;
+            self.inner.write_at(offset, &bytes[..write_length])
+        }
+
+        fn len(&self) -> Result<u64> {
+            self.len_calls.set(self.len_calls.get() + 1);
+            self.inner.len()
+        }
+
+        fn set_len(&mut self, length: u64) -> Result<()> {
+            self.inner.set_len(length)
+        }
+
+        fn sync_data(&mut self) -> Result<()> {
+            self.sync_calls += 1;
+            Ok(())
+        }
+
+        fn sync_all(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopInjector;
+
+    impl FaultInjector for NoopInjector {
+        fn hit(&mut self, _point: &str) -> Result<()> {
+            Ok(())
+        }
+    }
 
     impl DurableFile for MemoryFile {
         fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
@@ -1241,14 +1521,42 @@ mod tests {
     }
 
     fn page(page_id: u64) -> WalPageImage {
+        page_at_lsn(page_id, Lsn::new(2))
+    }
+
+    fn page_at_lsn(page_id: u64, lsn: Lsn) -> WalPageImage {
         WalPageImage {
             page_id: PageId::new(page_id),
             image: encode_page(
-                PageHeader::new(PageType::Leaf, PageId::new(page_id), Lsn::new(2)),
+                PageHeader::new(PageType::Leaf, PageId::new(page_id), lsn),
                 &[],
             )
             .unwrap(),
         }
+    }
+
+    fn wal_commits(commit_count: usize, pages_per_commit: usize) -> Vec<WalCommit> {
+        let mut first_record_lsn = 1u64;
+        (0..commit_count)
+            .map(|commit_index| {
+                let commit_lsn = first_record_lsn + pages_per_commit as u64;
+                let pages = (0..pages_per_commit)
+                    .map(|page_index| {
+                        page_at_lsn(
+                            2 + (commit_index * pages_per_commit + page_index) as u64,
+                            Lsn::new(commit_lsn),
+                        )
+                    })
+                    .collect();
+                let commit = WalCommit {
+                    batch_id: commit_index as u64 + 1,
+                    commit_lsn: Lsn::new(commit_lsn),
+                    pages,
+                };
+                first_record_lsn = commit_lsn + 1;
+                commit
+            })
+            .collect()
     }
 
     #[test]
@@ -1258,6 +1566,70 @@ mod tests {
         wal.append_commit(1, commit_lsn, &[page(2)], None).unwrap();
         assert_eq!(wal.committed_batches()[0].commit_lsn, commit_lsn);
         assert_eq!(wal.next_lsn(), Lsn::new(3));
+    }
+
+    #[test]
+    fn group_fast_path_is_byte_identical_to_fault_injectable_path() {
+        let commits = wal_commits(4, 2);
+        let mut fast_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        fast_wal.append_group(&commits, None).unwrap();
+        let fast_bytes = fast_wal.into_file().0;
+
+        let mut injected_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        let mut injector = NoopInjector;
+        injected_wal
+            .append_group(&commits, Some(&mut injector))
+            .unwrap();
+        let injected_bytes = injected_wal.into_file().0;
+        assert_eq!(fast_bytes, injected_bytes);
+    }
+
+    #[test]
+    fn group_fast_path_uses_one_physical_write() {
+        let mut wal = WalLog::open(CountingFile::new(None), identity()).unwrap();
+        let metrics_before = wal.metrics().unwrap();
+        wal.file.reset_counts();
+        wal.append_group(&wal_commits(10, 2), None).unwrap();
+        let metrics_after = wal.metrics().unwrap();
+        assert_eq!(wal.file.write_calls, 1);
+        assert_eq!(wal.file.len_calls.get(), 2);
+        assert_eq!(wal.file.sync_calls, 1);
+        assert_eq!(
+            metrics_after.physical_write_calls - metrics_before.physical_write_calls,
+            1
+        );
+        let group_encode_nanos =
+            metrics_after.group_encode_nanos - metrics_before.group_encode_nanos;
+        let group_write_nanos = metrics_after.group_write_nanos - metrics_before.group_write_nanos;
+        let append_nanos = metrics_after.append_nanos - metrics_before.append_nanos;
+        assert!(group_encode_nanos > 0);
+        assert!(group_write_nanos > 0);
+        assert!(group_encode_nanos + group_write_nanos <= append_nanos * 105 / 100 + 50_000);
+    }
+
+    #[test]
+    fn group_fast_path_handles_short_writes() {
+        let mut wal = WalLog::open(CountingFile::new(Some(137)), identity()).unwrap();
+        wal.file.reset_counts();
+        wal.append_group(&wal_commits(10, 2), None).unwrap();
+        assert!(wal.file.write_calls > 1);
+        let file = wal.into_file();
+        let reopened = WalLog::open(file, identity()).unwrap();
+        assert_eq!(reopened.committed_batches().len(), 10);
+        assert_eq!(reopened.scan_report().replayable_pages, 20);
+    }
+
+    #[test]
+    fn fast_group_torn_tail_keeps_only_complete_commits() {
+        let mut wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        wal.append_group(&wal_commits(2, 1), None).unwrap();
+        let mut file = wal.into_file();
+        let original_length = file.len().unwrap();
+        file.set_len(original_length - 10).unwrap();
+        let reopened = WalLog::open(file, identity()).unwrap();
+        assert_eq!(reopened.committed_batches().len(), 1);
+        assert_eq!(reopened.scan_report().replayable_pages, 1);
+        assert_eq!(reopened.scan_report().torn_tail_bytes, 58);
     }
 
     #[test]

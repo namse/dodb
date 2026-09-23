@@ -1413,6 +1413,9 @@ struct MetricDelta {
     page_images: u64,
     wal_append_nanos: u64,
     wal_sync_nanos: u64,
+    wal_group_encode_nanos: u64,
+    wal_group_write_nanos: u64,
+    wal_physical_write_calls: u64,
     leaf_splits: u64,
     internal_splits: u64,
     root_splits: u64,
@@ -1546,6 +1549,18 @@ impl MetricDelta {
             page_images: subtraction(wal_after.page_images as u64, wal_before.page_images as u64),
             wal_append_nanos: subtraction(wal_after.append_nanos, wal_before.append_nanos),
             wal_sync_nanos: subtraction(wal_after.sync_nanos, wal_before.sync_nanos),
+            wal_group_encode_nanos: subtraction(
+                wal_after.group_encode_nanos,
+                wal_before.group_encode_nanos,
+            ),
+            wal_group_write_nanos: subtraction(
+                wal_after.group_write_nanos,
+                wal_before.group_write_nanos,
+            ),
+            wal_physical_write_calls: subtraction(
+                wal_after.physical_write_calls,
+                wal_before.physical_write_calls,
+            ),
             leaf_splits: subtraction(blink_after.leaf_splits, blink_before.leaf_splits),
             internal_splits: subtraction(blink_after.internal_splits, blink_before.internal_splits),
             root_splits: subtraction(blink_after.root_splits, blink_before.root_splits),
@@ -2526,6 +2541,12 @@ fn build_record(
     json.u64("page_images_delta", delta.page_images);
     json.u64("wal_append_nanos_total", delta.wal_append_nanos);
     json.u64("wal_sync_nanos_total", delta.wal_sync_nanos);
+    json.u64("wal_group_encode_nanos_total", delta.wal_group_encode_nanos);
+    json.u64("wal_group_write_nanos_total", delta.wal_group_write_nanos);
+    json.u64(
+        "wal_physical_write_calls_delta",
+        delta.wal_physical_write_calls,
+    );
     json.f64("transactions_per_sync", delta.transactions_per_sync());
     json.u64("leaf_splits", delta.leaf_splits);
     json.u64("internal_splits", delta.internal_splits);
