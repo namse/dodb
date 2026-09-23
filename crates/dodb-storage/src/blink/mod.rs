@@ -32,6 +32,7 @@ use crate::wal::{
 };
 
 const FIRST_DATA_PAGE: u64 = 2;
+const PAGE_CATALOG_CHUNK_SIZE: usize = 64;
 const NULL_PAGE_ID: u64 = u64::MAX;
 const BLINK_SUPERBLOCK_MAGIC: [u8; 4] = *b"DBLK";
 const BLINK_SUPERBLOCK_VERSION: u16 = 2;
@@ -163,6 +164,9 @@ pub struct BlinkBatchMetrics {
     pub wal_bytes: u64,
     pub catalog_construction_nanos: u64,
     pub catalog_map_clone_nanos: u64,
+    pub catalog_directory_clone_nanos: u64,
+    pub catalog_chunk_clone_nanos: u64,
+    pub catalog_chunk_clones: u64,
     pub catalog_state_scan_nanos: u64,
     pub wal_assembly_nanos: u64,
     pub state_install_nanos: u64,
@@ -600,9 +604,33 @@ impl Drop for PageCell {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PageCatalogChunk {
+    entries: [Option<Arc<PageCell>>; PAGE_CATALOG_CHUNK_SIZE],
+}
+
+impl PageCatalogChunk {
+    fn empty() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| None),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PageCatalog {
-    pages: BTreeMap<PageId, Arc<PageCell>>,
+    chunks: Vec<Arc<PageCatalogChunk>>,
+}
+
+impl PageCatalog {
+    fn get(&self, page_id: PageId) -> Option<&Arc<PageCell>> {
+        if page_id.get() < FIRST_DATA_PAGE {
+            return None;
+        }
+        let chunk_index = usize::try_from(page_id.get() / PAGE_CATALOG_CHUNK_SIZE as u64).ok()?;
+        let slot_index = usize::try_from(page_id.get() % PAGE_CATALOG_CHUNK_SIZE as u64).ok()?;
+        self.chunks.get(chunk_index)?.entries[slot_index].as_ref()
+    }
 }
 
 #[derive(Debug)]
@@ -663,6 +691,9 @@ impl PublicationMetrics {
 #[derive(Clone, Copy, Debug, Default)]
 struct PublicationPrepareTiming {
     catalog_map_clone_nanos: u64,
+    catalog_directory_clone_nanos: u64,
+    catalog_chunk_clone_nanos: u64,
+    catalog_chunk_clones: u64,
     catalog_state_scan_nanos: u64,
 }
 
@@ -679,34 +710,38 @@ struct GenerationPublisher {
 }
 
 impl GenerationPublisher {
-    fn new(state: &BlinkState, epoch: u64) -> Arc<Self> {
+    fn new(state: &BlinkState, epoch: u64) -> Result<Arc<Self>> {
         let metrics = Arc::new(PublicationMetrics::default());
-        let mut pages = BTreeMap::new();
+        let chunk_count = Self::chunk_count(state.high_water_page_id.get())
+            .ok_or_else(|| Error::invariant("Blink catalog chunk count overflows usize"))?;
+        let mut chunks = (0..chunk_count)
+            .map(|_| PageCatalogChunk::empty())
+            .collect::<Vec<_>>();
         for (page_id, page) in &state.pages {
-            pages.insert(
-                *page_id,
-                Arc::new(PageCell {
+            if let Some((chunk_index, slot_index)) = Self::indices(*page_id) {
+                chunks[chunk_index].entries[slot_index] = Some(Arc::new(PageCell {
                     version: PageVersion {
                         epoch,
                         page: Arc::new(page.clone()),
                     },
                     metrics: Arc::clone(&metrics),
-                }),
-            );
+                }));
+            }
             metrics
                 .page_version_installs
                 .fetch_add(1, Ordering::Relaxed);
         }
+        let chunks = chunks.into_iter().map(Arc::new).collect();
         let generation = Arc::new(PublishedGeneration {
             epoch,
             root_page_id: state.root_page_id,
             high_water_page_id: state.high_water_page_id,
-            catalog: Arc::new(PageCatalog { pages }),
+            catalog: Arc::new(PageCatalog { chunks }),
         });
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             current: RwLock::new(generation),
             metrics,
-        })
+        }))
     }
 
     fn pin(&self) -> GenerationPin {
@@ -742,37 +777,27 @@ impl GenerationPublisher {
         dirty: &BTreeSet<PageId>,
     ) -> Result<(Arc<PublishedGeneration>, PublicationPrepareTiming)> {
         let base = self.pin();
-        let catalog_map_clone_started = Instant::now();
-        let mut pages = base.generation.catalog.pages.clone();
-        let catalog_map_clone_nanos = elapsed_nanos(catalog_map_clone_started);
-        let catalog_state_scan_started = Instant::now();
-        for (page_id, page) in &state.pages {
-            if dirty.contains(page_id) || !pages.contains_key(page_id) {
-                pages.insert(
-                    *page_id,
-                    Arc::new(PageCell {
-                        version: PageVersion {
-                            epoch: superblock.generation,
-                            page: Arc::new(page.clone()),
-                        },
-                        metrics: Arc::clone(&self.metrics),
-                    }),
-                );
-                self.metrics
-                    .page_version_installs
-                    .fetch_add(1, Ordering::Relaxed);
+        let mut dirty_or_missing = dirty.clone();
+        for page_id in state.pages.keys() {
+            if base.generation.catalog.get(*page_id).is_none() {
+                dirty_or_missing.insert(*page_id);
             }
         }
-        let timing = PublicationPrepareTiming {
-            catalog_map_clone_nanos,
-            catalog_state_scan_nanos: elapsed_nanos(catalog_state_scan_started),
-        };
+        let (catalog, timing) = self.prepare_catalog_delta(
+            &base.generation.catalog,
+            base.generation.high_water_page_id,
+            superblock.high_water_page_id,
+            superblock.generation,
+            &dirty_or_missing,
+            |page_id| state.pages.get(&page_id).cloned(),
+            false,
+        )?;
         Ok((
             Arc::new(PublishedGeneration {
                 epoch: superblock.generation,
                 root_page_id: state.root_page_id,
                 high_water_page_id: state.high_water_page_id,
-                catalog: Arc::new(PageCatalog { pages }),
+                catalog: Arc::new(catalog),
             }),
             timing,
         ))
@@ -785,40 +810,125 @@ impl GenerationPublisher {
         dirty: &BTreeSet<PageId>,
     ) -> Result<(Arc<PublishedGeneration>, PublicationPrepareTiming)> {
         let base = self.pin();
-        let catalog_map_clone_started = Instant::now();
-        let mut pages = base.generation.catalog.pages.clone();
-        let catalog_map_clone_nanos = elapsed_nanos(catalog_map_clone_started);
-        let catalog_state_scan_started = Instant::now();
-        for page_id in dirty {
-            let page = state
-                .page(*page_id)
-                .ok_or_else(|| Error::invariant("dirty planned page is missing"))?;
-            pages.insert(
-                *page_id,
-                Arc::new(PageCell {
-                    version: PageVersion {
-                        epoch: superblock.generation,
-                        page: Arc::new(page.clone()),
-                    },
-                    metrics: Arc::clone(&self.metrics),
-                }),
-            );
-            self.metrics
-                .page_version_installs
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let timing = PublicationPrepareTiming {
-            catalog_map_clone_nanos,
-            catalog_state_scan_nanos: elapsed_nanos(catalog_state_scan_started),
-        };
+        let (catalog, timing) = self.prepare_catalog_delta(
+            &base.generation.catalog,
+            base.generation.high_water_page_id,
+            state.high_water_page_id(),
+            superblock.generation,
+            dirty,
+            |page_id| state.page(page_id).cloned(),
+            true,
+        )?;
         Ok((
             Arc::new(PublishedGeneration {
                 epoch: superblock.generation,
                 root_page_id: state.root_page_id(),
                 high_water_page_id: state.high_water_page_id(),
-                catalog: Arc::new(PageCatalog { pages }),
+                catalog: Arc::new(catalog),
             }),
             timing,
+        ))
+    }
+
+    fn prepare_catalog_delta<F>(
+        &self,
+        base: &PageCatalog,
+        base_high_water_page_id: PageId,
+        high_water_page_id: PageId,
+        epoch: u64,
+        dirty: &BTreeSet<PageId>,
+        mut page_for: F,
+        validate_extension: bool,
+    ) -> Result<(PageCatalog, PublicationPrepareTiming)>
+    where
+        F: FnMut(PageId) -> Option<BlinkPage>,
+    {
+        let directory_clone_started = Instant::now();
+        let mut chunks = base.chunks.clone();
+        let catalog_directory_clone_nanos = elapsed_nanos(directory_clone_started);
+        let target_chunk_count = Self::chunk_count(high_water_page_id.get())
+            .ok_or_else(|| Error::invariant("Blink catalog chunk count overflows usize"))?;
+        while chunks.len() < target_chunk_count {
+            chunks.push(Arc::new(PageCatalogChunk::empty()));
+        }
+
+        if validate_extension && high_water_page_id > base_high_water_page_id {
+            for raw_page_id in
+                base_high_water_page_id.get().saturating_add(1)..=high_water_page_id.get()
+            {
+                let page_id = PageId::new(raw_page_id);
+                if !dirty.contains(&page_id) || page_for(page_id).is_none() {
+                    return Err(Error::invariant(
+                        "new high-water Blink page is missing from dirty state",
+                    ));
+                }
+            }
+        }
+
+        let catalog_state_scan_started = Instant::now();
+        let mut dirty_by_chunk = BTreeMap::<usize, Vec<PageId>>::new();
+        for page_id in dirty {
+            if let Some((chunk_index, _)) = Self::indices(*page_id) {
+                dirty_by_chunk
+                    .entry(chunk_index)
+                    .or_default()
+                    .push(*page_id);
+            }
+        }
+        let mut catalog_chunk_clone_nanos = 0u64;
+        let mut catalog_chunk_clones = 0u64;
+        for (chunk_index, page_ids) in dirty_by_chunk {
+            let chunk_clone_started = Instant::now();
+            let mut next_chunk = chunks
+                .get(chunk_index)
+                .ok_or_else(|| Error::invariant("dirty Blink page exceeds catalog directory"))?
+                .as_ref()
+                .clone();
+            catalog_chunk_clone_nanos =
+                catalog_chunk_clone_nanos.saturating_add(elapsed_nanos(chunk_clone_started));
+            catalog_chunk_clones = catalog_chunk_clones.saturating_add(1);
+            for page_id in page_ids {
+                let (_, slot_index) = Self::indices(page_id)
+                    .ok_or_else(|| Error::invariant("invalid Blink catalog page id"))?;
+                let page = page_for(page_id)
+                    .ok_or_else(|| Error::invariant("dirty planned page is missing"))?;
+                next_chunk.entries[slot_index] = Some(Arc::new(PageCell {
+                    version: PageVersion {
+                        epoch,
+                        page: Arc::new(page),
+                    },
+                    metrics: Arc::clone(&self.metrics),
+                }));
+                self.metrics
+                    .page_version_installs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            chunks[chunk_index] = Arc::new(next_chunk);
+        }
+        let catalog_map_clone_nanos =
+            catalog_directory_clone_nanos.saturating_add(catalog_chunk_clone_nanos);
+        let timing = PublicationPrepareTiming {
+            catalog_map_clone_nanos,
+            catalog_directory_clone_nanos,
+            catalog_chunk_clone_nanos,
+            catalog_chunk_clones,
+            catalog_state_scan_nanos: elapsed_nanos(catalog_state_scan_started),
+        };
+        Ok((PageCatalog { chunks }, timing))
+    }
+
+    fn chunk_count(high_water_page_id: u64) -> Option<usize> {
+        let last_chunk = high_water_page_id / PAGE_CATALOG_CHUNK_SIZE as u64;
+        usize::try_from(last_chunk.checked_add(1)?).ok()
+    }
+
+    fn indices(page_id: PageId) -> Option<(usize, usize)> {
+        if page_id.get() < FIRST_DATA_PAGE {
+            return None;
+        }
+        Some((
+            usize::try_from(page_id.get() / PAGE_CATALOG_CHUNK_SIZE as u64).ok()?,
+            usize::try_from(page_id.get() % PAGE_CATALOG_CHUNK_SIZE as u64).ok()?,
         ))
     }
 
@@ -1110,7 +1220,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         write_all_at(&mut file, PAGE_SIZE as u64, &sb_bytes)?;
         write_all_at(&mut file, root.get() * PAGE_SIZE as u64, &root_bytes)?;
         file.sync_all()?;
-        let publisher = GenerationPublisher::new(&state, sb.generation);
+        let publisher = GenerationPublisher::new(&state, sb.generation)?;
         Ok(Self {
             file,
             wal: None,
@@ -1179,7 +1289,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             high_water_page_id: sb.high_water_page_id,
             allow_page_reuse: true,
         };
-        let publisher = GenerationPublisher::new(&state, sb.generation);
+        let publisher = GenerationPublisher::new(&state, sb.generation)?;
         let store = Self {
             file,
             wal: None,
@@ -1824,6 +1934,18 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .batch_metrics
             .catalog_map_clone_nanos
             .saturating_add(prepare_timing.catalog_map_clone_nanos);
+        self.batch_metrics.catalog_directory_clone_nanos = self
+            .batch_metrics
+            .catalog_directory_clone_nanos
+            .saturating_add(prepare_timing.catalog_directory_clone_nanos);
+        self.batch_metrics.catalog_chunk_clone_nanos = self
+            .batch_metrics
+            .catalog_chunk_clone_nanos
+            .saturating_add(prepare_timing.catalog_chunk_clone_nanos);
+        self.batch_metrics.catalog_chunk_clones = self
+            .batch_metrics
+            .catalog_chunk_clones
+            .saturating_add(prepare_timing.catalog_chunk_clones);
         self.batch_metrics.catalog_state_scan_nanos = self
             .batch_metrics
             .catalog_state_scan_nanos
@@ -2081,8 +2203,7 @@ impl ReadPageSource for GenerationPin {
         }
         self.generation
             .catalog
-            .pages
-            .get(&page_id)
+            .get(page_id)
             .ok_or_else(|| Error::corruption("published Blink page is missing"))?
             .page_at(self.generation.epoch)
     }
@@ -5228,6 +5349,144 @@ mod tests {
         .unwrap();
         store.enable_parallel_execution(2).unwrap();
         store
+    }
+
+    fn catalog_test_state(high_water_page_id: u64) -> BlinkState {
+        BlinkState {
+            pages: (FIRST_DATA_PAGE..=high_water_page_id)
+                .map(|raw_page_id| {
+                    (
+                        PageId::new(raw_page_id),
+                        BlinkPage::Free {
+                            lsn: Lsn::ZERO,
+                            next: None,
+                        },
+                    )
+                })
+                .collect(),
+            root_page_id: PageId::new(FIRST_DATA_PAGE),
+            free_list_head: None,
+            high_water_page_id: PageId::new(high_water_page_id),
+            allow_page_reuse: true,
+        }
+    }
+
+    fn catalog_test_superblock(generation: u64, high_water_page_id: u64) -> BlinkSuperblock {
+        let mut superblock =
+            BlinkSuperblock::new(&DatabaseConfig::default(), PageId::new(FIRST_DATA_PAGE));
+        superblock.generation = generation;
+        superblock.high_water_page_id = PageId::new(high_water_page_id);
+        superblock
+    }
+
+    #[test]
+    fn page_catalog_lookup_crosses_chunk_boundaries() {
+        let state = catalog_test_state(128);
+        let publisher = GenerationPublisher::new(&state, 1).unwrap();
+        let pin = publisher.pin();
+        for raw_page_id in [63, 64, 65, 127, 128] {
+            assert!(
+                pin.generation
+                    .catalog
+                    .get(PageId::new(raw_page_id))
+                    .is_some()
+            );
+        }
+        assert!(pin.generation.catalog.get(PageId::new(1)).is_none());
+    }
+
+    #[test]
+    fn prepare_delta_reuses_untouched_catalog_chunks() {
+        let state = catalog_test_state(191);
+        let publisher = GenerationPublisher::new(&state, 1).unwrap();
+        let old_pin = publisher.pin();
+        let mut updated = state.clone();
+        let changed_page_id = PageId::new(65);
+        updated.pages.insert(
+            changed_page_id,
+            BlinkPage::Free {
+                lsn: Lsn::new(2),
+                next: None,
+            },
+        );
+        let dirty = BTreeSet::from([changed_page_id]);
+        let (generation, timing) = publisher
+            .prepare_delta(&updated, &catalog_test_superblock(2, 191), &dirty)
+            .unwrap();
+        assert_eq!(timing.catalog_chunk_clones, 1);
+        assert!(!Arc::ptr_eq(
+            &old_pin.generation.catalog.chunks[1],
+            &generation.catalog.chunks[1]
+        ));
+        assert!(Arc::ptr_eq(
+            &old_pin.generation.catalog.chunks[0],
+            &generation.catalog.chunks[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &old_pin.generation.catalog.chunks[2],
+            &generation.catalog.chunks[2]
+        ));
+    }
+
+    #[test]
+    fn prepare_delta_clones_each_dirty_chunk_once() {
+        let state = catalog_test_state(191);
+        let publisher = GenerationPublisher::new(&state, 1).unwrap();
+        let mut updated = state.clone();
+        let same_chunk_ids = [PageId::new(65), PageId::new(66), PageId::new(67)];
+        for page_id in same_chunk_ids {
+            updated.pages.insert(
+                page_id,
+                BlinkPage::Free {
+                    lsn: Lsn::new(2),
+                    next: None,
+                },
+            );
+        }
+        let dirty = same_chunk_ids.into_iter().collect::<BTreeSet<_>>();
+        let (_, timing) = publisher
+            .prepare_delta(&updated, &catalog_test_superblock(2, 191), &dirty)
+            .unwrap();
+        assert_eq!(timing.catalog_chunk_clones, 1);
+
+        let different_chunks = [PageId::new(3), PageId::new(65), PageId::new(129)];
+        let dirty = different_chunks.into_iter().collect::<BTreeSet<_>>();
+        let (_, timing) = publisher
+            .prepare_delta(&updated, &catalog_test_superblock(2, 191), &dirty)
+            .unwrap();
+        assert_eq!(timing.catalog_chunk_clones, 3);
+    }
+
+    #[test]
+    fn prepare_delta_extends_catalog_directory_and_rejects_missing_pages() {
+        let state = catalog_test_state(63);
+        let publisher = GenerationPublisher::new(&state, 1).unwrap();
+        let mut extended = state.clone();
+        for raw_page_id in 64..=65 {
+            extended.pages.insert(
+                PageId::new(raw_page_id),
+                BlinkPage::Free {
+                    lsn: Lsn::ZERO,
+                    next: None,
+                },
+            );
+        }
+        extended.high_water_page_id = PageId::new(65);
+        let dirty = BTreeSet::from([PageId::new(64), PageId::new(65)]);
+        let (generation, _) = publisher
+            .prepare_delta(&extended, &catalog_test_superblock(2, 65), &dirty)
+            .unwrap();
+        assert_eq!(generation.catalog.chunks.len(), 2);
+        assert!(generation.catalog.get(PageId::new(64)).is_some());
+        assert!(generation.catalog.get(PageId::new(65)).is_some());
+        assert!(generation.catalog.get(PageId::new(63)).is_some());
+
+        let missing_dirty = BTreeSet::from([PageId::new(64)]);
+        assert!(
+            publisher
+                .prepare_delta(&extended, &catalog_test_superblock(2, 65), &missing_dirty,)
+                .is_err()
+        );
     }
 
     #[test]

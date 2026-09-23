@@ -1463,6 +1463,9 @@ struct MetricDelta {
     planner_wal_bytes: u64,
     catalog_construction_nanos: u64,
     catalog_map_clone_nanos: u64,
+    catalog_directory_clone_nanos: u64,
+    catalog_chunk_clone_nanos: u64,
+    catalog_chunk_clones: u64,
     catalog_state_scan_nanos: u64,
     wal_assembly_nanos: u64,
     state_install_nanos: u64,
@@ -1673,6 +1676,18 @@ impl MetricDelta {
             catalog_map_clone_nanos: subtraction(
                 batch_after.catalog_map_clone_nanos,
                 batch_before.catalog_map_clone_nanos,
+            ),
+            catalog_directory_clone_nanos: subtraction(
+                batch_after.catalog_directory_clone_nanos,
+                batch_before.catalog_directory_clone_nanos,
+            ),
+            catalog_chunk_clone_nanos: subtraction(
+                batch_after.catalog_chunk_clone_nanos,
+                batch_before.catalog_chunk_clone_nanos,
+            ),
+            catalog_chunk_clones: subtraction(
+                batch_after.catalog_chunk_clones,
+                batch_before.catalog_chunk_clones,
             ),
             catalog_state_scan_nanos: subtraction(
                 batch_after.catalog_state_scan_nanos,
@@ -2583,6 +2598,16 @@ fn build_record(
         "catalog_map_clone_nanos_total",
         delta.catalog_map_clone_nanos,
     );
+    json.u64(
+        "catalog_directory_clone_nanos_total",
+        delta.catalog_directory_clone_nanos,
+    );
+    json.u64(
+        "catalog_chunk_clone_nanos_total",
+        delta.catalog_chunk_clone_nanos,
+    );
+    json.u64("catalog_chunk_clones_delta", delta.catalog_chunk_clones);
+    json.u64("catalog_chunk_size", 64);
     json.u64(
         "catalog_state_scan_nanos_total",
         delta.catalog_state_scan_nanos,
