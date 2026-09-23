@@ -1,8 +1,9 @@
 # B-link + Batched Storage Engine Experiment
 
-Status: Phase 3.1 sparse working-state implementation, correctness, and OCI
-diagnostics complete. Phase 4 implementation has not started; its design may
-proceed based on the Phase 3.1 readiness gates.
+Status: Phase 4 persistent worker pool implementation and correctness are
+complete. The OCI delay-zero diagnostic found insufficient worker overlap and
+a throughput regression; the worker mechanism needs further review. Phase 5
+has not started. See [`phase4-results.md`](phase4-results.md).
 
 Baseline branch: `main`
 
@@ -917,11 +918,15 @@ source of truth.
 
 ### Phase 4 — parallel page-local mutation workers
 
-- Execute independent leaf/overflow/page jobs on multiple workers.
-- Serialize overlapping pages and same-key dependencies in planner order.
-- Use an ordered fallback for split/structural work.
-- Add worker wait, dependency wait, page-latch contention, and join-barrier
-  metrics.
+- Implemented persistent page-local leaf workers with private page candidates,
+  deterministic job partition, FIFO LSN/WAL assembly, and sparse-state install.
+- Structural, allocator/overflow, multi-leaf transaction, and cross-leaf
+  dependency cases fall back as a whole group to the sparse serial executor.
+- Correctness passed; OCI delay-zero results show median effective
+  parallelism 1.075 and throughput speedup 0.859x. The worker mechanism needs
+  further review before Phase 5 design. See
+  [`phase4-results.md`](phase4-results.md).
+- Phase 5 implementation has not started.
 
 ### Phase 5 — concurrent structural modification and splits
 
