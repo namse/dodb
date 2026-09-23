@@ -1,8 +1,9 @@
 # Transaction semantics model
 
 This directory contains the first dodb formal model. It covers only the
-logical transaction contract. Coordinator, WAL, recovery, checkpoint,
-publication, end-to-end, and B-link models are outside this phase.
+logical transaction contract. A separate model checks fixed-group WAL durability.
+Coordinator processing, checkpoint, publication, end-to-end, and B-link behavior
+remain outside these models.
 
 ## Toolchain
 
@@ -129,5 +130,25 @@ bounded integer revisions/LSNs, and `--max-steps=20`. The simulation uses seed
 | `finish_transaction` logical result | `prepareTransaction` |
 | committed publication in this logical model | `commitPrepared` |
 
-WAL records, fsync, page images, superblocks, read views, coordinator groups,
-and network responses are intentionally absent. They belong to later models.
+## WAL durability model
+
+`wal_durability.qnt` models `APage`, `ACommit`, `BPage1`, `BPage2`, and
+`BCommit` in fixed LSN order. It allows monotonic spontaneous persistence before
+sync success, one shared fsync attempt, uncertain sync failure, crash and recovery,
+and loss of the return after successful fsync. Recovery includes each logical
+commit only when its own COMMIT frame is in the durable complete prefix.
+
+The `state_invariants` value checks `TypeOK`, `FixedFramePrefixOrdering`,
+`DurablePrefixBound`, `CommitBRequiresCommitA`, `CommitARecoveryMatchesLsn`,
+`CommitBRecoveryMatchesLsn`, `RecoveryNextLsnMatchesPrefix`,
+`SyncSuccessMeansWholeGroupDurable`, `AppendSuccessRequiresSyncSuccess`,
+`SyncFailureNeverReturnsSuccess`, `CrashBeforeSyncCannotClaimSuccess`,
+`SuccessfulSyncRecoversWholeGroup`, `NoSyncRetryAfterFailure`,
+`SyncCannotRestart`, `LostReturnRetainsWholeGroup`, and
+`FailedClaimAllowsObservedRecovery`.
+
+```sh
+npm run formal:wal:typecheck
+npm run formal:wal:verify:tlc
+npm run formal:wal:verify:apalache
+```
