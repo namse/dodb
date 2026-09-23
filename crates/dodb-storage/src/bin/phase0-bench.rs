@@ -1444,6 +1444,18 @@ struct MetricDelta {
     planning_nanos: u64,
     state_clone_nanos: u64,
     physical_execution_nanos: u64,
+    physical_mutation_nanos: u64,
+    leaf_load_clone_nanos: u64,
+    leaf_entries_clone_nanos: u64,
+    leaf_install_clone_nanos: u64,
+    physical_restamp_nanos: u64,
+    physical_cached_refresh_nanos: u64,
+    physical_page_encode_nanos: u64,
+    physical_superblock_encode_nanos: u64,
+    leaf_load_clones: u64,
+    leaf_entries_clones: u64,
+    leaf_install_clones: u64,
+    cached_refresh_clones: u64,
     dirty_union_nanos: u64,
     full_state_clones: u64,
     mutations_planned: u64,
@@ -1624,6 +1636,54 @@ impl MetricDelta {
             physical_execution_nanos: subtraction(
                 batch_after.physical_execution_nanos,
                 batch_before.physical_execution_nanos,
+            ),
+            physical_mutation_nanos: subtraction(
+                batch_after.physical_mutation_nanos,
+                batch_before.physical_mutation_nanos,
+            ),
+            leaf_load_clone_nanos: subtraction(
+                batch_after.leaf_load_clone_nanos,
+                batch_before.leaf_load_clone_nanos,
+            ),
+            leaf_entries_clone_nanos: subtraction(
+                batch_after.leaf_entries_clone_nanos,
+                batch_before.leaf_entries_clone_nanos,
+            ),
+            leaf_install_clone_nanos: subtraction(
+                batch_after.leaf_install_clone_nanos,
+                batch_before.leaf_install_clone_nanos,
+            ),
+            physical_restamp_nanos: subtraction(
+                batch_after.physical_restamp_nanos,
+                batch_before.physical_restamp_nanos,
+            ),
+            physical_cached_refresh_nanos: subtraction(
+                batch_after.physical_cached_refresh_nanos,
+                batch_before.physical_cached_refresh_nanos,
+            ),
+            physical_page_encode_nanos: subtraction(
+                batch_after.physical_page_encode_nanos,
+                batch_before.physical_page_encode_nanos,
+            ),
+            physical_superblock_encode_nanos: subtraction(
+                batch_after.physical_superblock_encode_nanos,
+                batch_before.physical_superblock_encode_nanos,
+            ),
+            leaf_load_clones: subtraction(
+                batch_after.leaf_load_clones,
+                batch_before.leaf_load_clones,
+            ),
+            leaf_entries_clones: subtraction(
+                batch_after.leaf_entries_clones,
+                batch_before.leaf_entries_clones,
+            ),
+            leaf_install_clones: subtraction(
+                batch_after.leaf_install_clones,
+                batch_before.leaf_install_clones,
+            ),
+            cached_refresh_clones: subtraction(
+                batch_after.cached_refresh_clones,
+                batch_before.cached_refresh_clones,
             ),
             dirty_union_nanos: subtraction(
                 batch_after.dirty_union_nanos,
@@ -2583,6 +2643,36 @@ fn build_record(
     json.u64("planning_nanos", delta.planning_nanos);
     json.u64("state_clone_nanos_total", delta.state_clone_nanos);
     json.u64("physical_execution_nanos", delta.physical_execution_nanos);
+    json.u64(
+        "physical_mutation_nanos_total",
+        delta.physical_mutation_nanos,
+    );
+    json.u64("leaf_load_clone_nanos_total", delta.leaf_load_clone_nanos);
+    json.u64(
+        "leaf_entries_clone_nanos_total",
+        delta.leaf_entries_clone_nanos,
+    );
+    json.u64(
+        "leaf_install_clone_nanos_total",
+        delta.leaf_install_clone_nanos,
+    );
+    json.u64("physical_restamp_nanos_total", delta.physical_restamp_nanos);
+    json.u64(
+        "physical_cached_refresh_nanos_total",
+        delta.physical_cached_refresh_nanos,
+    );
+    json.u64(
+        "physical_page_encode_nanos_total",
+        delta.physical_page_encode_nanos,
+    );
+    json.u64(
+        "physical_superblock_encode_nanos_total",
+        delta.physical_superblock_encode_nanos,
+    );
+    json.u64("leaf_load_clones_delta", delta.leaf_load_clones);
+    json.u64("leaf_entries_clones_delta", delta.leaf_entries_clones);
+    json.u64("leaf_install_clones_delta", delta.leaf_install_clones);
+    json.u64("cached_refresh_clones_delta", delta.cached_refresh_clones);
     json.u64("dirty_union_nanos_total", delta.dirty_union_nanos);
     json.u64("full_state_clones", delta.full_state_clones);
     json.f64(

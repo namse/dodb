@@ -142,6 +142,18 @@ pub struct BlinkBatchMetrics {
     pub planning_nanos: u64,
     pub state_clone_nanos: u64,
     pub physical_execution_nanos: u64,
+    pub physical_mutation_nanos: u64,
+    pub leaf_load_clone_nanos: u64,
+    pub leaf_entries_clone_nanos: u64,
+    pub leaf_install_clone_nanos: u64,
+    pub physical_restamp_nanos: u64,
+    pub physical_cached_refresh_nanos: u64,
+    pub physical_page_encode_nanos: u64,
+    pub physical_superblock_encode_nanos: u64,
+    pub leaf_load_clones: u64,
+    pub leaf_entries_clones: u64,
+    pub leaf_install_clones: u64,
+    pub cached_refresh_clones: u64,
     pub dirty_union_nanos: u64,
     pub full_state_clones: u64,
     pub mutations_planned: u64,
@@ -3090,6 +3102,7 @@ fn prepare_planned_serial_execution<'a>(
     let mut executed = Vec::with_capacity(plan.transactions.len());
     for transaction_plan in &plan.transactions {
         let mut dirty = BTreeSet::new();
+        let mutation_started = Instant::now();
         for planned_mutation in &transaction_plan.mutations {
             apply_planned_mutation(
                 &mut working,
@@ -3101,6 +3114,9 @@ fn prepare_planned_serial_execution<'a>(
                 Revision::new(transaction_plan.provisional_revision.ordinal),
             )?;
         }
+        batch_metrics.physical_mutation_nanos = batch_metrics
+            .physical_mutation_nanos
+            .saturating_add(elapsed_nanos(mutation_started));
         let commit_lsn = Lsn::new(
             next_lsn
                 .get()
@@ -3110,6 +3126,7 @@ fn prepare_planned_serial_execution<'a>(
                 )
                 .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
         );
+        let restamp_started = Instant::now();
         for page_id in &dirty {
             working
                 .overlay_page_mut(*page_id)
@@ -3120,14 +3137,23 @@ fn prepare_planned_serial_execution<'a>(
                     &transaction_plan.mutated_key_set,
                 );
         }
+        batch_metrics.physical_restamp_nanos = batch_metrics
+            .physical_restamp_nanos
+            .saturating_add(elapsed_nanos(restamp_started));
+        let cached_refresh_started = Instant::now();
         if let Some(cached_leaf) = execution_state.cached_leaf.as_mut()
             && dirty.contains(&cached_leaf.leaf_id)
         {
+            batch_metrics.cached_refresh_clones =
+                batch_metrics.cached_refresh_clones.saturating_add(1);
             cached_leaf.page = working
                 .page(cached_leaf.leaf_id)
                 .cloned()
                 .ok_or_else(|| Error::invariant("cached planned leaf disappeared"))?;
         }
+        batch_metrics.physical_cached_refresh_nanos = batch_metrics
+            .physical_cached_refresh_nanos
+            .saturating_add(elapsed_nanos(cached_refresh_started));
         working_superblock = BlinkSuperblock {
             generation: working_superblock
                 .generation
@@ -3143,6 +3169,7 @@ fn prepare_planned_serial_execution<'a>(
             SuperblockSlot::B => SuperblockSlot::A,
         };
         let mut images = Vec::with_capacity(dirty.len() + 1);
+        let page_encode_started = Instant::now();
         for page_id in &dirty {
             let page = working
                 .page(*page_id)
@@ -3155,12 +3182,20 @@ fn prepare_planned_serial_execution<'a>(
                 image: encode_blink_page(*page_id, page)?,
             });
         }
+        batch_metrics.physical_page_encode_nanos = batch_metrics
+            .physical_page_encode_nanos
+            .saturating_add(elapsed_nanos(page_encode_started));
+        let superblock_encode_started = Instant::now();
+        let superblock_image = encode_blink_superblock(&working_superblock)?;
+        batch_metrics.physical_superblock_encode_nanos = batch_metrics
+            .physical_superblock_encode_nanos
+            .saturating_add(elapsed_nanos(superblock_encode_started));
         images.push(WalPageImage {
             page_id: match working_slot {
                 SuperblockSlot::A => PageId::ZERO,
                 SuperblockSlot::B => PageId::new(1),
             },
-            image: encode_blink_superblock(&working_superblock)?,
+            image: superblock_image,
         });
         let next_lsn_after = Lsn::new(
             commit_lsn
@@ -3236,10 +3271,14 @@ fn apply_planned_mutation<S: BlinkMutationState>(
         batch_metrics.split_triggered_reroutes =
             batch_metrics.split_triggered_reroutes.saturating_add(1);
     }
-    let page = state
-        .page(leaf_id)
-        .cloned()
-        .ok_or_else(|| Error::corruption("planned Blink leaf is missing"))?;
+    let page_ref = state.page(leaf_id);
+    let leaf_load_started = Instant::now();
+    let page = page_ref.cloned();
+    batch_metrics.leaf_load_clone_nanos = batch_metrics
+        .leaf_load_clone_nanos
+        .saturating_add(elapsed_nanos(leaf_load_started));
+    let page = page.ok_or_else(|| Error::corruption("planned Blink leaf is missing"))?;
+    batch_metrics.leaf_load_clones = batch_metrics.leaf_load_clones.saturating_add(1);
     if !matches!(page, BlinkPage::Leaf { .. }) {
         return Err(Error::corruption("planned Blink route ended at non-leaf"));
     }
@@ -3305,7 +3344,12 @@ fn apply_cached_leaf_mutation<S: BlinkMutationState>(
     else {
         return Err(Error::corruption("cached Blink page is not a leaf"));
     };
+    let entries_clone_started = Instant::now();
     let mut next_entries = entries.clone();
+    batch_metrics.leaf_entries_clone_nanos = batch_metrics
+        .leaf_entries_clone_nanos
+        .saturating_add(elapsed_nanos(entries_clone_started));
+    batch_metrics.leaf_entries_clones = batch_metrics.leaf_entries_clones.saturating_add(1);
     let value_ref = match value {
         Some(bytes) => Some(allocate_value(state, dirty, bytes)?),
         None => None,
@@ -3370,7 +3414,12 @@ fn apply_cached_leaf_mutation<S: BlinkMutationState>(
         right_sibling: *right_sibling,
         entries: next_entries,
     };
+    let leaf_install_started = Instant::now();
     state.insert_page(cached.leaf_id, next_page.clone());
+    batch_metrics.leaf_install_clone_nanos = batch_metrics
+        .leaf_install_clone_nanos
+        .saturating_add(elapsed_nanos(leaf_install_started));
+    batch_metrics.leaf_install_clones = batch_metrics.leaf_install_clones.saturating_add(1);
     cached.page = next_page;
     dirty.insert(cached.leaf_id);
     Ok(false)
