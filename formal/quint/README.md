@@ -1,9 +1,8 @@
 # Transaction semantics model
 
 This directory contains the first dodb formal model. It covers only the
-logical transaction contract. A separate model checks fixed-group WAL durability.
-Coordinator processing, checkpoint, publication, end-to-end, and B-link behavior
-remain outside these models.
+logical transaction contract. Coordinator, WAL, recovery, checkpoint,
+publication, end-to-end, and B-link models are outside this phase.
 
 ## Toolchain
 
@@ -130,25 +129,31 @@ bounded integer revisions/LSNs, and `--max-steps=20`. The simulation uses seed
 | `finish_transaction` logical result | `prepareTransaction` |
 | committed publication in this logical model | `commitPrepared` |
 
+WAL records, fsync, page images, superblocks, read views, coordinator groups,
+and network responses are intentionally absent. They belong to later models.
+
 ## WAL durability model
 
-`wal_durability.qnt` models `APage`, `ACommit`, `BPage1`, `BPage2`, and
-`BCommit` in fixed LSN order. It allows monotonic spontaneous persistence before
-sync success, one shared fsync attempt, uncertain sync failure, crash and recovery,
-and loss of the return after successful fsync. Recovery includes each logical
-commit only when its own COMMIT frame is in the durable complete prefix.
+`wal_durability.qnt` models two logical commits written in fixed WAL frame order:
+`APage`, `ACommit`, `BPage1`, `BPage2`, `BCommit`. Each logical commit is
+recoverable only when its own COMMIT marker is part of the complete durable
+prefix. Both commits share one physical fsync.
 
-The `state_invariants` value checks `TypeOK`, `FixedFramePrefixOrdering`,
-`DurablePrefixBound`, `CommitBRequiresCommitA`, `CommitARecoveryMatchesLsn`,
-`CommitBRecoveryMatchesLsn`, `RecoveryNextLsnMatchesPrefix`,
-`SyncSuccessMeansWholeGroupDurable`, `AppendSuccessRequiresSyncSuccess`,
-`SyncFailureNeverReturnsSuccess`, `CrashBeforeSyncCannotClaimSuccess`,
-`SuccessfulSyncRecoversWholeGroup`, `NoSyncRetryAfterFailure`,
-`SyncCannotRestart`, `LostReturnRetainsWholeGroup`, and
-`FailedClaimAllowsObservedRecovery`.
+Unsynced writes may partially persist before a crash. A failed fsync has an
+uncertain persistence outcome, so recovery reads the complete durable prefix
+and can preserve an earlier logical commit from a failed physical group. The
+physical group is a durability amortization unit, not a logical atomicity
+boundary. A successful fsync makes the full frame group durable, even if a
+fault occurs before `append_group()` reports success.
+
+The model stops after WAL append success and recovery. B+Tree publication,
+client acknowledgment, checkpointing, WAL reset, and page flush are outside
+its scope.
 
 ```sh
 npm run formal:wal:typecheck
+npm run formal:wal:test
+npm run formal:wal:simulate
 npm run formal:wal:verify:tlc
 npm run formal:wal:verify:apalache
 ```

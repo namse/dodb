@@ -5,6 +5,8 @@ module wal_durability {
 
   pure val GroupFrames: List[Frame] = List(APage, ACommit, BPage1, BPage2, BCommit)
   pure val AllCommits: Set[LogicalCommit] = Set(CommitA, CommitB)
+  pure val AllDurableCounts: Set[int] = Set(0, 1, 2, 3, 4, 5)
+
   pure def frameLsn(frame: Frame): int =
     match (frame) {
       | APage => 1
@@ -13,8 +15,19 @@ module wal_durability {
       | BPage2 => 4
       | BCommit => 5
     }
+
   pure val CommitALsn = frameLsn(ACommit)
   pure val CommitBLsn = frameLsn(BCommit)
+
+  pure def recoveredFromPrefix(durableFrameCount: int): Set[LogicalCommit] =
+    Set().union(if (durableFrameCount >= CommitALsn) Set(CommitA) else Set())
+      .union(if (durableFrameCount >= CommitBLsn) Set(CommitB) else Set())
+
+  pure def replayedCommits(durableFrameCount: int): Set[LogicalCommit] =
+    Set().union(if (durableFrameCount >= 2) Set(CommitA) else Set())
+      .union(if (durableFrameCount >= 5) Set(CommitB) else Set())
+
+  pure def nextLsnFromPrefix(durableFrameCount: int): int = durableFrameCount + 1
 
   var writeIndex: int
   var writtenFrames: List[Frame]
@@ -27,7 +40,6 @@ module wal_durability {
   var recoveredCommits: Set[LogicalCommit]
   var recoveredNextLsn: int
   var phase: Phase
-  var crashAfterSync: bool
 
   action init = all {
     writeIndex' = 0,
@@ -41,7 +53,6 @@ module wal_durability {
     recoveredCommits' = Set(),
     recoveredNextLsn' = 1,
     phase' = Writing,
-    crashAfterSync' = false,
   }
 
   action WriteNextFrame = {
@@ -50,6 +61,7 @@ module wal_durability {
       phase == Writing,
       writeIndex < GroupFrames.length(),
       writtenFrames == GroupFrames.slice(0, writeIndex),
+      durableCount <= writtenFrames.length(),
       writtenFrames' = nextFrames,
       writeIndex' = writeIndex + 1,
       durableCount' = durableCount,
@@ -61,30 +73,6 @@ module wal_durability {
       recoveredCommits' = recoveredCommits,
       recoveredNextLsn' = recoveredNextLsn,
       phase' = if (writeIndex + 1 == GroupFrames.length()) ReadyToSync else Writing,
-      crashAfterSync' = crashAfterSync,
-    }
-  }
-
-  action SpontaneousPersistence = {
-    nondet persistedCount = Set(0, 1, 2, 3, 4, 5).oneOf()
-    nondet hasTornTail = Set(true, false).oneOf()
-    all {
-      phase == Writing or phase == ReadyToSync or phase == Syncing,
-      not (syncSucceeded),
-      persistedCount >= durableCount,
-      persistedCount <= writtenFrames.length(),
-      durableCount' = persistedCount,
-      writeIndex' = writeIndex,
-      writtenFrames' = writtenFrames,
-      tornTail' = hasTornTail,
-      syncStarted' = syncStarted,
-      syncSucceeded' = syncSucceeded,
-      appendReturnedSuccess' = appendReturnedSuccess,
-      broken' = broken,
-      recoveredCommits' = recoveredCommits,
-      recoveredNextLsn' = recoveredNextLsn,
-      phase' = phase,
-      crashAfterSync' = crashAfterSync,
     }
   }
 
@@ -103,14 +91,13 @@ module wal_durability {
     broken' = broken,
     recoveredCommits' = recoveredCommits,
     recoveredNextLsn' = recoveredNextLsn,
-    crashAfterSync' = crashAfterSync,
   }
 
   action SyncSuccess = all {
     phase == Syncing,
     syncStarted,
     not (syncSucceeded),
-    durableCount' = writtenFrames.length(),
+    durableCount' = GroupFrames.length(),
     syncSucceeded' = true,
     phase' = Synced,
     writeIndex' = writeIndex,
@@ -121,18 +108,17 @@ module wal_durability {
     broken' = broken,
     recoveredCommits' = recoveredCommits,
     recoveredNextLsn' = recoveredNextLsn,
-    crashAfterSync' = crashAfterSync,
   }
 
   action SyncFailure = {
-    nondet persistedCount = Set(0, 1, 2, 3, 4, 5).oneOf()
+    nondet persistedCount = AllDurableCounts.oneOf()
     nondet hasTornTail = Set(true, false).oneOf()
     all {
       phase == Syncing,
       syncStarted,
       not (syncSucceeded),
       persistedCount >= durableCount,
-      persistedCount <= writtenFrames.length(),
+      persistedCount <= GroupFrames.length(),
       durableCount' = persistedCount,
       syncSucceeded' = false,
       phase' = Failed,
@@ -141,70 +127,35 @@ module wal_durability {
       writeIndex' = writeIndex,
       writtenFrames' = writtenFrames,
       syncStarted' = syncStarted,
-      appendReturnedSuccess' = appendReturnedSuccess,
+      appendReturnedSuccess' = false,
       recoveredCommits' = recoveredCommits,
       recoveredNextLsn' = recoveredNextLsn,
-      crashAfterSync' = crashAfterSync,
     }
   }
 
-  action CrashDuringSync = all {
-    phase == Syncing,
-    syncStarted,
-    not (syncSucceeded),
-    phase' = Crashed,
+  action PostSyncFailure = all {
+    phase == Synced,
+    syncSucceeded,
+    not (appendReturnedSuccess),
+    durableCount == GroupFrames.length(),
+    phase' = Failed,
     broken' = true,
-    crashAfterSync' = false,
+    appendReturnedSuccess' = false,
     writeIndex' = writeIndex,
     writtenFrames' = writtenFrames,
     durableCount' = durableCount,
     tornTail' = tornTail,
     syncStarted' = syncStarted,
     syncSucceeded' = syncSucceeded,
-    appendReturnedSuccess' = appendReturnedSuccess,
     recoveredCommits' = recoveredCommits,
     recoveredNextLsn' = recoveredNextLsn,
   }
 
-  action CrashBeforeSync = all {
-    phase == Writing or phase == ReadyToSync,
-    not (syncStarted),
-    not (syncSucceeded),
-    phase' = Crashed,
-    broken' = true,
-    crashAfterSync' = false,
-    writeIndex' = writeIndex,
-    writtenFrames' = writtenFrames,
-    durableCount' = durableCount,
-    tornTail' = tornTail,
-    syncStarted' = syncStarted,
-    syncSucceeded' = syncSucceeded,
-    appendReturnedSuccess' = appendReturnedSuccess,
-    recoveredCommits' = recoveredCommits,
-    recoveredNextLsn' = recoveredNextLsn,
-  }
-
-  action CrashAfterSyncFailure = all {
-    phase == Failed,
-    not (syncSucceeded),
-    phase' = Crashed,
-    broken' = broken,
-    crashAfterSync' = false,
-    writeIndex' = writeIndex,
-    writtenFrames' = writtenFrames,
-    durableCount' = durableCount,
-    tornTail' = tornTail,
-    syncStarted' = syncStarted,
-    syncSucceeded' = syncSucceeded,
-    appendReturnedSuccess' = appendReturnedSuccess,
-    recoveredCommits' = recoveredCommits,
-    recoveredNextLsn' = recoveredNextLsn,
-  }
-
-  action ReturnSuccess = all {
+  action AppendSuccess = all {
     phase == Synced,
     syncSucceeded,
     not (broken),
+    durableCount == GroupFrames.length(),
     appendReturnedSuccess' = true,
     phase' = Returned,
     writeIndex' = writeIndex,
@@ -216,16 +167,50 @@ module wal_durability {
     broken' = broken,
     recoveredCommits' = recoveredCommits,
     recoveredNextLsn' = recoveredNextLsn,
-    crashAfterSync' = crashAfterSync,
   }
 
-  action LoseReturnAndCrash = all {
-    phase == Synced,
-    syncSucceeded,
-    not (appendReturnedSuccess),
+  action Crash = all {
+    phase == Synced or phase == Failed or phase == Returned,
     phase' = Crashed,
-    broken' = true,
-    crashAfterSync' = true,
+    broken' = if (appendReturnedSuccess) false else true,
+    appendReturnedSuccess' = appendReturnedSuccess,
+    writeIndex' = writeIndex,
+    writtenFrames' = writtenFrames,
+    durableCount' = durableCount,
+    tornTail' = tornTail,
+    syncStarted' = syncStarted,
+    syncSucceeded' = syncSucceeded,
+    recoveredCommits' = recoveredCommits,
+    recoveredNextLsn' = recoveredNextLsn,
+  }
+
+  action CrashWithPersistence = {
+    nondet persistedCount = AllDurableCounts.oneOf()
+    nondet hasTornTail = Set(true, false).oneOf()
+    all {
+      phase == Writing or phase == ReadyToSync or phase == Syncing,
+      not (syncSucceeded),
+      persistedCount >= durableCount,
+      persistedCount <= writtenFrames.length(),
+      phase' = Crashed,
+      broken' = true,
+      durableCount' = persistedCount,
+      tornTail' = hasTornTail,
+      appendReturnedSuccess' = false,
+      writeIndex' = writeIndex,
+      writtenFrames' = writtenFrames,
+      syncStarted' = syncStarted,
+      syncSucceeded' = syncSucceeded,
+      recoveredCommits' = recoveredCommits,
+      recoveredNextLsn' = recoveredNextLsn,
+    }
+  }
+
+  action Recover = all {
+    phase == Crashed,
+    recoveredCommits' = replayedCommits(durableCount),
+    recoveredNextLsn' = nextLsnFromPrefix(durableCount),
+    phase' = Recovered,
     writeIndex' = writeIndex,
     writtenFrames' = writtenFrames,
     durableCount' = durableCount,
@@ -233,28 +218,7 @@ module wal_durability {
     syncStarted' = syncStarted,
     syncSucceeded' = syncSucceeded,
     appendReturnedSuccess' = appendReturnedSuccess,
-    recoveredCommits' = recoveredCommits,
-    recoveredNextLsn' = recoveredNextLsn,
-  }
-
-  action Recover = {
-    val commits = Set().union(if (durableCount >= CommitALsn) Set(CommitA) else Set())
-      .union(if (durableCount >= CommitBLsn) Set(CommitB) else Set())
-    all {
-      phase == Crashed,
-      recoveredCommits' = commits,
-      recoveredNextLsn' = durableCount + 1,
-      phase' = Recovered,
-      writeIndex' = writeIndex,
-      writtenFrames' = writtenFrames,
-      durableCount' = durableCount,
-      tornTail' = tornTail,
-      syncStarted' = syncStarted,
-      syncSucceeded' = syncSucceeded,
-      appendReturnedSuccess' = appendReturnedSuccess,
-      broken' = broken,
-      crashAfterSync' = crashAfterSync,
-    }
+    broken' = broken,
   }
 
   action terminalStutter = all {
@@ -270,20 +234,17 @@ module wal_durability {
     recoveredCommits' = recoveredCommits,
     recoveredNextLsn' = recoveredNextLsn,
     phase' = phase,
-    crashAfterSync' = crashAfterSync,
   }
 
   action step = any {
     WriteNextFrame,
-    SpontaneousPersistence,
     StartSync,
     SyncSuccess,
     SyncFailure,
-    CrashBeforeSync,
-    CrashDuringSync,
-    CrashAfterSyncFailure,
-    ReturnSuccess,
-    LoseReturnAndCrash,
+    PostSyncFailure,
+    AppendSuccess,
+    Crash,
+    CrashWithPersistence,
     Recover,
     terminalStutter,
   }
@@ -299,37 +260,58 @@ module wal_durability {
     recoveredNextLsn >= 1,
   }
 
-  val FixedFramePrefixOrdering = writtenFrames == GroupFrames.slice(0, writeIndex)
-  val DurablePrefixBound = durableCount <= writtenFrames.length()
-  val CommitBRequiresCommitA = not (recoveredCommits.contains(CommitB)) or recoveredCommits.contains(CommitA)
-  val CommitARecoveryMatchesLsn = (phase == Recovered and recoveredCommits.contains(CommitA)) == (phase == Recovered and durableCount >= CommitALsn)
-  val CommitBRecoveryMatchesLsn = (phase == Recovered and recoveredCommits.contains(CommitB)) == (phase == Recovered and durableCount >= CommitBLsn)
-  val RecoveryNextLsnMatchesPrefix = phase != Recovered or recoveredNextLsn == durableCount + 1
-  val SyncSuccessMeansWholeGroupDurable = not (syncSucceeded) or durableCount == GroupFrames.length()
-  val AppendSuccessRequiresSyncSuccess = not (appendReturnedSuccess) or syncSucceeded
-  val SyncFailureNeverReturnsSuccess = phase != Failed or not (appendReturnedSuccess)
-  val CrashBeforeSyncCannotClaimSuccess = not (phase == Crashed and not (crashAfterSync)) or not (syncSucceeded)
-  val SuccessfulSyncRecoversWholeGroup = not (phase == Recovered and crashAfterSync) or recoveredCommits == AllCommits
-  val SyncCannotRestart = not (syncStarted) or phase != ReadyToSync
-  val NoSyncRetryAfterFailure = phase != Failed or syncStarted
-  val LostReturnRetainsWholeGroup = not (phase == Recovered and crashAfterSync) or (syncSucceeded and recoveredCommits == AllCommits)
-  val FailedClaimAllowsObservedRecovery = phase != Recovered or syncSucceeded or recoveredCommits == (Set().union(if (durableCount >= CommitALsn) Set(CommitA) else Set()).union(if (durableCount >= CommitBLsn) Set(CommitB) else Set()))
+  val WrittenFramesAreOrderedPrefix = writtenFrames == GroupFrames.slice(0, writeIndex)
+  val DurableFramesAreWrittenPrefix = durableCount >= 0 and durableCount <= writtenFrames.length()
+  val CommitRecoveryRequiresCommitMarker =
+    (phase != Recovered or recoveredCommits == recoveredFromPrefix(durableCount)) and
+    (not (recoveredCommits.contains(CommitA)) or durableCount >= CommitALsn) and
+    (not (recoveredCommits.contains(CommitB)) or durableCount >= CommitBLsn)
+  val RecoveredCommitsAreLogicalPrefix =
+    recoveredCommits == Set() or recoveredCommits == Set(CommitA) or recoveredCommits == AllCommits
+  val SyncSuccessMakesWholeGroupDurable = not (syncSucceeded) or durableCount == GroupFrames.length()
+  val AppendSuccessRequiresSyncSuccess = not (appendReturnedSuccess) or
+    (syncSucceeded and durableCount == GroupFrames.length())
+  val SyncStartsAfterCompleteWrite = not (syncStarted) or writeIndex == GroupFrames.length()
+  val FailedAppendNeverReportsSuccess = not (broken) or not (appendReturnedSuccess)
+  val RecoveryMatchesDurablePrefixReference = phase != Recovered or
+    (recoveredCommits == recoveredFromPrefix(durableCount) and
+      recoveredNextLsn == nextLsnFromPrefix(durableCount))
+  val TornTailDoesNotCreateCommit =
+    (not (tornTail) or phase != Recovered or recoveredCommits == recoveredFromPrefix(durableCount)) and
+    (not (tornTail) or not (recoveredCommits.contains(CommitA)) or durableCount >= CommitALsn) and
+    (not (tornTail) or not (recoveredCommits.contains(CommitB)) or durableCount >= CommitBLsn)
+  val AppendSuccessRecoversWholeGroup = not (appendReturnedSuccess) or recoveredCommits == AllCommits or phase != Recovered
+
   val state_invariants = all {
     TypeOK,
-    FixedFramePrefixOrdering,
-    DurablePrefixBound,
-    CommitBRequiresCommitA,
-    CommitARecoveryMatchesLsn,
-    CommitBRecoveryMatchesLsn,
-    RecoveryNextLsnMatchesPrefix,
-    SyncSuccessMeansWholeGroupDurable,
+    WrittenFramesAreOrderedPrefix,
+    DurableFramesAreWrittenPrefix,
+    CommitRecoveryRequiresCommitMarker,
+    RecoveredCommitsAreLogicalPrefix,
+    SyncSuccessMakesWholeGroupDurable,
     AppendSuccessRequiresSyncSuccess,
-    SyncFailureNeverReturnsSuccess,
-    CrashBeforeSyncCannotClaimSuccess,
-    SuccessfulSyncRecoversWholeGroup,
-    NoSyncRetryAfterFailure,
-    SyncCannotRestart,
-    LostReturnRetainsWholeGroup,
-    FailedClaimAllowsObservedRecovery,
+    SyncStartsAfterCompleteWrite,
+    FailedAppendNeverReportsSuccess,
+    RecoveryMatchesDurablePrefixReference,
+    TornTailDoesNotCreateCommit,
+    AppendSuccessRecoversWholeGroup,
   }
+
+  pure val RecoveryReferenceTest = all {
+    recoveredFromPrefix(0) == Set(),
+    recoveredFromPrefix(1) == Set(),
+    recoveredFromPrefix(2) == Set(CommitA),
+    recoveredFromPrefix(3) == Set(CommitA),
+    recoveredFromPrefix(4) == Set(CommitA),
+    recoveredFromPrefix(5) == Set(CommitA, CommitB),
+    nextLsnFromPrefix(0) == 1,
+    nextLsnFromPrefix(2) == 3,
+    nextLsnFromPrefix(5) == 6,
+  }
+
+  val walPathAReached = phase == Recovered and durableCount == 0 and recoveredCommits == Set()
+  val walPathBReached = phase == Recovered and durableCount == 2 and recoveredCommits == Set(CommitA)
+  val walPathCReached = phase == Recovered and durableCount == 5 and not (syncSucceeded) and recoveredCommits == AllCommits
+  val walPathDReached = phase == Recovered and durableCount == 5 and syncSucceeded and broken and not (appendReturnedSuccess) and recoveredCommits == AllCommits
+  val walPathEReached = phase == Recovered and appendReturnedSuccess and recoveredCommits == AllCommits
 }
