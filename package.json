@@ -1,0 +1,14 @@
+{
+  "name": "dodb-formalization",
+  "private": true,
+  "devDependencies": {
+    "@informalsystems/quint": "0.32.0"
+  },
+  "scripts": {
+    "formal:typecheck": "quint typecheck formal/quint/transaction_semantics.qnt",
+    "formal:test": "quint test formal/quint/transaction_semantics.qnt --backend=rust",
+    "formal:simulate": "quint run formal/quint/transaction_semantics.qnt --invariant=state_invariants --max-samples=200 --max-steps=20 --seed=0x20260923",
+    "formal:verify:tlc": "quint verify formal/quint/transaction_semantics.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=20 --invariants state_invariants",
+    "formal:verify:apalache": "quint verify formal/quint/transaction_semantics.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=20 --invariants state_invariants"
+  }
+}
