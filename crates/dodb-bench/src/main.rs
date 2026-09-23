@@ -30,6 +30,7 @@ const LARGE_VALUE_SIZE: usize = 65_536;
 const WARMUP_MS: u64 = 100;
 const MEASURE_MS: u64 = 350;
 const RAW_SAMPLE_LIMIT: usize = 1_024;
+const BENCHMARK_SEED: u64 = 1;
 const REQUEST_BUDGET: usize = 68 * 1024 * 1024;
 static PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -242,6 +243,7 @@ struct ServerMetricReport {
 struct BenchmarkResult {
     layer: String,
     workload: String,
+    seed: u64,
     value_size: usize,
     logical_key_count: usize,
     cache_capacity: Option<usize>,
@@ -1116,7 +1118,10 @@ impl Dataset {
 fn key_for_index(index: usize) -> DocumentKey {
     DocumentKey::new(
         (index % 64).to_le_bytes().to_vec(),
-        (index as u64).to_le_bytes().to_vec(),
+        (index as u64)
+            .wrapping_add(BENCHMARK_SEED)
+            .to_le_bytes()
+            .to_vec(),
     )
 }
 
@@ -1242,6 +1247,7 @@ fn make_result(
     BenchmarkResult {
         layer: layer.to_owned(),
         workload: workload.name().to_owned(),
+        seed: BENCHMARK_SEED,
         value_size,
         logical_key_count: key_count,
         cache_capacity,
