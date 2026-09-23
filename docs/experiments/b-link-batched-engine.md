@@ -14,6 +14,10 @@ The WAL physical group-write result is recorded in
 batching architecture is unchanged; this optimization only aggregates the
 physical WAL writes of an already logically batched group.
 
+Physical execution costs are attributed in
+[`physical-execution-attribution.md`](physical-execution-attribution.md). No
+physical execution optimization was implemented in this task.
+
 Baseline branch: `main`
 
 Baseline commit: `1ff96e1` (`storage: rely on crash-consistent storage snapshots`)
