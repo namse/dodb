@@ -16,6 +16,10 @@ Phase 3 result: [`phase3-results.md`](phase3-results.md)
 Current OCI Phase 3 diagnostic result:
 [`phase3-oci-results.md`](phase3-oci-results.md)
 
+The report separates partial real-sync observations from true sync-disabled
+CPU/engine diagnostics; neither establishes performance on the unmounted
+200 GB target filesystem.
+
 Phase 3 Mac runs are development smoke/profiling only. They are not the
 production benchmark, adoption evidence, or a final performance conclusion.
 The production target is an OCI A1 instance with 2 OCPU, 12 GiB RAM, and a
