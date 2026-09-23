@@ -1,5 +1,5 @@
 module common {
-  type Key = KeyA | KeyB | KeyC
+  type Key = KeyA | KeyB
   type Value = ValueA | ValueB
   type LogicalState = | Present((Value, int)) | Missing(int)
   type Condition = | RevisionEquals((Key, int)) | Exists(Key) | NotExists(Key)

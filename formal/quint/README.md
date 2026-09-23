@@ -33,6 +33,16 @@ trace. The candidate transaction moves through `Validating`, `Validated`,
 `Prepared`, and one of `Committed`, `Conflict`, `ConditionSatisfied`, or
 `InvalidRequest`.
 
+`transaction_group.qnt` models ordered logical processing of one fixed request
+sequence at a time. It keeps the group result private until `PublishGroup` and
+checks each processed prefix against a separate serial reference evaluator.
+The four bounded sequences cover accepted/conflict/accepted, staged-state
+condition-only success, insert-if-absent conflict, and invalid-then-accepted.
+The invalid case uses an empty transaction as a representative invalid request
+to check that one invalid request does not block later requests in the group;
+it does not formalize all Rust input-validation cases, such as duplicate
+conditions or mutations and oversized input.
+
 Validation reads the immutable `baseState`. Mutation preparation computes a
 private `stagedState` with one commit LSN for every changed key. Only
 `commitPrepared` changes `committedState` and advances `nextLsn`. A
@@ -68,6 +78,11 @@ npm run formal:test
 npm run formal:simulate
 npm run formal:verify:tlc
 npm run formal:verify:apalache
+npm run formal:group:typecheck
+npm run formal:group:test
+npm run formal:group:simulate
+npm run formal:group:verify:tlc
+npm run formal:group:verify:apalache
 ```
 
 The initial verification bound is two keys, two setup commits, finite values,
