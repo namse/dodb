@@ -1,7 +1,8 @@
 # B-link + Batched Storage Engine Experiment
 
-Status: Phase 3 implementation, correctness, and development smoke complete.
-Phase 4 parallel page execution has not started.
+Status: Phase 3.1 sparse working-state implementation, correctness, and OCI
+diagnostics complete. Phase 4 implementation has not started; its design may
+proceed based on the Phase 3.1 readiness gates.
 
 Baseline branch: `main`
 
@@ -15,6 +16,9 @@ Phase 3 result: [`phase3-results.md`](phase3-results.md)
 
 Current OCI Phase 3 diagnostic result:
 [`phase3-oci-results.md`](phase3-oci-results.md)
+
+Phase 3.1 sparse working-state result:
+[`phase3-sparse-working-state-results.md`](phase3-sparse-working-state-results.md)
 
 The report separates partial real-sync observations from true sync-disabled
 CPU/engine diagnostics; neither establishes performance on the unmounted
