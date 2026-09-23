@@ -111,8 +111,79 @@ The true sync-disabled `R100K` is 0.530, so the large planned write regression r
 ## Phase 4 Readiness
 
 - Parallelizable work exists: **yes**; independent leaf groups were observed.
-- Current serial planned path understood enough to begin Phase 4: **no**; the no-sync regression remains, and most processing time is still unattributed.
-- Recommendation for next engineering step: investigate state-size-dependent clone/catalog costs first, guided by the 0.141 ratio change. The timing residual is not proof of clone time. No Phase 4 or optimization work was performed here.
+- Current serial planned path understood enough to begin Phase 4: **no**; the clone is now directly measured as a dominant cost, but the detailed residual remains nonzero.
+- Recommendation for next engineering step: address the per-group whole-`BlinkState` clone in a separate task. No Phase 4 or optimization work was performed here.
+
+## Planned Serial Cost Attribution
+
+### Instrumentation
+
+- Added planned-path timers for the state clone, dirty union, catalog map clone/state scan, WAL assembly, state install, publication swap/retired-generation drop, and dirty tracking. Existing catalog construction and generation publication aggregate timers remain unchanged.
+- `GenerationPublisher::publish()` still drops the retired generation while holding the write lock; swap and drop time are split without moving the drop outside the lock. Existing test `versioned_generation_is_atomic_for_multi_page_transaction` verifies that a pinned reader retains the old generation while a new handle sees the published generation.
+- Both runs used sync-disabled mode. Writes and buffered WAL operations remain; these are not durability benchmarks. The benchmark files were on the root LVM/XFS filesystem, not a mounted 200 GB filesystem.
+- Both artifacts contain three valid `planned-blink` records at harness commit `49beb856035afd9732ac3439ed352ad8e7fd1a0e`; repetition seeds match the corresponding planned no-sync runs. Catalog and publication breakdown sums are within the 105% aggregate invariants for every record.
+
+### Cost breakdown
+
+Median milliseconds per measured run. Ratios are `ws100k / ws4096`.
+
+| component | ws100k ms | ws4096 ms | 100k/4096 |
+|---|---:|---:|---:|
+| processing total | 1,974.088 | 1,965.746 | 1.00 |
+| logical admission | 11.522 | 26.810 | 0.43 |
+| planning | 147.881 | 476.878 | 0.31 |
+| state clone | 632.706 | 70.874 | 8.93 |
+| physical execution | 207.909 | 621.315 | 0.33 |
+| dirty union | 0.627 | 1.581 | 0.40 |
+| catalog total | 87.597 | 46.497 | 1.88 |
+| └ catalog map clone | 26.083 | 2.343 | 11.13 |
+| └ catalog state scan | 61.434 | 44.041 | 1.39 |
+| WAL assembly | 23.280 | 44.779 | 0.52 |
+| WAL append | 188.448 | 513.954 | 0.37 |
+| WAL sync | 0.013 | 0.040 | 0.32 |
+| state install | 280.772 | 52.237 | 5.37 |
+| generation publication total | 207.187 | 24.899 | 8.32 |
+| └ publication swap | 0.002 | 0.005 | 0.35 |
+| └ retired generation drop | 207.124 | 24.814 | 8.35 |
+| dirty tracking | 16.228 | 19.258 | 0.84 |
+| detailed residual | 167.230 | 59.999 | 2.79 |
+
+The detailed residual is computed per repetition as `max(processing - known_detailed, 0)` and then medianed. Catalog and publication submetrics are not added a second time because they are included in their respective aggregate timers.
+
+### Contribution at 100k
+
+Each top-level component is divided by the 1,974.088 ms processing median; nested breakdowns are excluded from this contribution sum.
+
+| top-level component | processing share |
+|---|---:|
+| logical admission | 0.58% |
+| planning | 7.49% |
+| state clone | 32.05% |
+| physical execution | 10.53% |
+| dirty union | 0.03% |
+| catalog total | 4.44% |
+| WAL assembly | 1.18% |
+| WAL append | 9.55% |
+| WAL sync | <0.01% |
+| state install | 14.22% |
+| generation publication total | 10.50% |
+| dirty tracking | 0.82% |
+| detailed residual | 8.47% |
+
+Catalog lifecycle (catalog total plus generation publication) is 14.93% of processing. WAL assembly, append, and dirty tracking together are 11.55%. State clone alone is 32.05% and accounts for 58.35% of the earlier 1,084.291 ms unattributed residual. The detailed residual is now 167.230 ms.
+
+### Working-set sensitivity
+
+- Strong sensitivity (at least 2x at ws100k): state clone **8.93x**, catalog map clone **11.13x**, and retired generation drop **8.35x**.
+- Catalog state scan is **1.39x**, below the 2x marker. Other component ratios are listed in the cost table.
+
+### Attribution conclusion
+
+**Rule A applies.** State clone is more than 30% of processing and explains more than half of the previous unattributed work. Catalog lifecycle and WAL/page-image path are each below their 30% thresholds. Retired-generation drop is individually sizable but does not make the combined catalog lifecycle reach Rule B's threshold.
+
+### Next engineering step
+
+The single next priority is to eliminate the whole `BlinkState` clone per group, using a sparse/COW working-state design in a separate implementation task. This instrumentation task makes no such change. Phase 4 remains not ready to start until that serial-path cost is addressed and reassessed.
 
 ## Artifacts
 
@@ -127,4 +198,6 @@ The true sync-disabled `R100K` is 0.530, so the large planned write regression r
 - [`planned-nosync-w16-width16-ws100k.jsonl`](results/oci-a1-2ocpu-12g-200g/phase3/planned-nosync-w16-width16-ws100k.jsonl)
 - [`main-nosync-w16-width16-ws4096.jsonl`](results/oci-a1-2ocpu-12g-200g/phase3/main-nosync-w16-width16-ws4096.jsonl)
 - [`planned-nosync-w16-width16-ws4096.jsonl`](results/oci-a1-2ocpu-12g-200g/phase3/planned-nosync-w16-width16-ws4096.jsonl)
+- [`planned-cost-attribution-ws100k.jsonl`](results/oci-a1-2ocpu-12g-200g/phase3/planned-cost-attribution-ws100k.jsonl)
+- [`planned-cost-attribution-ws4096.jsonl`](results/oci-a1-2ocpu-12g-200g/phase3/planned-cost-attribution-ws4096.jsonl)
 - Preserved smoke controls: [`smoke-main-btree.jsonl`](results/oci-a1-2ocpu-12g-200g/phase3/smoke-main-btree.jsonl) and [`smoke-planned-blink.jsonl`](results/oci-a1-2ocpu-12g-200g/phase3/smoke-planned-blink.jsonl).
