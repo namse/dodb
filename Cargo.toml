@@ -9,6 +9,7 @@ members = [
     "crates/dodb-storage",
     "crates/dodb-testkit",
     "crates/dodb-soak",
+    "crates/dodb-bench",
 ]
 
 [workspace.package]

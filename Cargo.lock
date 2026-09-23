@@ -254,6 +254,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dodb-bench"
+version = "0.1.0"
+dependencies = [
+ "dodb-client",
+ "dodb-core",
+ "dodb-protocol",
+ "dodb-server",
+ "dodb-service",
+ "dodb-storage",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dodb-client"
 version = "0.1.0"
 dependencies = [

@@ -38,7 +38,7 @@ impl Default for CoordinatorConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoordinatorMetrics {
     pub groups: u64,
     pub queued_requests: u64,
@@ -49,6 +49,27 @@ pub struct CoordinatorMetrics {
     pub processing_nanos: u64,
     pub max_group_requests: usize,
     pub max_group_bytes: usize,
+    /// Counts groups by request count. Index 0 is unused; index 64 also
+    /// represents groups larger than 64 so benchmark tooling can calculate
+    /// percentiles without retaining every group sample.
+    pub group_size_counts: [u64; 65],
+}
+
+impl Default for CoordinatorMetrics {
+    fn default() -> Self {
+        Self {
+            groups: 0,
+            queued_requests: 0,
+            logical_transactions: 0,
+            overloaded_requests: 0,
+            queue_wait_nanos: 0,
+            batch_collection_nanos: 0,
+            processing_nanos: 0,
+            max_group_requests: 0,
+            max_group_bytes: 0,
+            group_size_counts: [0; 65],
+        }
+    }
 }
 
 /// Async single-shard facade. The coordinator is deliberately thin; all tree
@@ -824,6 +845,8 @@ fn record_group(
             .saturating_add(collection_nanos);
         metrics.max_group_requests = metrics.max_group_requests.max(group_requests);
         metrics.max_group_bytes = metrics.max_group_bytes.max(group_bytes);
+        let bucket = group_requests.min(metrics.group_size_counts.len() - 1);
+        metrics.group_size_counts[bucket] = metrics.group_size_counts[bucket].saturating_add(1);
     }
 }
 
