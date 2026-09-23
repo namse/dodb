@@ -9,6 +9,11 @@ The independent serial generation/catalog lifecycle optimization is recorded in
 [`catalog-cow-results.md`](catalog-cow-results.md). It does not change the
 Phase 4 conclusion or imply Phase 5 readiness.
 
+The WAL physical group-write result is recorded in
+[`wal-group-write-results.md`](wal-group-write-results.md). The B-link +
+batching architecture is unchanged; this optimization only aggregates the
+physical WAL writes of an already logically batched group.
+
 Baseline branch: `main`
 
 Baseline commit: `1ff96e1` (`storage: rely on crash-consistent storage snapshots`)
