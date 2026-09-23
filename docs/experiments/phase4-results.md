@@ -184,3 +184,81 @@ backup copies:
 | `planned-sparse-nosync-w16-width16-ws100k.jsonl` | `24c0426b0768e74fb8e44791c82dc3414a95d52503720268dd1d494ba4a01d54` |
 | `planned-sparse-nosync-w16-width16-ws4096.jsonl` | `fd0c57281c3090c1ba83887364238f6f8286d78b39dbddb36f84f76a7818a3b3` |
 | `planned-sparse-real-w16-width16-ws100k.jsonl` | `ecd444dc25c5f409ba16f39b03c7efb2ce8bff3fc3f9570e0355cdece4a14317` |
+
+## OCI CPU Availability and Granularity Control
+
+The OCI host reports two online Neoverse-N1 CPUs. `nproc` returned 2,
+`taskset -pc` reported affinity `0,1`, Python affinity was `[0, 1]`, and
+`cpuset.cpus.effective` contained `0-1`. `/sys/fs/cgroup/cpu.max` produced no
+content at the queried path. `/proc/self/cgroup` reported
+`0::/user.slice/user-1000.slice/session-352.scope`. No configuration was
+changed.
+
+A single two-process CPU saturation test ran for about five seconds. Both
+children had affinity `[0, 1]` and each accumulated about 4.995 CPU seconds.
+Combined child CPU time was 9.989 seconds over 5.007 seconds of parent wall
+time, for `cpu_parallel_factor = 1.995`. This confirms that the OCI environment
+can run two CPU-bound processes concurrently.
+
+### Delay-zero reference
+
+| engine | mut/s median | min..max | median avg group requests | process CPU, one-core median | process CPU, machine median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| planned-blink | 7,818.20 | 7,678.95..7,870.21 | 11.54 | 100.87% | 50.44% |
+| parallel-blink | 6,717.26 | 6,689.50..6,755.83 | 9.08 | 104.35% | 52.18% |
+
+Delay-zero parallel effective-parallelism samples were 0.976, 1.092, and
+1.075, with median 1.075. Coverage was 81.0%, with 11.20 leaf jobs and 2.00
+worker dispatches per successful parallel group. The process used only about
+one CPU on average despite the host's verified two-CPU availability.
+
+### 100 us control
+
+The same workload was run with collection delay 100 us. Both artifacts have
+three valid records at commit `3465dbb996bb4a0b9419a8a4099548ad0d8af8a0`,
+zero errors and overloads, disabled sync, and zero full-state clones.
+
+| engine | mut/s median | min..max | median avg group requests | process CPU, one-core median | process CPU, machine median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| planned-blink | 5,293.32 | 5,269.65..5,319.27 | 16.00 | 63.37% | 31.69% |
+| parallel-blink | 5,196.71 | 5,191.95..5,241.33 | 16.00 | 66.42% | 33.21% |
+
+The 100 us speedup was 0.982x. Parallel effective-parallelism samples were
+1.092, 1.122, and 1.124, with median 1.122. Coverage was 100%: 1,957 of
+1,957 groups used parallel execution. Each parallel group had 16.00 leaf jobs
+and 2.00 worker dispatches; there were no single-leaf skips or correctness
+fallbacks. Thus the average parallel job count increased from 11.20 to 16.00
+per group, but worker overlap remained below 1.20. Process CPU use was about
+66% of one core, or 33% of the machine, in the parallel records.
+
+### Interpretation and next priority
+
+The two-process saturation result rules out an OCI one-core allocation as the
+cause of the weak Phase 4 overlap. The 100 us control increased group and job
+granularity and reached full parallel-group coverage, but did not reach the
+required 1.20 effective parallelism. Its throughput ratio was 0.982x, which
+meets the 0.95 throughput floor but does not offset the overlap failure. The
+granularity hypothesis is therefore **rejected**: larger groups alone did not
+recover worker overlap on this target. The current Phase 4 leaf-job dispatch
+design is not worthwhile on this OCI target under these measurements; no
+worker-pool optimization was started.
+
+At 100 us, Phase 4 does not justify proceeding to Phase 5. The next engineering
+priority is serial generation/catalog lifecycle cost. In the delay-zero
+parallel median repetition, catalog construction was 412.79 ms and generation
+publication was 448.73 ms, together 861.52 ms of 1,945.14 ms processing
+(about 44%). The main cost to investigate is the full `PageCatalog.pages`
+`BTreeMap` clone and dropping the retired generation/catalog. WAL append was
+459.11 ms, but the combined catalog/publication lifecycle was larger. No such
+optimization was implemented in this diagnostic.
+
+### 100 us artifacts
+
+- Planned:
+  [`planned-pool-different-width1-nosync-delay100us.jsonl`](results/oci-a1-2ocpu-12g-200g/phase4/planned-pool-different-width1-nosync-delay100us.jsonl)
+  SHA256 `9751e3e14a43e2b20fe0324d895a55b307029532085b6a5880f9d5a01facbae6`
+- Parallel:
+  [`parallel-pool-different-width1-nosync-delay100us.jsonl`](results/oci-a1-2ocpu-12g-200g/phase4/parallel-pool-different-width1-nosync-delay100us.jsonl)
+  SHA256 `a0da0176b1457ac91d716e5e4fd472911c9d54ed8981884f69bdbe6b0cbdf8fc`
+- OCI backup:
+  `/home/opc/dodb-oci-artifacts-cpu-diag-3465dbb/phase4/`
