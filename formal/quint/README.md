@@ -50,6 +50,13 @@ and records the current logical state. Independent serial and segmentation
 references check each processed prefix. The model does not reimplement
 transaction semantics.
 
+`coordinator_collection.qnt` verifies physical group formation for one fixed
+FIFO-admitted request stream. It checks request conservation and FIFO order,
+pending-request handoff, request-count and byte bounds, and the oversized-first
+request exception. Timing is not modeled; sealing a group early is an
+nondeterministic choice. Transaction and barrier semantics, WAL, and fsync are
+the responsibility of the other models or are outside this model's scope.
+
 Validation reads the immutable `baseState`. Mutation preparation computes a
 private `stagedState` with one commit LSN for every changed key. Only
 `commitPrepared` changes `committedState` and advances `nextLsn`. A
@@ -95,6 +102,11 @@ npm run formal:segments:test
 npm run formal:segments:simulate
 npm run formal:segments:verify:tlc
 npm run formal:segments:verify:apalache
+npm run formal:collection:typecheck
+npm run formal:collection:test
+npm run formal:collection:simulate
+npm run formal:collection:verify:tlc
+npm run formal:collection:verify:apalache
 ```
 
 The initial verification bound is two keys, two setup commits, finite values,

@@ -19,6 +19,11 @@
     "formal:segments:test": "quint test formal/quint/coordinator_segments.qnt --backend=rust",
     "formal:segments:simulate": "quint run formal/quint/coordinator_segments.qnt --invariant=state_invariants --max-samples=1 --max-steps=20 --seed=0x20260923",
     "formal:segments:verify:tlc": "quint verify formal/quint/coordinator_segments.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=20 --invariants state_invariants",
-    "formal:segments:verify:apalache": "quint verify formal/quint/coordinator_segments.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=20 --invariants state_invariants"
+    "formal:segments:verify:apalache": "quint verify formal/quint/coordinator_segments.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=20 --invariants state_invariants",
+    "formal:collection:typecheck": "quint typecheck formal/quint/coordinator_collection.qnt",
+    "formal:collection:test": "quint test formal/quint/coordinator_collection.qnt --backend=rust",
+    "formal:collection:simulate": "quint run formal/quint/coordinator_collection.qnt --invariant=state_invariants --max-samples=200 --max-steps=20 --seed=0x20260923",
+    "formal:collection:verify:tlc": "quint verify formal/quint/coordinator_collection.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=20 --invariants state_invariants",
+    "formal:collection:verify:apalache": "quint verify formal/quint/coordinator_collection.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=20 --invariants state_invariants"
   }
 }
