@@ -29,6 +29,11 @@
     "formal:wal:test": "quint test formal/quint/wal_durability.qnt --backend=rust",
     "formal:wal:simulate": "quint run formal/quint/wal_durability.qnt --invariant=state_invariants --max-samples=5000 --max-steps=25 --seed=0x20260923 --witnesses walPathAReached walPathBReached walPathCReached walPathDReached walPathEReached",
     "formal:wal:verify:tlc": "quint verify formal/quint/wal_durability.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants",
-    "formal:wal:verify:apalache": "quint verify formal/quint/wal_durability.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants"
+    "formal:wal:verify:apalache": "quint verify formal/quint/wal_durability.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants",
+    "formal:publication:typecheck": "quint typecheck formal/quint/publication_visibility.qnt",
+    "formal:publication:test": "quint test formal/quint/publication_visibility.qnt --backend=rust",
+    "formal:publication:simulate": "quint run formal/quint/publication_visibility.qnt --invariant=state_invariants --max-samples=5000 --max-steps=25 --seed=0x20260923 --witnesses publicationPathAReached publicationPathBReached publicationPathCReached publicationPathDReached publicationPathEReached publicationPathFReached",
+    "formal:publication:verify:tlc": "quint verify formal/quint/publication_visibility.qnt --backend=tlc --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants",
+    "formal:publication:verify:apalache": "quint verify formal/quint/publication_visibility.qnt --backend=apalache --apalache-version=0.56.1 --max-steps=25 --invariants state_invariants"
   }
 }

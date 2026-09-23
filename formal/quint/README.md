@@ -157,3 +157,42 @@ npm run formal:wal:simulate
 npm run formal:wal:verify:tlc
 npm run formal:wal:verify:apalache
 ```
+
+## Publication and read visibility model
+
+`publication_visibility.qnt` checks the publication pipeline for the fixed
+logical group `CommitA` and `CommitB`. It covers WAL durability before store
+publication, transient per-commit store publication, atomic committed read-view
+publication, ordinary read visibility, coordinator response issuance ordering,
+crash recovery from WAL authority, and the distinct before/after publish
+failure outcomes. Recovery models reopening from durable WAL state; checkpoint,
+WAL reset, and data-file flush are outside this model.
+
+The store may transiently publish A before B internally, but ordinary
+lock-free reads use the committed read view and do not observe that partial
+group in the live process.
+
+A failed or missing response does not imply rollback; once WAL durability has
+been established, crash recovery may restore the commit.
+
+The modeled responses are coordinator oneshot response issuance. Network
+delivery and client acknowledgment are outside the model.
+
+The production mapping is `WalAppendSuccess` to successful
+`wal.append_group(...)`, `WalAppendFailure` to its error path and broken store,
+`BeforePublishFailure` to the `before_publish` fault after WAL durability but
+before store publication, `PublishA` and `PublishB` to the prepared store
+publication loop, `PublishReadView` to `coordinator::publish_read_updates()`,
+and the success or error response actions to `queued.response_tx.send(...)`.
+`AfterPublishFailure` captures an error after both store publications: the
+coordinator can still publish the committed read view, leaving visible A+B
+alongside error responses. Ordinary `Get`, `Query`, and `Scan` read the
+`CommittedReadView`; they do not observe the store's transient A-only state.
+
+```sh
+npm run formal:publication:typecheck
+npm run formal:publication:test
+npm run formal:publication:simulate
+npm run formal:publication:verify:tlc
+npm run formal:publication:verify:apalache
+```
