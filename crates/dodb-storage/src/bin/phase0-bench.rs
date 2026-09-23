@@ -21,9 +21,9 @@ use dodb_core::{
     TransactionRequest, TransactionResult,
 };
 use dodb_storage::{
-    AsyncShard, BTreeStore, BatchRequest, BatchResponse, BlinkReadHandle, BlinkSplitMetrics,
-    BlinkStore, BlinkVersionedReadMetrics, CoordinatorConfig, DatabaseConfig, DurableFile,
-    ProductionFile, StorageMetrics, WalMetrics,
+    AsyncShard, BTreeStore, BatchRequest, BatchResponse, BlinkBatchMetrics, BlinkReadHandle,
+    BlinkSplitMetrics, BlinkStore, BlinkVersionedReadMetrics, CoordinatorConfig, DatabaseConfig,
+    DurableFile, ProductionFile, StorageMetrics, WalMetrics,
 };
 
 const BASELINE_COMMIT: &str = "1ff96e1b3d205074d4c1b820f5f2680bd3226a8b";
@@ -172,6 +172,7 @@ enum EngineKind {
     MainBtree,
     SerialBlink,
     VersionedBlink,
+    PlannedBlink,
 }
 
 impl EngineKind {
@@ -180,6 +181,7 @@ impl EngineKind {
             "main-btree" | "btree" | "main" => Self::MainBtree,
             "serial-blink" | "blink" => Self::SerialBlink,
             "versioned-blink" | "blink-versioned" | "phase2" => Self::VersionedBlink,
+            "planned-blink" | "blink-planned" | "phase3" => Self::PlannedBlink,
             other => panic!("unknown engine {other:?}"),
         }
     }
@@ -189,6 +191,7 @@ impl EngineKind {
             Self::MainBtree => "main-btree",
             Self::SerialBlink => "serial-blink",
             Self::VersionedBlink => "versioned-blink",
+            Self::PlannedBlink => "planned-blink",
         }
     }
 }
@@ -458,7 +461,7 @@ fn print_help() {
     println!(
         "phase0-bench sustained baseline\n\n\
          Usage: cargo run --release -p dodb-storage --bin phase0-bench -- [options]\n\n\
-         --engine main-btree|serial-blink|versioned-blink\n\
+         --engine main-btree|serial-blink|versioned-blink|planned-blink\n\
          Suites: write, read, mixed, delay-sweep, sync-sweep, all\n\
          Options: --writers 1,4 --readers 1,4 --widths 1,16\n\
          --distributions uniform,same-leaf-heavy,different-leaf-heavy\n\
@@ -973,6 +976,7 @@ struct EngineSnapshot {
     storage: Option<StorageMetrics>,
     wal: Option<WalMetrics>,
     blink: Option<BlinkSplitMetrics>,
+    batch: Option<BlinkBatchMetrics>,
     versioned: Option<BlinkVersionedReadMetrics>,
 }
 
@@ -1008,6 +1012,7 @@ impl EngineAdapter for BaselineAdapter {
             storage: self.shard.storage_metrics(),
             wal: self.shard.wal_metrics(),
             blink: None,
+            batch: None,
             versioned: None,
         }
     }
@@ -1204,6 +1209,7 @@ impl EngineAdapter for BlinkAdapter {
                 storage: None,
                 wal: None,
                 blink: None,
+                batch: None,
                 versioned: None,
             };
         };
@@ -1216,6 +1222,7 @@ impl EngineAdapter for BlinkAdapter {
             storage: Some(store.storage_metrics()),
             wal: store.wal_metrics().ok().flatten(),
             blink: Some(store.split_metrics()),
+            batch: Some(store.batch_metrics()),
             versioned: self
                 .read_handle
                 .as_ref()
@@ -1399,6 +1406,34 @@ struct MetricDelta {
     retired_page_ids: u64,
     reusable_page_ids: u64,
     versioned_right_link_corrections: u64,
+    logical_groups: u64,
+    admitted_transactions: u64,
+    conflicted_transactions: u64,
+    rejected_transactions: u64,
+    logical_admission_nanos: u64,
+    planning_nanos: u64,
+    physical_execution_nanos: u64,
+    full_state_clones: u64,
+    mutations_planned: u64,
+    routes_calculated: u64,
+    route_reuses: u64,
+    route_invalidations: u64,
+    reroutes: u64,
+    leaf_groups: u64,
+    same_leaf_groups: u64,
+    mutations_per_leaf_group: u64,
+    coalesced_mutations: u64,
+    independent_leaf_groups: u64,
+    dependency_edges: u64,
+    leaf_loads: u64,
+    leaf_encodes: u64,
+    structural_fallbacks: u64,
+    split_triggered_reroutes: u64,
+    coalescing_interruptions: u64,
+    planner_page_images: u64,
+    planner_wal_bytes: u64,
+    catalog_construction_nanos: u64,
+    generation_publication_nanos: u64,
 }
 
 impl MetricDelta {
@@ -1410,6 +1445,8 @@ impl MetricDelta {
         let wal_after = after.wal.clone().unwrap_or_default();
         let blink_before = before.blink.clone().unwrap_or_default();
         let blink_after = after.blink.clone().unwrap_or_default();
+        let batch_before = before.batch.clone().unwrap_or_default();
+        let batch_after = after.batch.clone().unwrap_or_default();
         let versioned_before = before.versioned.clone().unwrap_or_default();
         let versioned_after = after.versioned.clone().unwrap_or_default();
         Self {
@@ -1494,6 +1531,91 @@ impl MetricDelta {
             versioned_right_link_corrections: subtraction(
                 versioned_after.right_link_corrections,
                 versioned_before.right_link_corrections,
+            ),
+            logical_groups: subtraction(batch_after.logical_groups, batch_before.logical_groups),
+            admitted_transactions: subtraction(
+                batch_after.admitted_transactions,
+                batch_before.admitted_transactions,
+            ),
+            conflicted_transactions: subtraction(
+                batch_after.conflicted_transactions,
+                batch_before.conflicted_transactions,
+            ),
+            rejected_transactions: subtraction(
+                batch_after.rejected_transactions,
+                batch_before.rejected_transactions,
+            ),
+            logical_admission_nanos: subtraction(
+                batch_after.logical_admission_nanos,
+                batch_before.logical_admission_nanos,
+            ),
+            planning_nanos: subtraction(batch_after.planning_nanos, batch_before.planning_nanos),
+            physical_execution_nanos: subtraction(
+                batch_after.physical_execution_nanos,
+                batch_before.physical_execution_nanos,
+            ),
+            full_state_clones: subtraction(
+                batch_after.full_state_clones,
+                batch_before.full_state_clones,
+            ),
+            mutations_planned: subtraction(
+                batch_after.mutations_planned,
+                batch_before.mutations_planned,
+            ),
+            routes_calculated: subtraction(
+                batch_after.routes_calculated,
+                batch_before.routes_calculated,
+            ),
+            route_reuses: subtraction(batch_after.route_reuses, batch_before.route_reuses),
+            route_invalidations: subtraction(
+                batch_after.route_invalidations,
+                batch_before.route_invalidations,
+            ),
+            reroutes: subtraction(batch_after.reroutes, batch_before.reroutes),
+            leaf_groups: subtraction(batch_after.leaf_groups, batch_before.leaf_groups),
+            same_leaf_groups: subtraction(
+                batch_after.same_leaf_groups,
+                batch_before.same_leaf_groups,
+            ),
+            mutations_per_leaf_group: subtraction(
+                batch_after.mutations_per_leaf_group,
+                batch_before.mutations_per_leaf_group,
+            ),
+            coalesced_mutations: subtraction(
+                batch_after.coalesced_mutations,
+                batch_before.coalesced_mutations,
+            ),
+            independent_leaf_groups: subtraction(
+                batch_after.independent_leaf_groups,
+                batch_before.independent_leaf_groups,
+            ),
+            dependency_edges: subtraction(
+                batch_after.dependency_edges,
+                batch_before.dependency_edges,
+            ),
+            leaf_loads: subtraction(batch_after.leaf_loads, batch_before.leaf_loads),
+            leaf_encodes: subtraction(batch_after.leaf_encodes, batch_before.leaf_encodes),
+            structural_fallbacks: subtraction(
+                batch_after.structural_fallbacks,
+                batch_before.structural_fallbacks,
+            ),
+            split_triggered_reroutes: subtraction(
+                batch_after.split_triggered_reroutes,
+                batch_before.split_triggered_reroutes,
+            ),
+            coalescing_interruptions: subtraction(
+                batch_after.coalescing_interruptions,
+                batch_before.coalescing_interruptions,
+            ),
+            planner_page_images: subtraction(batch_after.page_images, batch_before.page_images),
+            planner_wal_bytes: subtraction(batch_after.wal_bytes, batch_before.wal_bytes),
+            catalog_construction_nanos: subtraction(
+                batch_after.catalog_construction_nanos,
+                batch_before.catalog_construction_nanos,
+            ),
+            generation_publication_nanos: subtraction(
+                batch_after.generation_publication_nanos,
+                batch_before.generation_publication_nanos,
             ),
         }
     }
@@ -1984,6 +2106,21 @@ async fn open_adapter(
             let adapter = BlinkAdapter::start_versioned(store, benchmark_config(args, scenario));
             Ok((Arc::new(adapter), data_path, seeded))
         }
+        EngineKind::PlannedBlink => {
+            let mut store = BlinkStore::open_with_wal(
+                BenchFile::open(&data_path, sync_delay)?,
+                BenchFile::open(&wal_path, sync_delay)?,
+                config,
+            )?;
+            store.enable_planned_execution();
+            let requests = seed_requests(args, scenario);
+            let seeded = requests.iter().map(|request| request.mutations.len()).sum();
+            for chunk in requests.chunks(64) {
+                store.apply_transaction_group(chunk)?;
+            }
+            let adapter = BlinkAdapter::start_versioned(store, benchmark_config(args, scenario));
+            Ok((Arc::new(adapter), data_path, seeded))
+        }
     }
 }
 
@@ -2248,6 +2385,49 @@ fn build_record(
     json.u64(
         "versioned_right_link_corrections",
         delta.versioned_right_link_corrections,
+    );
+    json.u64("logical_groups", delta.logical_groups);
+    json.u64("logical_transactions", delta.logical_transactions);
+    json.u64("admitted_transactions", delta.admitted_transactions);
+    json.u64("conflicted_transactions", delta.conflicted_transactions);
+    json.u64("rejected_transactions", delta.rejected_transactions);
+    json.u64("logical_admission_nanos", delta.logical_admission_nanos);
+    json.u64("planning_nanos", delta.planning_nanos);
+    json.u64("physical_execution_nanos", delta.physical_execution_nanos);
+    json.u64("full_state_clones", delta.full_state_clones);
+    json.f64(
+        "full_state_clones_per_group",
+        delta.full_state_clones as f64 / delta.groups.max(1) as f64,
+    );
+    json.f64(
+        "full_state_clones_per_transaction",
+        delta.full_state_clones as f64 / delta.logical_transactions.max(1) as f64,
+    );
+    json.u64("mutations_planned", delta.mutations_planned);
+    json.u64("routes_calculated", delta.routes_calculated);
+    json.u64("route_reuses", delta.route_reuses);
+    json.u64("route_invalidations", delta.route_invalidations);
+    json.u64("reroutes", delta.reroutes);
+    json.u64("leaf_groups", delta.leaf_groups);
+    json.u64("same_leaf_groups", delta.same_leaf_groups);
+    json.u64("mutations_per_leaf_group", delta.mutations_per_leaf_group);
+    json.u64("coalesced_mutations", delta.coalesced_mutations);
+    json.u64("independent_leaf_groups", delta.independent_leaf_groups);
+    json.u64("dependency_edges", delta.dependency_edges);
+    json.u64("leaf_loads", delta.leaf_loads);
+    json.u64("leaf_encodes", delta.leaf_encodes);
+    json.u64("structural_fallbacks", delta.structural_fallbacks);
+    json.u64("split_triggered_reroutes", delta.split_triggered_reroutes);
+    json.u64("coalescing_interruptions", delta.coalescing_interruptions);
+    json.u64("planner_page_images", delta.planner_page_images);
+    json.u64("planner_wal_bytes", delta.planner_wal_bytes);
+    json.u64(
+        "catalog_construction_nanos",
+        delta.catalog_construction_nanos,
+    );
+    json.u64(
+        "generation_publication_nanos",
+        delta.generation_publication_nanos,
     );
     json.string(
         "component_timing_scope",

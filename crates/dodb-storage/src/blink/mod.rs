@@ -61,6 +61,106 @@ pub struct BlinkSplitMetrics {
     pub page_images: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProvisionalRevisionToken {
+    pub transaction_position: usize,
+    pub ordinal: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyKind {
+    SameKey,
+    ConditionKey,
+    SameTargetPage,
+    SameTransaction,
+    StructuralRoute,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyEdge {
+    pub predecessor: usize,
+    pub successor: usize,
+    pub kind: DependencyKind,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DependencyMetadata {
+    pub same_key_predecessors: Vec<usize>,
+    pub condition_key_predecessors: Vec<usize>,
+    pub same_target_page_predecessors: Vec<usize>,
+    pub same_transaction_positions: Vec<usize>,
+    pub structural_route_predecessors: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteHint {
+    pub encoded_key: Vec<u8>,
+    pub leaf_id: PageId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedMutation {
+    pub mutation: TransactionMutation,
+    pub encoded_key: Vec<u8>,
+    pub route_hint: RouteHint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalTransactionPlan {
+    pub fifo_position: usize,
+    pub provisional_revision: ProvisionalRevisionToken,
+    pub mutations: Vec<PlannedMutation>,
+    pub encoded_keys: Vec<Vec<u8>>,
+    pub mutated_key_set: BTreeSet<Vec<u8>>,
+    pub dependency_metadata: DependencyMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeafGroupPlan {
+    pub leaf_hint: PageId,
+    pub mutations: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BatchPlan {
+    pub transactions: Vec<PhysicalTransactionPlan>,
+    pub leaf_groups: Vec<LeafGroupPlan>,
+    pub dependencies: Vec<DependencyEdge>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlinkBatchMetrics {
+    pub logical_groups: u64,
+    pub logical_transactions: u64,
+    pub admitted_transactions: u64,
+    pub conflicted_transactions: u64,
+    pub rejected_transactions: u64,
+    pub logical_admission_nanos: u64,
+    pub planning_nanos: u64,
+    pub physical_execution_nanos: u64,
+    pub full_state_clones: u64,
+    pub mutations_planned: u64,
+    pub routes_calculated: u64,
+    pub route_reuses: u64,
+    pub route_invalidations: u64,
+    pub reroutes: u64,
+    pub leaf_groups: u64,
+    pub same_leaf_groups: u64,
+    pub mutations_per_leaf_group: u64,
+    pub coalesced_mutations: u64,
+    pub independent_leaf_groups: u64,
+    pub dependency_edges: u64,
+    pub leaf_loads: u64,
+    pub leaf_encodes: u64,
+    pub structural_fallbacks: u64,
+    pub split_triggered_reroutes: u64,
+    pub coalescing_interruptions: u64,
+    pub page_images: u64,
+    pub wal_bytes: u64,
+    pub catalog_construction_nanos: u64,
+    pub generation_publication_nanos: u64,
+}
+
 impl Default for BlinkSplitMetrics {
     fn default() -> Self {
         Self {
@@ -289,6 +389,39 @@ struct BlinkState {
     free_list_head: Option<PageId>,
     high_water_page_id: PageId,
     allow_page_reuse: bool,
+}
+
+#[derive(Clone, Debug)]
+enum LogicalRevision {
+    Provisional(ProvisionalRevisionToken),
+}
+
+#[derive(Clone, Debug)]
+struct LogicalEntry {
+    present: bool,
+    value: Option<Vec<u8>>,
+    revision: LogicalRevision,
+    originating_transaction_position: usize,
+}
+
+struct LogicalOverlay<'a> {
+    committed: &'a BlinkState,
+    entries: BTreeMap<Vec<u8>, LogicalEntry>,
+}
+
+struct AdmittedTransaction {
+    fifo_position: usize,
+    request: TransactionRequest,
+    provisional_revision: ProvisionalRevisionToken,
+}
+
+struct CachedLeaf {
+    leaf_id: PageId,
+    page: BlinkPage,
+}
+
+struct PhysicalExecutionState {
+    cached_leaf: Option<CachedLeaf>,
 }
 
 #[derive(Clone, Debug)]
@@ -584,6 +717,18 @@ struct Candidate {
     next_batch_id: u64,
 }
 
+struct ExecutedPlanTransaction {
+    batch_id: u64,
+    result: TransactionResult,
+    dirty: BTreeSet<PageId>,
+    images: Vec<WalPageImage>,
+    superblock: BlinkSuperblock,
+    slot: SuperblockSlot,
+    next_revision: Revision,
+    next_lsn: Lsn,
+    next_batch_id: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SuperblockSlot {
     A,
@@ -607,6 +752,8 @@ pub struct BlinkStore<F: DurableFile, W: DurableFile = crate::btree::NoWal> {
     dirty_superblock: Option<[u8; PAGE_SIZE]>,
     storage_metrics: StorageMetrics,
     split_metrics: BlinkSplitMetrics,
+    batch_metrics: BlinkBatchMetrics,
+    planned_execution: bool,
     broken: Option<String>,
     fault_injector: Option<Box<dyn FaultInjector + Send>>,
 }
@@ -729,6 +876,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             dirty_superblock: None,
             storage_metrics: StorageMetrics::default(),
             split_metrics: BlinkSplitMetrics::default(),
+            batch_metrics: BlinkBatchMetrics::default(),
+            planned_execution: false,
             broken: None,
             fault_injector: None,
         })
@@ -794,6 +943,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             dirty_superblock: None,
             storage_metrics: StorageMetrics::default(),
             split_metrics: BlinkSplitMetrics::default(),
+            batch_metrics: BlinkBatchMetrics::default(),
+            planned_execution: false,
             broken: None,
             fault_injector: None,
         };
@@ -811,6 +962,14 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
 
     pub fn split_metrics(&self) -> BlinkSplitMetrics {
         self.split_metrics.clone()
+    }
+
+    pub fn batch_metrics(&self) -> BlinkBatchMetrics {
+        self.batch_metrics.clone()
+    }
+
+    pub fn enable_planned_execution(&mut self) {
+        self.planned_execution = true;
     }
 
     pub fn current_superblock_generation(&self) -> u64 {
@@ -983,6 +1142,17 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         &mut self,
         requests: &[TransactionRequest],
     ) -> Result<Vec<Result<TransactionResult>>> {
+        if self.planned_execution {
+            self.apply_planned_transaction_group(requests)
+        } else {
+            self.apply_serial_transaction_group(requests)
+        }
+    }
+
+    fn apply_serial_transaction_group(
+        &mut self,
+        requests: &[TransactionRequest],
+    ) -> Result<Vec<Result<TransactionResult>>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -993,6 +1163,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         }
         let started = Instant::now();
         let mut working = self.state.clone();
+        self.batch_metrics.full_state_clones =
+            self.batch_metrics.full_state_clones.saturating_add(1);
         // A free page is reusable only when no reader can still reference the
         // generation that contains its previous contents. Otherwise the
         // allocator conservatively grows the file and leaves the ID retired.
@@ -1011,6 +1183,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         for request in requests {
             let validation_started = Instant::now();
             let candidate_state = working.clone();
+            self.batch_metrics.full_state_clones =
+                self.batch_metrics.full_state_clones.saturating_add(1);
             if let Err(error) = request.validate() {
                 if matches!(error, Error::InvalidInput(_) | Error::InvalidRequest(_)) {
                     results.push(Err(error));
@@ -1086,7 +1260,11 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             };
             let result = TransactionResult { commit_lsn };
             candidates.push(Candidate {
-                state: candidate.clone(),
+                state: {
+                    self.batch_metrics.full_state_clones =
+                        self.batch_metrics.full_state_clones.saturating_add(1);
+                    candidate.clone()
+                },
                 dirty,
                 result,
                 superblock: working_sb.clone(),
@@ -1204,6 +1382,325 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .storage_metrics
             .publication_nanos
             .saturating_add(elapsed_nanos(started));
+        Ok(results)
+    }
+
+    fn apply_planned_transaction_group(
+        &mut self,
+        requests: &[TransactionRequest],
+    ) -> Result<Vec<Result<TransactionResult>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.broken.is_some() {
+            return Err(Error::durability(
+                "experimental storage shard is degraded after an uncertain write",
+            ));
+        }
+
+        self.batch_metrics.logical_groups = self.batch_metrics.logical_groups.saturating_add(1);
+        self.batch_metrics.logical_transactions = self
+            .batch_metrics
+            .logical_transactions
+            .saturating_add(requests.len() as u64);
+        let admission_started = Instant::now();
+        let committed_state = &self.state;
+        let mut overlay = LogicalOverlay::new(committed_state);
+        let provisional_start = self.next_revision.get();
+        let mut admitted = Vec::new();
+        let mut results = Vec::with_capacity(requests.len());
+        let mut accepted_count = 0u64;
+        for (fifo_position, request) in requests.iter().enumerate() {
+            if let Err(error) = request.validate() {
+                if matches!(error, Error::InvalidInput(_) | Error::InvalidRequest(_)) {
+                    self.batch_metrics.rejected_transactions =
+                        self.batch_metrics.rejected_transactions.saturating_add(1);
+                    results.push(Err(error));
+                    continue;
+                }
+                return Err(error);
+            }
+            if let Err(error) = validate_request_values(request, &self.config.limits) {
+                self.batch_metrics.rejected_transactions =
+                    self.batch_metrics.rejected_transactions.saturating_add(1);
+                results.push(Err(error));
+                continue;
+            }
+            if let Err(error) = overlay.validate_conditions(&request.conditions) {
+                if matches!(error, Error::Conflict(_)) {
+                    self.batch_metrics.conflicted_transactions =
+                        self.batch_metrics.conflicted_transactions.saturating_add(1);
+                    results.push(Err(error));
+                    continue;
+                }
+                return Err(error);
+            }
+            let ordinal = provisional_start
+                .checked_add(accepted_count)
+                .ok_or_else(|| Error::invariant("experimental revision exhausted"))?;
+            let provisional_revision = ProvisionalRevisionToken {
+                transaction_position: fifo_position,
+                ordinal,
+            };
+            overlay.accept(request, provisional_revision);
+            admitted.push(AdmittedTransaction {
+                fifo_position,
+                request: request.clone(),
+                provisional_revision,
+            });
+            accepted_count = accepted_count.saturating_add(1);
+            results.push(Ok(TransactionResult {
+                commit_lsn: Lsn::ZERO,
+            }));
+            self.batch_metrics.admitted_transactions =
+                self.batch_metrics.admitted_transactions.saturating_add(1);
+        }
+        let admission_nanos = elapsed_nanos(admission_started);
+        self.batch_metrics.logical_admission_nanos = self
+            .batch_metrics
+            .logical_admission_nanos
+            .saturating_add(admission_nanos);
+        self.storage_metrics.validation_nanos = self
+            .storage_metrics
+            .validation_nanos
+            .saturating_add(admission_nanos);
+        drop(overlay);
+        if admitted.is_empty() {
+            return Ok(results);
+        }
+
+        let planning_started = Instant::now();
+        let plan = plan_batch(&self.state, &admitted, &mut self.batch_metrics)?;
+        self.batch_metrics.planning_nanos = self
+            .batch_metrics
+            .planning_nanos
+            .saturating_add(elapsed_nanos(planning_started));
+
+        let mut working = self.state.clone();
+        self.batch_metrics.full_state_clones =
+            self.batch_metrics.full_state_clones.saturating_add(1);
+        working.allow_page_reuse = self.publisher.can_reuse_pages();
+        let mut working_superblock = self.current_superblock.clone();
+        let mut working_slot = self.active_slot;
+        let mut next_lsn = self.wal.as_ref().map_or(self.next_lsn, WalLog::next_lsn);
+        let mut next_batch_id = self
+            .wal
+            .as_ref()
+            .map_or(self.next_batch_id, WalLog::next_batch_id);
+        let mut execution_state = PhysicalExecutionState { cached_leaf: None };
+        let physical_started = Instant::now();
+        let mut executed = Vec::with_capacity(plan.transactions.len());
+        for transaction_plan in &plan.transactions {
+            let mut dirty = BTreeSet::new();
+            for planned_mutation in &transaction_plan.mutations {
+                apply_planned_mutation(
+                    &mut working,
+                    &mut dirty,
+                    &mut self.split_metrics,
+                    &mut self.batch_metrics,
+                    &mut execution_state,
+                    planned_mutation,
+                    Revision::new(transaction_plan.provisional_revision.ordinal),
+                )?;
+            }
+            let commit_lsn = Lsn::new(
+                next_lsn
+                    .get()
+                    .checked_add(
+                        u64::try_from(dirty.len() + 1)
+                            .map_err(|_| Error::invariant("Blink page count overflows LSN"))?,
+                    )
+                    .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
+            );
+            for page_id in &dirty {
+                working
+                    .pages
+                    .get_mut(page_id)
+                    .ok_or_else(|| Error::invariant("dirty experimental page disappeared"))?
+                    .restamp(
+                        Revision::new(transaction_plan.provisional_revision.ordinal),
+                        commit_lsn,
+                        &transaction_plan.mutated_key_set,
+                    );
+            }
+            if let Some(cached_leaf) = execution_state.cached_leaf.as_mut()
+                && dirty.contains(&cached_leaf.leaf_id)
+            {
+                cached_leaf.page = working
+                    .pages
+                    .get(&cached_leaf.leaf_id)
+                    .cloned()
+                    .ok_or_else(|| Error::invariant("cached planned leaf disappeared"))?;
+            }
+            working_superblock = BlinkSuperblock {
+                generation: working_superblock
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("experimental generation exhausted"))?,
+                root_page_id: working.root_page_id,
+                free_list_head: working.free_list_head,
+                high_water_page_id: working.high_water_page_id,
+                ..working_superblock
+            };
+            working_slot = match working_slot {
+                SuperblockSlot::A => SuperblockSlot::B,
+                SuperblockSlot::B => SuperblockSlot::A,
+            };
+            let mut images = Vec::with_capacity(dirty.len() + 1);
+            for page_id in &dirty {
+                let page = working
+                    .pages
+                    .get(page_id)
+                    .ok_or_else(|| Error::invariant("planned page is missing"))?;
+                if matches!(page, BlinkPage::Leaf { .. }) {
+                    self.batch_metrics.leaf_encodes =
+                        self.batch_metrics.leaf_encodes.saturating_add(1);
+                }
+                images.push(WalPageImage {
+                    page_id: *page_id,
+                    image: encode_blink_page(*page_id, page)?,
+                });
+            }
+            images.push(WalPageImage {
+                page_id: match working_slot {
+                    SuperblockSlot::A => PageId::ZERO,
+                    SuperblockSlot::B => PageId::new(1),
+                },
+                image: encode_blink_superblock(&working_superblock)?,
+            });
+            let next_lsn_after = Lsn::new(
+                commit_lsn
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
+            );
+            let next_revision = Revision::from(next_lsn_after);
+            executed.push(ExecutedPlanTransaction {
+                batch_id: next_batch_id,
+                result: TransactionResult { commit_lsn },
+                dirty,
+                images,
+                superblock: working_superblock.clone(),
+                slot: working_slot,
+                next_revision,
+                next_lsn: next_lsn_after,
+                next_batch_id: next_batch_id
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("experimental batch id exhausted"))?,
+            });
+            next_lsn = next_lsn_after;
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("experimental batch id exhausted"))?;
+        }
+        self.batch_metrics.physical_execution_nanos = self
+            .batch_metrics
+            .physical_execution_nanos
+            .saturating_add(elapsed_nanos(physical_started));
+
+        let final_execution = executed
+            .last()
+            .ok_or_else(|| Error::invariant("planned execution produced no transaction"))?;
+        let all_dirty = executed
+            .iter()
+            .flat_map(|transaction| transaction.dirty.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let catalog_started = Instant::now();
+        let published_generation =
+            self.publisher
+                .prepare(&working, &final_execution.superblock, &all_dirty)?;
+        self.batch_metrics.catalog_construction_nanos = self
+            .batch_metrics
+            .catalog_construction_nanos
+            .saturating_add(elapsed_nanos(catalog_started));
+
+        let mut wal_commits = Vec::with_capacity(executed.len());
+        let mut final_images = BTreeMap::new();
+        let mut wal_bytes = 0u64;
+        for transaction in &executed {
+            if self.wal.is_some() {
+                wal_commits.push(WalCommit {
+                    batch_id: transaction.batch_id,
+                    commit_lsn: transaction.result.commit_lsn,
+                    pages: transaction.images.clone(),
+                });
+            }
+            for image in &transaction.images {
+                final_images.insert(image.page_id, image.image);
+            }
+        }
+        if let Some(wal) = self.wal.as_mut() {
+            let reports = match wal.append_group(&wal_commits, self.fault_injector.as_deref_mut()) {
+                Ok(reports) => reports,
+                Err(error) => {
+                    self.broken = Some(error.to_string());
+                    return Err(error);
+                }
+            };
+            wal_bytes = reports
+                .iter()
+                .map(|report| report.bytes_written as u64)
+                .sum();
+        } else {
+            for (page_id, image) in &final_images {
+                write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, image)?;
+            }
+            self.file.sync_data()?;
+        }
+
+        self.state = working;
+        self.current_superblock = final_execution.superblock.clone();
+        self.active_slot = final_execution.slot;
+        self.next_revision = final_execution.next_revision;
+        self.next_lsn = final_execution.next_lsn;
+        self.next_batch_id = final_execution.next_batch_id;
+        let publication_started = Instant::now();
+        self.publisher.publish(published_generation);
+        self.batch_metrics.generation_publication_nanos = self
+            .batch_metrics
+            .generation_publication_nanos
+            .saturating_add(elapsed_nanos(publication_started));
+        self.dirty_pages.extend(
+            final_images
+                .iter()
+                .filter(|(page_id, _)| **page_id != PageId::ZERO && **page_id != PageId::new(1))
+                .map(|(page_id, image)| (*page_id, *image)),
+        );
+        self.dirty_superblock = Some(
+            final_images
+                .get(&match final_execution.slot {
+                    SuperblockSlot::A => PageId::ZERO,
+                    SuperblockSlot::B => PageId::new(1),
+                })
+                .copied()
+                .ok_or_else(|| Error::invariant("planned superblock image is missing"))?,
+        );
+        self.split_metrics.pages_touched = self
+            .split_metrics
+            .pages_touched
+            .saturating_add(final_images.len() as u64);
+        self.split_metrics.page_images = self
+            .split_metrics
+            .page_images
+            .saturating_add(final_images.len() as u64);
+        self.batch_metrics.page_images = self.batch_metrics.page_images.saturating_add(
+            executed
+                .iter()
+                .map(|transaction| transaction.images.len() as u64)
+                .sum(),
+        );
+        self.batch_metrics.wal_bytes = self.batch_metrics.wal_bytes.saturating_add(wal_bytes);
+        self.storage_metrics.btree_preparation_nanos = self
+            .storage_metrics
+            .btree_preparation_nanos
+            .saturating_add(elapsed_nanos(admission_started));
+        for (planned, transaction) in plan.transactions.iter().zip(&executed) {
+            results[planned.fifo_position] = Ok(transaction.result);
+        }
+        self.storage_metrics.publication_nanos = self
+            .storage_metrics
+            .publication_nanos
+            .saturating_add(elapsed_nanos(physical_started));
         Ok(results)
     }
 
@@ -1346,6 +1843,74 @@ impl ReadPageSource for GenerationPin {
     }
 }
 
+impl<'a> LogicalOverlay<'a> {
+    fn new(committed: &'a BlinkState) -> Self {
+        Self {
+            committed,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn observed_state(&self, key: &DocumentKey) -> Result<ObservedState> {
+        let encoded = key.encode();
+        validate_encoded_key(&encoded)?;
+        if let Some(entry) = self.entries.get(&encoded) {
+            let LogicalRevision::Provisional(token) = entry.revision;
+            debug_assert_eq!(
+                entry.originating_transaction_position,
+                token.transaction_position
+            );
+            let _ = entry.value.as_ref();
+            let revision = Revision::new(token.ordinal);
+            return Ok(if entry.present {
+                ObservedState::present(revision)
+            } else {
+                ObservedState::missing(revision)
+            });
+        }
+        observed_state(self.committed, key)
+    }
+
+    fn validate_conditions(&self, conditions: &[TransactionCondition]) -> Result<()> {
+        for condition in conditions {
+            let actual = self.observed_state(condition.key())?;
+            let matches = match condition {
+                TransactionCondition::RevisionEquals {
+                    expected_revision, ..
+                } => actual.revision() == *expected_revision,
+                TransactionCondition::Exists { .. } => !actual.is_missing(),
+                TransactionCondition::NotExists { .. } => actual.is_missing(),
+            };
+            if !matches {
+                return Err(Error::conflict(TransactionConflict {
+                    key: condition.key().clone(),
+                    expected: condition.expectation(),
+                    actual,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn accept(&mut self, request: &TransactionRequest, token: ProvisionalRevisionToken) {
+        for mutation in &request.mutations {
+            let (present, value) = match mutation {
+                TransactionMutation::Put { value, .. } => (true, Some(value.clone())),
+                TransactionMutation::Delete { .. } => (false, None),
+            };
+            self.entries.insert(
+                mutation.key().encode(),
+                LogicalEntry {
+                    present,
+                    value,
+                    revision: LogicalRevision::Provisional(token),
+                    originating_transaction_position: token.transaction_position,
+                },
+            );
+        }
+    }
+}
+
 fn validate_conditions<S: ReadPageSource>(
     state: &S,
     conditions: &[TransactionCondition],
@@ -1368,6 +1933,412 @@ fn validate_conditions<S: ReadPageSource>(
         }
     }
     Ok(())
+}
+
+fn plan_batch(
+    state: &BlinkState,
+    admitted: &[AdmittedTransaction],
+    metrics: &mut BlinkBatchMetrics,
+) -> Result<BatchPlan> {
+    let mut plan = BatchPlan::default();
+    let mut last_key_writer = BTreeMap::<Vec<u8>, usize>::new();
+    let mut last_leaf_writer = BTreeMap::<PageId, usize>::new();
+    let mut leaf_group_indices = BTreeMap::<PageId, usize>::new();
+    let mut transaction_groups = BTreeMap::<usize, BTreeSet<usize>>::new();
+
+    for transaction in admitted {
+        let mut dependency_metadata = DependencyMetadata::default();
+        let mut mutations = Vec::with_capacity(transaction.request.mutations.len());
+        for condition in &transaction.request.conditions {
+            let encoded = condition.key().encode();
+            validate_encoded_key(&encoded)?;
+            if let Some(predecessor) = last_key_writer.get(&encoded).copied() {
+                dependency_metadata
+                    .condition_key_predecessors
+                    .push(predecessor);
+                plan.dependencies.push(DependencyEdge {
+                    predecessor,
+                    successor: transaction.fifo_position,
+                    kind: DependencyKind::ConditionKey,
+                });
+            }
+        }
+        for (mutation_index, mutation) in transaction.request.mutations.iter().enumerate() {
+            let encoded_key = mutation.key().encode();
+            validate_encoded_key(&encoded_key)?;
+            let mut route_corrections = 0;
+            let leaf_id = find_leaf_with_metrics(state, &encoded_key, &mut route_corrections)?;
+            let route_hint = RouteHint {
+                encoded_key: encoded_key.clone(),
+                leaf_id,
+            };
+            mutations.push(PlannedMutation {
+                mutation: mutation.clone(),
+                encoded_key: encoded_key.clone(),
+                route_hint,
+            });
+            metrics.routes_calculated = metrics.routes_calculated.saturating_add(1);
+            if let Some(predecessor) = last_key_writer.get(&encoded_key).copied() {
+                dependency_metadata.same_key_predecessors.push(predecessor);
+                plan.dependencies.push(DependencyEdge {
+                    predecessor,
+                    successor: transaction.fifo_position,
+                    kind: DependencyKind::SameKey,
+                });
+            }
+            if let Some(predecessor) = last_leaf_writer.get(&leaf_id).copied() {
+                dependency_metadata
+                    .same_target_page_predecessors
+                    .push(predecessor);
+                dependency_metadata
+                    .structural_route_predecessors
+                    .push(predecessor);
+                plan.dependencies.push(DependencyEdge {
+                    predecessor,
+                    successor: transaction.fifo_position,
+                    kind: DependencyKind::SameTargetPage,
+                });
+                plan.dependencies.push(DependencyEdge {
+                    predecessor,
+                    successor: transaction.fifo_position,
+                    kind: DependencyKind::StructuralRoute,
+                });
+            }
+            last_key_writer.insert(encoded_key, transaction.fifo_position);
+            last_leaf_writer.insert(leaf_id, transaction.fifo_position);
+            let leaf_group_index = *leaf_group_indices.entry(leaf_id).or_insert_with(|| {
+                let index = plan.leaf_groups.len();
+                plan.leaf_groups.push(LeafGroupPlan {
+                    leaf_hint: leaf_id,
+                    mutations: Vec::new(),
+                });
+                index
+            });
+            plan.leaf_groups[leaf_group_index]
+                .mutations
+                .push((transaction.fifo_position, mutation_index));
+            transaction_groups
+                .entry(transaction.fifo_position)
+                .or_default()
+                .insert(leaf_group_index);
+        }
+        let same_transaction_positions = if mutations.len() > 1 {
+            vec![transaction.fifo_position; mutations.len()]
+        } else {
+            Vec::new()
+        };
+        let encoded_keys = mutations
+            .iter()
+            .map(|mutation| mutation.encoded_key.clone())
+            .collect::<Vec<_>>();
+        let mutated_key_set = encoded_keys.iter().cloned().collect::<BTreeSet<_>>();
+        plan.transactions.push(PhysicalTransactionPlan {
+            fifo_position: transaction.fifo_position,
+            provisional_revision: transaction.provisional_revision,
+            mutations,
+            encoded_keys,
+            mutated_key_set,
+            dependency_metadata: DependencyMetadata {
+                same_transaction_positions,
+                ..dependency_metadata
+            },
+        });
+    }
+
+    metrics.mutations_planned = metrics.mutations_planned.saturating_add(
+        plan.transactions
+            .iter()
+            .map(|transaction| transaction.mutations.len() as u64)
+            .sum(),
+    );
+    metrics.leaf_groups = metrics
+        .leaf_groups
+        .saturating_add(plan.leaf_groups.len() as u64);
+    metrics.same_leaf_groups = metrics.same_leaf_groups.saturating_add(
+        plan.leaf_groups
+            .iter()
+            .filter(|group| group.mutations.len() > 1)
+            .count() as u64,
+    );
+    metrics.mutations_per_leaf_group = metrics.mutations_per_leaf_group.saturating_add(
+        plan.leaf_groups
+            .iter()
+            .map(|group| group.mutations.len() as u64)
+            .sum::<u64>(),
+    );
+    metrics.route_reuses = metrics.route_reuses.saturating_add(
+        plan.leaf_groups
+            .iter()
+            .map(|group| group.mutations.len().saturating_sub(1) as u64)
+            .sum::<u64>(),
+    );
+    metrics.dependency_edges = metrics
+        .dependency_edges
+        .saturating_add(plan.dependencies.len() as u64);
+    let mut dependent_group_indices = BTreeSet::new();
+    for groups in transaction_groups.values() {
+        if groups.len() > 1 {
+            dependent_group_indices.extend(groups.iter().copied());
+        }
+    }
+    for dependency in &plan.dependencies {
+        let Some(predecessor_groups) = transaction_groups.get(&dependency.predecessor) else {
+            continue;
+        };
+        let Some(successor_groups) = transaction_groups.get(&dependency.successor) else {
+            continue;
+        };
+        for predecessor_group in predecessor_groups {
+            for successor_group in successor_groups {
+                if predecessor_group != successor_group {
+                    dependent_group_indices.insert(*predecessor_group);
+                    dependent_group_indices.insert(*successor_group);
+                }
+            }
+        }
+    }
+    let dependent_groups = dependent_group_indices.len() as u64;
+    metrics.independent_leaf_groups = metrics
+        .independent_leaf_groups
+        .saturating_add((plan.leaf_groups.len() as u64).saturating_sub(dependent_groups));
+    Ok(plan)
+}
+
+fn apply_planned_mutation(
+    state: &mut BlinkState,
+    dirty: &mut BTreeSet<PageId>,
+    split_metrics: &mut BlinkSplitMetrics,
+    batch_metrics: &mut BlinkBatchMetrics,
+    execution_state: &mut PhysicalExecutionState,
+    planned_mutation: &PlannedMutation,
+    revision: Revision,
+) -> Result<()> {
+    let cached_matches = execution_state
+        .cached_leaf
+        .as_ref()
+        .is_some_and(|cached| cached_leaf_contains(cached, &planned_mutation.encoded_key));
+    if cached_matches {
+        batch_metrics.coalesced_mutations = batch_metrics.coalesced_mutations.saturating_add(1);
+        let mut cached = execution_state.cached_leaf.take().unwrap();
+        let split = apply_cached_leaf_mutation(
+            state,
+            dirty,
+            split_metrics,
+            batch_metrics,
+            &mut cached,
+            planned_mutation,
+            revision,
+        )?;
+        if split {
+            batch_metrics.route_invalidations = batch_metrics.route_invalidations.saturating_add(1);
+            batch_metrics.split_triggered_reroutes =
+                batch_metrics.split_triggered_reroutes.saturating_add(1);
+        } else {
+            execution_state.cached_leaf = Some(cached);
+        }
+        return Ok(());
+    }
+
+    let mut route_corrections = 0;
+    let leaf_id = find_leaf_from_hint(
+        state,
+        &planned_mutation.encoded_key,
+        planned_mutation.route_hint.leaf_id,
+        &mut route_corrections,
+    )?;
+    if leaf_id != planned_mutation.route_hint.leaf_id {
+        batch_metrics.reroutes = batch_metrics.reroutes.saturating_add(1);
+        batch_metrics.split_triggered_reroutes =
+            batch_metrics.split_triggered_reroutes.saturating_add(1);
+    }
+    let page = state
+        .pages
+        .get(&leaf_id)
+        .cloned()
+        .ok_or_else(|| Error::corruption("planned Blink leaf is missing"))?;
+    if !matches!(page, BlinkPage::Leaf { .. }) {
+        return Err(Error::corruption("planned Blink route ended at non-leaf"));
+    }
+    batch_metrics.leaf_loads = batch_metrics.leaf_loads.saturating_add(1);
+    let mut cached = CachedLeaf { leaf_id, page };
+    let split = apply_cached_leaf_mutation(
+        state,
+        dirty,
+        split_metrics,
+        batch_metrics,
+        &mut cached,
+        planned_mutation,
+        revision,
+    )?;
+    if split {
+        batch_metrics.route_invalidations = batch_metrics.route_invalidations.saturating_add(1);
+        batch_metrics.split_triggered_reroutes =
+            batch_metrics.split_triggered_reroutes.saturating_add(1);
+    } else {
+        execution_state.cached_leaf = Some(cached);
+    }
+    Ok(())
+}
+
+fn cached_leaf_contains(cached: &CachedLeaf, encoded_key: &[u8]) -> bool {
+    let BlinkPage::Leaf {
+        high_key, entries, ..
+    } = &cached.page
+    else {
+        return false;
+    };
+    if high_key
+        .as_ref()
+        .is_some_and(|high_key| encoded_key >= high_key.as_slice())
+    {
+        return false;
+    }
+    entries
+        .first()
+        .is_none_or(|entry| encoded_key >= entry.key.as_slice())
+}
+
+fn apply_cached_leaf_mutation(
+    state: &mut BlinkState,
+    dirty: &mut BTreeSet<PageId>,
+    split_metrics: &mut BlinkSplitMetrics,
+    batch_metrics: &mut BlinkBatchMetrics,
+    cached: &mut CachedLeaf,
+    planned_mutation: &PlannedMutation,
+    revision: Revision,
+) -> Result<bool> {
+    let value = match &planned_mutation.mutation {
+        TransactionMutation::Put { value, .. } => Some(value.as_slice()),
+        TransactionMutation::Delete { .. } => None,
+    };
+    let encoded = &planned_mutation.encoded_key;
+    let BlinkPage::Leaf {
+        high_key,
+        right_sibling,
+        entries,
+        ..
+    } = &cached.page
+    else {
+        return Err(Error::corruption("cached Blink page is not a leaf"));
+    };
+    let mut next_entries = entries.clone();
+    let value_ref = match value {
+        Some(bytes) => Some(allocate_value(state, dirty, bytes)?),
+        None => None,
+    };
+    match next_entries.binary_search_by(|entry| entry.key.cmp(encoded)) {
+        Ok(entry_index) => {
+            let old = next_entries[entry_index].value.clone();
+            next_entries[entry_index] = LeafEntry {
+                key: encoded.clone(),
+                revision,
+                value: value_ref,
+            };
+            if !leaf_fits(&next_entries, high_key.as_deref(), *right_sibling) {
+                return Err(Error::invalid_input(
+                    "document key and value cannot fit in a Blink leaf",
+                ));
+            }
+            free_value(state, dirty, old)?;
+        }
+        Err(entry_index) => {
+            next_entries.insert(
+                entry_index,
+                LeafEntry {
+                    key: encoded.clone(),
+                    revision,
+                    value: value_ref,
+                },
+            );
+            if !leaf_fits(&next_entries, high_key.as_deref(), *right_sibling) {
+                let mut path = Vec::new();
+                let routed_leaf = find_leaf_with_path(state, encoded, &mut path, split_metrics)?;
+                if routed_leaf != cached.leaf_id {
+                    batch_metrics.reroutes = batch_metrics.reroutes.saturating_add(1);
+                    batch_metrics.split_triggered_reroutes =
+                        batch_metrics.split_triggered_reroutes.saturating_add(1);
+                    return Err(Error::invariant(
+                        "planned leaf cache became stale before split",
+                    ));
+                }
+                batch_metrics.structural_fallbacks =
+                    batch_metrics.structural_fallbacks.saturating_add(1);
+                batch_metrics.coalescing_interruptions =
+                    batch_metrics.coalescing_interruptions.saturating_add(1);
+                split_leaf(
+                    state,
+                    dirty,
+                    split_metrics,
+                    cached.leaf_id,
+                    path,
+                    high_key.clone(),
+                    *right_sibling,
+                    next_entries,
+                    revision,
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+    let next_page = BlinkPage::Leaf {
+        lsn: Lsn::new(revision.get()),
+        high_key: high_key.clone(),
+        right_sibling: *right_sibling,
+        entries: next_entries,
+    };
+    state.pages.insert(cached.leaf_id, next_page.clone());
+    cached.page = next_page;
+    dirty.insert(cached.leaf_id);
+    Ok(false)
+}
+
+fn find_leaf_from_hint(
+    state: &BlinkState,
+    key: &[u8],
+    hint: PageId,
+    right_link_corrections: &mut u64,
+) -> Result<PageId> {
+    let Some(BlinkPage::Leaf { .. }) = state.pages.get(&hint) else {
+        return find_leaf_with_metrics(state, key, right_link_corrections);
+    };
+    let mut page_id = hint;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(page_id) {
+            return Err(Error::corruption("planned Blink route contains a cycle"));
+        }
+        let page = state
+            .pages
+            .get(&page_id)
+            .ok_or_else(|| Error::corruption("planned Blink route page is missing"))?;
+        let BlinkPage::Leaf {
+            high_key,
+            right_sibling,
+            entries,
+            ..
+        } = page
+        else {
+            return find_leaf_with_metrics(state, key, right_link_corrections);
+        };
+        if entries
+            .first()
+            .is_some_and(|entry| key < entry.key.as_slice())
+        {
+            return find_leaf_with_metrics(state, key, right_link_corrections);
+        }
+        if high_key
+            .as_ref()
+            .is_some_and(|high_key| key >= high_key.as_slice())
+        {
+            let Some(next) = *right_sibling else {
+                return find_leaf_with_metrics(state, key, right_link_corrections);
+            };
+            *right_link_corrections = right_link_corrections.saturating_add(1);
+            page_id = next;
+            continue;
+        }
+        return Ok(page_id);
+    }
 }
 
 fn observed_state<S: ReadPageSource>(state: &S, key: &DocumentKey) -> Result<ObservedState> {
@@ -3224,6 +4195,78 @@ mod tests {
         }
     }
 
+    fn planned_store() -> BlinkStore<MemoryFile, MemoryFile> {
+        let mut store = BlinkStore::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        store.enable_planned_execution();
+        store
+    }
+
+    fn wide_key(index: u64) -> DocumentKey {
+        let mut primary = vec![0x51; 280];
+        primary.extend_from_slice(&index.to_be_bytes());
+        DocumentKey::new(primary, vec![0x61; 280])
+    }
+
+    struct FailOnOccurrence {
+        point: &'static str,
+        remaining: usize,
+    }
+
+    impl FaultInjector for FailOnOccurrence {
+        fn hit(&mut self, point: &str) -> Result<()> {
+            if point == self.point {
+                self.remaining = self.remaining.saturating_sub(1);
+                if self.remaining == 0 {
+                    return Err(Error::recovery(format!("injected failure at {point}")));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn reference_apply(
+        states: &mut BTreeMap<DocumentKey, RevisionState>,
+        request: &TransactionRequest,
+        commit_lsn: Lsn,
+    ) -> bool {
+        if request.validate().is_err() {
+            return false;
+        }
+        for condition in &request.conditions {
+            let observed = states
+                .get(condition.key())
+                .cloned()
+                .unwrap_or_else(|| RevisionState::missing(Revision::ZERO));
+            let matches = match condition {
+                TransactionCondition::RevisionEquals {
+                    expected_revision, ..
+                } => observed.revision() == *expected_revision,
+                TransactionCondition::Exists { .. } => !observed.is_missing(),
+                TransactionCondition::NotExists { .. } => observed.is_missing(),
+            };
+            if !matches {
+                return false;
+            }
+        }
+        for mutation in &request.mutations {
+            let state = match mutation {
+                TransactionMutation::Put { value, .. } => {
+                    RevisionState::present(value.clone(), Revision::from(commit_lsn))
+                }
+                TransactionMutation::Delete { .. } => {
+                    RevisionState::missing(Revision::from(commit_lsn))
+                }
+            };
+            states.insert(mutation.key().clone(), state);
+        }
+        true
+    }
+
     #[test]
     fn experimental_superblock_is_not_baseline_format() {
         let config = DatabaseConfig::default();
@@ -3389,6 +4432,364 @@ mod tests {
         assert!(failed[0].is_err());
         assert!(failed[1].is_ok());
         assert_eq!(store.get(&d).unwrap().value(), Some(&b"D2"[..]));
+    }
+
+    #[test]
+    fn planned_admission_stages_dependencies_and_skips_failed_deltas() {
+        let mut store = planned_store();
+        let k1 = DocumentKey::new(b"planned".to_vec(), b"k1".to_vec());
+        let k2 = DocumentKey::new(b"planned".to_vec(), b"k2".to_vec());
+        let k3 = DocumentKey::new(b"planned".to_vec(), b"k3".to_vec());
+        let results = store
+            .apply_transaction_group(&[
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: k1.clone(),
+                        value: b"one".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    vec![TransactionCondition::Exists { key: k1.clone() }],
+                    vec![TransactionMutation::Put {
+                        key: k2.clone(),
+                        value: b"two".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    vec![TransactionCondition::Exists { key: k2.clone() }],
+                    vec![TransactionMutation::Put {
+                        key: k3.clone(),
+                        value: b"three".to_vec(),
+                    }],
+                ),
+            ])
+            .unwrap();
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(store.get(&k1).unwrap().value(), Some(&b"one"[..]));
+        assert_eq!(store.get(&k2).unwrap().value(), Some(&b"two"[..]));
+        assert_eq!(store.get(&k3).unwrap().value(), Some(&b"three"[..]));
+
+        let failed_key = DocumentKey::new(b"planned".to_vec(), b"failed".to_vec());
+        let after_failed_key = DocumentKey::new(b"planned".to_vec(), b"after".to_vec());
+        let failed_results = store
+            .apply_transaction_group(&[
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: failed_key.clone(),
+                        value: b"first".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    vec![TransactionCondition::NotExists {
+                        key: failed_key.clone(),
+                    }],
+                    vec![TransactionMutation::Put {
+                        key: after_failed_key.clone(),
+                        value: b"must-not-appear".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    vec![TransactionCondition::Exists {
+                        key: failed_key.clone(),
+                    }],
+                    vec![TransactionMutation::Put {
+                        key: after_failed_key.clone(),
+                        value: b"after".to_vec(),
+                    }],
+                ),
+            ])
+            .unwrap();
+        assert!(failed_results[0].is_ok());
+        assert!(matches!(failed_results[1], Err(Error::Conflict(_))));
+        assert!(failed_results[2].is_ok());
+        assert_eq!(
+            store.get(&after_failed_key).unwrap().value(),
+            Some(&b"after"[..])
+        );
+        let metrics = store.batch_metrics();
+        assert!(metrics.conflicted_transactions >= 1);
+        assert!(metrics.dependency_edges >= 2);
+        assert!(metrics.same_leaf_groups > 0);
+        assert_eq!(metrics.full_state_clones, 2);
+    }
+
+    #[test]
+    fn planned_same_leaf_chain_preserves_wal_boundaries_and_revisions() {
+        let mut store = planned_store();
+        let key = DocumentKey::new(b"chain".to_vec(), b"key".to_vec());
+        let other_key = DocumentKey::new(b"chain".to_vec(), b"other".to_vec());
+        let before = store.batch_metrics();
+        let results = store
+            .apply_transaction_group(&[
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: key.clone(),
+                        value: b"put".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Delete { key: key.clone() }],
+                ),
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: key.clone(),
+                        value: b"final".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: other_key.clone(),
+                        value: b"other".to_vec(),
+                    }],
+                ),
+            ])
+            .unwrap();
+        let first_lsn = results[0].as_ref().unwrap().commit_lsn;
+        let second_lsn = results[1].as_ref().unwrap().commit_lsn;
+        let third_lsn = results[2].as_ref().unwrap().commit_lsn;
+        assert!(first_lsn < second_lsn && second_lsn < third_lsn);
+        assert_eq!(
+            store.get(&key).unwrap(),
+            RevisionState::present(b"final", third_lsn.into())
+        );
+        assert_eq!(
+            store.get(&other_key).unwrap().revision(),
+            results[3].as_ref().unwrap().commit_lsn.into()
+        );
+        let metrics = store.batch_metrics();
+        assert_eq!(metrics.full_state_clones - before.full_state_clones, 1);
+        assert!(metrics.same_leaf_groups > before.same_leaf_groups);
+        assert!(metrics.coalesced_mutations > before.coalesced_mutations);
+        assert!(metrics.leaf_loads < metrics.mutations_planned);
+        let committed = store.wal.as_ref().unwrap().committed_batches();
+        assert_eq!(committed.len(), 4);
+        assert!(committed.iter().all(|batch| !batch.pages.is_empty()));
+        store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_independent_leaf_groups_are_exposed() {
+        let mut store = BlinkStore::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        for index in 0..120u64 {
+            store.put(wide_key(index), vec![index as u8; 8]).unwrap();
+        }
+        store.enable_planned_execution();
+        let first = wide_key(0);
+        let last = wide_key(10_000);
+        store
+            .apply_transaction_group(&[
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: first.clone(),
+                        value: b"first".to_vec(),
+                    }],
+                ),
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: last.clone(),
+                        value: b"last".to_vec(),
+                    }],
+                ),
+            ])
+            .unwrap();
+        let metrics = store.batch_metrics();
+        assert!(metrics.independent_leaf_groups >= 2);
+        assert!(metrics.dependency_edges < metrics.mutations_planned);
+        assert_eq!(store.get(&first).unwrap().value(), Some(&b"first"[..]));
+        assert_eq!(store.get(&last).unwrap().value(), Some(&b"last"[..]));
+        store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_stale_route_reroutes_after_a_split() {
+        let mut store = BlinkStore::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        for index in 0..6u64 {
+            store.put(wide_key(index), vec![index as u8; 8]).unwrap();
+        }
+        store.enable_planned_execution();
+        let split_key = wide_key(6);
+        let stale_route_key = wide_key(7);
+        let results = store
+            .apply_transaction_group(&[
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: split_key.clone(),
+                        value: vec![6; 8],
+                    }],
+                ),
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: stale_route_key.clone(),
+                        value: vec![7; 8],
+                    }],
+                ),
+            ])
+            .unwrap();
+        assert!(results.iter().all(Result::is_ok));
+        let metrics = store.batch_metrics();
+        assert!(metrics.structural_fallbacks > 0);
+        assert!(metrics.reroutes > 0 || metrics.split_triggered_reroutes > 0);
+        assert_eq!(
+            store.get(&stale_route_key).unwrap().value(),
+            Some(&vec![7; 8][..])
+        );
+        store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_structural_fallback_handles_internal_and_root_splits() {
+        let mut store = BlinkStore::open_with_wal(
+            MemoryFile::default(),
+            MemoryFile::default(),
+            DatabaseConfig::default(),
+        )
+        .unwrap();
+        for index in 0..500u64 {
+            store.put(wide_key(index), vec![index as u8; 8]).unwrap();
+        }
+        let before = store.split_metrics();
+        store.enable_planned_execution();
+        let requests = (500..5_000u64)
+            .map(|index| {
+                TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: wide_key(index),
+                        value: vec![index as u8; 8],
+                    }],
+                )
+            })
+            .collect::<Vec<_>>();
+        let results = store.apply_transaction_group(&requests).unwrap();
+        assert!(results.iter().all(Result::is_ok));
+        let after = store.split_metrics();
+        assert!(after.leaf_splits > before.leaf_splits);
+        assert!(after.internal_splits > before.internal_splits);
+        assert!(
+            after.root_splits > before.root_splits,
+            "before={before:?} after={after:?}"
+        );
+        assert!(store.batch_metrics().structural_fallbacks > 0);
+        store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_multi_leaf_transaction_has_one_commit_and_atomic_publication() {
+        let mut store = planned_store();
+        for index in 0..120u64 {
+            store.put(wide_key(index), vec![index as u8; 8]).unwrap();
+        }
+        let first = wide_key(0);
+        let last = wide_key(10_000);
+        let old_pin = store.publisher.pin();
+        let read_handle = store.versioned_read_handle();
+        let before_batches = store.wal.as_ref().unwrap().committed_batches().len();
+        let result = store
+            .transact(TransactionRequest::new(
+                Vec::new(),
+                vec![
+                    TransactionMutation::Put {
+                        key: first.clone(),
+                        value: b"multi-first".to_vec(),
+                    },
+                    TransactionMutation::Put {
+                        key: last.clone(),
+                        value: b"multi-last".to_vec(),
+                    },
+                ],
+            ))
+            .unwrap();
+        let mut corrections = 0;
+        assert_eq!(
+            read_state(&old_pin, &first, &mut corrections)
+                .unwrap()
+                .value(),
+            Some(&vec![0; 8][..])
+        );
+        assert_eq!(
+            read_state(&old_pin, &last, &mut corrections)
+                .unwrap()
+                .value(),
+            None
+        );
+        assert_eq!(
+            store.get(&first).unwrap(),
+            RevisionState::present(b"multi-first", result.commit_lsn.into())
+        );
+        assert_eq!(
+            store.get(&last).unwrap(),
+            RevisionState::present(b"multi-last", result.commit_lsn.into())
+        );
+        assert_eq!(
+            read_handle.get(&first).unwrap().value(),
+            Some(&b"multi-first"[..])
+        );
+        assert_eq!(
+            read_handle.get(&last).unwrap().value(),
+            Some(&b"multi-last"[..])
+        );
+        assert_eq!(
+            store.wal.as_ref().unwrap().committed_batches().len(),
+            before_batches + 1
+        );
+        store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_wal_tail_keeps_the_first_logical_commit_boundary() {
+        let mut store = planned_store();
+        store.set_fault_injector(FailOnOccurrence {
+            point: "before_commit_record",
+            remaining: 2,
+        });
+        let first = DocumentKey::new(b"wal-boundary".to_vec(), b"first".to_vec());
+        let second = DocumentKey::new(b"wal-boundary".to_vec(), b"second".to_vec());
+        assert!(
+            store
+                .apply_transaction_group(&[
+                    TransactionRequest::new(
+                        Vec::new(),
+                        vec![TransactionMutation::Put {
+                            key: first.clone(),
+                            value: b"first".to_vec(),
+                        }],
+                    ),
+                    TransactionRequest::new(
+                        Vec::new(),
+                        vec![TransactionMutation::Put {
+                            key: second.clone(),
+                            value: b"second".to_vec(),
+                        }],
+                    ),
+                ])
+                .is_err()
+        );
+        let (data, wal) = store.into_files();
+        let mut reopened =
+            BlinkStore::open_with_wal(data, wal.unwrap(), DatabaseConfig::default()).unwrap();
+        assert_eq!(reopened.get(&first).unwrap().value(), Some(&b"first"[..]));
+        assert!(reopened.get(&second).unwrap().is_missing());
+        reopened.check_invariants().unwrap();
     }
 
     #[test]
@@ -3867,6 +5268,143 @@ mod tests {
         baseline.flush().unwrap();
         let (baseline_file, baseline_wal) = baseline.into_files().unwrap();
         assert!(BlinkStore::open_with_wal(baseline_file, baseline_wal, config).is_err());
+    }
+
+    #[test]
+    fn planned_randomized_transaction_differential_reports_seed_and_operation() {
+        let seed = 0x3a03_2026_u64;
+        let mut state = seed;
+        let mut store = planned_store();
+        let mut reference = BTreeMap::<DocumentKey, RevisionState>::new();
+        for operation_index in 0..300usize {
+            state = splitmix_for_test(state);
+            let mut requests = Vec::new();
+            if operation_index % 7 == 0 {
+                let first_key =
+                    DocumentKey::new(b"staged".to_vec(), (state % 64).to_be_bytes().to_vec());
+                let second_key = DocumentKey::new(
+                    b"staged".to_vec(),
+                    ((state + 1) % 64).to_be_bytes().to_vec(),
+                );
+                requests.push(TransactionRequest::new(
+                    Vec::new(),
+                    vec![TransactionMutation::Put {
+                        key: first_key.clone(),
+                        value: vec![operation_index as u8],
+                    }],
+                ));
+                requests.push(TransactionRequest::new(
+                    vec![TransactionCondition::Exists { key: first_key }],
+                    vec![TransactionMutation::Put {
+                        key: second_key,
+                        value: vec![(operation_index + 1) as u8],
+                    }],
+                ));
+            } else {
+                let key_index = state % 64;
+                let key = if state & 8 == 0 {
+                    wide_key(key_index)
+                } else {
+                    DocumentKey::new(b"random".to_vec(), key_index.to_be_bytes().to_vec())
+                };
+                state = splitmix_for_test(state);
+                let condition = match state % 4 {
+                    0 => None,
+                    1 => Some(
+                        if reference.get(&key).is_some_and(|value| !value.is_missing()) {
+                            TransactionCondition::Exists { key: key.clone() }
+                        } else {
+                            TransactionCondition::NotExists { key: key.clone() }
+                        },
+                    ),
+                    2 => Some(TransactionCondition::RevisionEquals {
+                        key: key.clone(),
+                        expected_revision: reference
+                            .get(&key)
+                            .map(RevisionState::revision)
+                            .unwrap_or(Revision::ZERO),
+                    }),
+                    _ => Some(TransactionCondition::RevisionEquals {
+                        key: key.clone(),
+                        expected_revision: Revision::new(9_000_000 + operation_index as u64),
+                    }),
+                };
+                state = splitmix_for_test(state);
+                let mutation = if state & 1 == 0 {
+                    TransactionMutation::Put {
+                        key: key.clone(),
+                        value: vec![(operation_index & 0xff) as u8; 8],
+                    }
+                } else {
+                    TransactionMutation::Delete { key: key.clone() }
+                };
+                let mut mutations = vec![mutation];
+                if state & 2 == 0 {
+                    let second_key = DocumentKey::new(
+                        b"random".to_vec(),
+                        ((key_index + 1) % 64).to_be_bytes().to_vec(),
+                    );
+                    if second_key != key {
+                        mutations.push(TransactionMutation::Put {
+                            key: second_key,
+                            value: vec![operation_index as u8; 4],
+                        });
+                    }
+                }
+                requests.push(TransactionRequest::new(
+                    condition.into_iter().collect(),
+                    mutations,
+                ));
+            }
+
+            let actual_results = store
+                .apply_transaction_group(&requests)
+                .unwrap_or_else(|error| {
+                    panic!("seed={seed:#x} operation={operation_index} error={error}")
+                });
+            assert_eq!(actual_results.len(), requests.len());
+            for (request, actual_result) in requests.iter().zip(actual_results) {
+                let expected_accept = {
+                    let mut candidate = reference.clone();
+                    reference_apply(&mut candidate, request, Lsn::new(1))
+                };
+                match (expected_accept, actual_result) {
+                    (true, Ok(result)) => {
+                        assert!(reference_apply(&mut reference, request, result.commit_lsn));
+                    }
+                    (false, Err(_)) => {}
+                    (expected, actual) => panic!(
+                        "seed={seed:#x} operation={operation_index} expected_accept={expected} actual={actual:?}"
+                    ),
+                }
+            }
+            if operation_index % 25 == 0 {
+                for key_index in 0..64u64 {
+                    let key =
+                        DocumentKey::new(b"random".to_vec(), key_index.to_be_bytes().to_vec());
+                    assert_eq!(
+                        store.get(&key).unwrap(),
+                        reference
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| RevisionState::missing(Revision::ZERO)),
+                        "seed={seed:#x} operation={operation_index} key={key:?}"
+                    );
+                }
+            }
+        }
+        store.flush().unwrap();
+        let (data, wal) = store.into_files();
+        let mut reopened =
+            BlinkStore::open_with_wal(data, wal.unwrap(), DatabaseConfig::default()).unwrap();
+        for (key, expected) in &reference {
+            assert_eq!(
+                reopened.get(key).unwrap(),
+                *expected,
+                "seed={seed:#x} reopened key={key:?}"
+            );
+        }
+        reopened.check_invariants().unwrap();
     }
 
     #[test]

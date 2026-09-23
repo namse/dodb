@@ -1,7 +1,7 @@
 # B-link + Batched Storage Engine Experiment
 
-Status: Phase 2 implementation and benchmark complete. Phase 3 batching and
-coalescing work has not started.
+Status: Phase 3 implementation, correctness, and development smoke complete.
+Phase 4 parallel page execution has not started.
 
 Baseline branch: `main`
 
@@ -10,6 +10,14 @@ Baseline commit: `1ff96e1` (`storage: rely on crash-consistent storage snapshots
 Experiment branch: `experiment/b-link-batched-engine`
 
 Phase 2 result: [`phase2-results.md`](phase2-results.md)
+
+Phase 3 result: [`phase3-results.md`](phase3-results.md)
+
+Phase 3 Mac runs are development smoke/profiling only. They are not the
+production benchmark, adoption evidence, or a final performance conclusion.
+The production target is an OCI A1 instance with 2 OCPU, 12 GiB RAM, and a
+100 GB block volume; the same implementation commit will be measured there
+before any adoption decision.
 
 Performance status:
 
@@ -27,10 +35,10 @@ historical identity only. Phase 2 started from the requested branch HEAD,
 `23dc4b38b9249e2f7814c099866be100ef0a54a0`, and its implementation and test
 commits are recorded in `phase2-results.md`.
 
-This document is the source of truth for the later implementation and for the
-benchmark that decides whether the experimental engine should be adopted. It
-describes the repository as it exists at the baseline commit, not an assumed
-future API.
+This document is the source of truth for the implementation history and for
+the later benchmark that decides whether the experimental engine should be
+adopted. Its baseline sections describe the repository at the frozen starting
+commit; the linked phase result records describe completed changes.
 
 ## 1. Goal
 
@@ -235,7 +243,9 @@ pinned catalog.
 
 The detailed architecture, ordering proof, reclamation rule, tests, and
 results are in [`phase2-results.md`](phase2-results.md). The benchmark
-selector accepts `main-btree`, `serial-blink`, and `versioned-blink`.
+selector accepts `main-btree`, `serial-blink`, `versioned-blink`, and
+`planned-blink`. The Phase 3 selector keeps the versioned direct-read path and
+adds logical planning/coalescing with one serial physical writer.
 
 ### 3.6 Current durability path
 
@@ -884,11 +894,15 @@ source of truth.
 
 ### Phase 3 — logical batch planner, routing, and coalescing
 
-- Add the FIFO logical admission pass and staged dependency model.
-- Add route snapshots, key/leaf grouping, and same-leaf ordered coalescing.
-- Keep physical page execution serial initially so planner effects are
-  measurable separately from worker parallelism.
-- Preserve per-transaction WAL image/`COMMIT` boundaries and revisions.
+- Completed: add the FIFO logical admission pass and staged dependency model.
+- Completed: add route snapshots, key/leaf grouping, and same-leaf ordered
+  coalescing.
+- Completed: keep physical page execution serial so planner effects remain
+  separate from worker parallelism.
+- Completed: preserve per-transaction WAL image/`COMMIT` boundaries, revision
+  restamping, and one-generation publication.
+- Completed: record Phase 3 correctness and development smoke results in
+  [`phase3-results.md`](phase3-results.md).
 
 ### Phase 4 — parallel page-local mutation workers
 

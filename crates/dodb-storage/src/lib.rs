@@ -9,8 +9,9 @@ pub mod superblock;
 pub mod wal;
 
 pub use blink::{
-    BlinkCheckpointReport, BlinkReadHandle, BlinkSplitMetrics, BlinkStore,
-    BlinkVersionedReadMetrics,
+    BatchPlan, BlinkBatchMetrics, BlinkCheckpointReport, BlinkReadHandle, BlinkSplitMetrics,
+    BlinkStore, BlinkVersionedReadMetrics, DependencyEdge, DependencyKind, DependencyMetadata,
+    LeafGroupPlan, PhysicalTransactionPlan, PlannedMutation, ProvisionalRevisionToken, RouteHint,
 };
 pub use btree::{
     AsyncShard, BTreeStore, BatchRequest, BatchResponse, CheckpointReport, CoordinatorConfig,
