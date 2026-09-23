@@ -137,7 +137,9 @@ pub struct BlinkBatchMetrics {
     pub rejected_transactions: u64,
     pub logical_admission_nanos: u64,
     pub planning_nanos: u64,
+    pub state_clone_nanos: u64,
     pub physical_execution_nanos: u64,
+    pub dirty_union_nanos: u64,
     pub full_state_clones: u64,
     pub mutations_planned: u64,
     pub routes_calculated: u64,
@@ -158,7 +160,14 @@ pub struct BlinkBatchMetrics {
     pub page_images: u64,
     pub wal_bytes: u64,
     pub catalog_construction_nanos: u64,
+    pub catalog_map_clone_nanos: u64,
+    pub catalog_state_scan_nanos: u64,
+    pub wal_assembly_nanos: u64,
+    pub state_install_nanos: u64,
     pub generation_publication_nanos: u64,
+    pub publication_swap_nanos: u64,
+    pub retired_generation_drop_nanos: u64,
+    pub dirty_tracking_nanos: u64,
 }
 
 impl Default for BlinkSplitMetrics {
@@ -518,6 +527,18 @@ impl PublicationMetrics {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PublicationPrepareTiming {
+    catalog_map_clone_nanos: u64,
+    catalog_state_scan_nanos: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PublicationPublishTiming {
+    swap_nanos: u64,
+    retired_generation_drop_nanos: u64,
+}
+
 #[derive(Debug)]
 struct GenerationPublisher {
     current: RwLock<Arc<PublishedGeneration>>,
@@ -586,9 +607,12 @@ impl GenerationPublisher {
         state: &BlinkState,
         superblock: &BlinkSuperblock,
         dirty: &BTreeSet<PageId>,
-    ) -> Result<Arc<PublishedGeneration>> {
+    ) -> Result<(Arc<PublishedGeneration>, PublicationPrepareTiming)> {
         let base = self.pin();
+        let catalog_map_clone_started = Instant::now();
         let mut pages = base.generation.catalog.pages.clone();
+        let catalog_map_clone_nanos = elapsed_nanos(catalog_map_clone_started);
+        let catalog_state_scan_started = Instant::now();
         for (page_id, page) in &state.pages {
             if dirty.contains(page_id) || !pages.contains_key(page_id) {
                 pages.insert(
@@ -606,19 +630,37 @@ impl GenerationPublisher {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        Ok(Arc::new(PublishedGeneration {
-            epoch: superblock.generation,
-            root_page_id: state.root_page_id,
-            high_water_page_id: state.high_water_page_id,
-            catalog: Arc::new(PageCatalog { pages }),
-        }))
+        let timing = PublicationPrepareTiming {
+            catalog_map_clone_nanos,
+            catalog_state_scan_nanos: elapsed_nanos(catalog_state_scan_started),
+        };
+        Ok((
+            Arc::new(PublishedGeneration {
+                epoch: superblock.generation,
+                root_page_id: state.root_page_id,
+                high_water_page_id: state.high_water_page_id,
+                catalog: Arc::new(PageCatalog { pages }),
+            }),
+            timing,
+        ))
     }
 
-    fn publish(&self, generation: Arc<PublishedGeneration>) {
-        *self.current.write().expect("generation lock poisoned") = generation;
+    fn publish(&self, generation: Arc<PublishedGeneration>) -> PublicationPublishTiming {
+        let mut current = self.current.write().expect("generation lock poisoned");
+        let swap_started = Instant::now();
+        let retired_generation = std::mem::replace(&mut *current, generation);
+        let swap_nanos = elapsed_nanos(swap_started);
+        let retired_generation_drop_started = Instant::now();
+        drop(retired_generation);
+        let retired_generation_drop_nanos = elapsed_nanos(retired_generation_drop_started);
+        drop(current);
         self.metrics
             .published_generations
             .fetch_add(1, Ordering::Relaxed);
+        PublicationPublishTiming {
+            swap_nanos,
+            retired_generation_drop_nanos,
+        }
     }
 
     fn can_reuse_pages(&self) -> bool {
@@ -1303,7 +1345,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .iter()
             .flat_map(|candidate| candidate.dirty.iter().copied())
             .collect::<BTreeSet<_>>();
-        let published_generation = self.publisher.prepare(
+        let (published_generation, _) = self.publisher.prepare(
             &final_candidate.state,
             &final_candidate.superblock,
             &all_dirty,
@@ -1476,7 +1518,12 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .planning_nanos
             .saturating_add(elapsed_nanos(planning_started));
 
+        let state_clone_started = Instant::now();
         let mut working = self.state.clone();
+        self.batch_metrics.state_clone_nanos = self
+            .batch_metrics
+            .state_clone_nanos
+            .saturating_add(elapsed_nanos(state_clone_started));
         self.batch_metrics.full_state_clones =
             self.batch_metrics.full_state_clones.saturating_add(1);
         working.allow_page_reuse = self.publisher.can_reuse_pages();
@@ -1601,19 +1648,33 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         let final_execution = executed
             .last()
             .ok_or_else(|| Error::invariant("planned execution produced no transaction"))?;
+        let dirty_union_started = Instant::now();
         let all_dirty = executed
             .iter()
             .flat_map(|transaction| transaction.dirty.iter().copied())
             .collect::<BTreeSet<_>>();
+        self.batch_metrics.dirty_union_nanos = self
+            .batch_metrics
+            .dirty_union_nanos
+            .saturating_add(elapsed_nanos(dirty_union_started));
         let catalog_started = Instant::now();
-        let published_generation =
+        let (published_generation, prepare_timing) =
             self.publisher
                 .prepare(&working, &final_execution.superblock, &all_dirty)?;
         self.batch_metrics.catalog_construction_nanos = self
             .batch_metrics
             .catalog_construction_nanos
             .saturating_add(elapsed_nanos(catalog_started));
+        self.batch_metrics.catalog_map_clone_nanos = self
+            .batch_metrics
+            .catalog_map_clone_nanos
+            .saturating_add(prepare_timing.catalog_map_clone_nanos);
+        self.batch_metrics.catalog_state_scan_nanos = self
+            .batch_metrics
+            .catalog_state_scan_nanos
+            .saturating_add(prepare_timing.catalog_state_scan_nanos);
 
+        let wal_assembly_started = Instant::now();
         let mut wal_commits = Vec::with_capacity(executed.len());
         let mut final_images = BTreeMap::new();
         let mut wal_bytes = 0u64;
@@ -1629,6 +1690,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 final_images.insert(image.page_id, image.image);
             }
         }
+        self.batch_metrics.wal_assembly_nanos = self
+            .batch_metrics
+            .wal_assembly_nanos
+            .saturating_add(elapsed_nanos(wal_assembly_started));
         if let Some(wal) = self.wal.as_mut() {
             let reports = match wal.append_group(&wal_commits, self.fault_injector.as_deref_mut()) {
                 Ok(reports) => reports,
@@ -1648,18 +1713,32 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             self.file.sync_data()?;
         }
 
+        let state_install_started = Instant::now();
         self.state = working;
         self.current_superblock = final_execution.superblock.clone();
         self.active_slot = final_execution.slot;
         self.next_revision = final_execution.next_revision;
         self.next_lsn = final_execution.next_lsn;
         self.next_batch_id = final_execution.next_batch_id;
+        self.batch_metrics.state_install_nanos = self
+            .batch_metrics
+            .state_install_nanos
+            .saturating_add(elapsed_nanos(state_install_started));
         let publication_started = Instant::now();
-        self.publisher.publish(published_generation);
+        let publish_timing = self.publisher.publish(published_generation);
         self.batch_metrics.generation_publication_nanos = self
             .batch_metrics
             .generation_publication_nanos
             .saturating_add(elapsed_nanos(publication_started));
+        self.batch_metrics.publication_swap_nanos = self
+            .batch_metrics
+            .publication_swap_nanos
+            .saturating_add(publish_timing.swap_nanos);
+        self.batch_metrics.retired_generation_drop_nanos = self
+            .batch_metrics
+            .retired_generation_drop_nanos
+            .saturating_add(publish_timing.retired_generation_drop_nanos);
+        let dirty_tracking_started = Instant::now();
         self.dirty_pages.extend(
             final_images
                 .iter()
@@ -1675,6 +1754,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 .copied()
                 .ok_or_else(|| Error::invariant("planned superblock image is missing"))?,
         );
+        self.batch_metrics.dirty_tracking_nanos = self
+            .batch_metrics
+            .dirty_tracking_nanos
+            .saturating_add(elapsed_nanos(dirty_tracking_started));
         self.split_metrics.pages_touched = self
             .split_metrics
             .pages_touched
@@ -4914,7 +4997,7 @@ mod tests {
             high_water_page_id: candidate.high_water_page_id,
             ..store.current_superblock.clone()
         };
-        let unpublished = store
+        let (unpublished, _) = store
             .publisher
             .prepare(&candidate, &prepared_sb, &dirty)
             .unwrap();

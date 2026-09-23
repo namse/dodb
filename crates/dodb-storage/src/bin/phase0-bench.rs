@@ -1430,7 +1430,9 @@ struct MetricDelta {
     rejected_transactions: u64,
     logical_admission_nanos: u64,
     planning_nanos: u64,
+    state_clone_nanos: u64,
     physical_execution_nanos: u64,
+    dirty_union_nanos: u64,
     full_state_clones: u64,
     mutations_planned: u64,
     routes_calculated: u64,
@@ -1451,7 +1453,14 @@ struct MetricDelta {
     planner_page_images: u64,
     planner_wal_bytes: u64,
     catalog_construction_nanos: u64,
+    catalog_map_clone_nanos: u64,
+    catalog_state_scan_nanos: u64,
+    wal_assembly_nanos: u64,
+    state_install_nanos: u64,
     generation_publication_nanos: u64,
+    publication_swap_nanos: u64,
+    retired_generation_drop_nanos: u64,
+    dirty_tracking_nanos: u64,
 }
 
 impl MetricDelta {
@@ -1568,9 +1577,17 @@ impl MetricDelta {
                 batch_before.logical_admission_nanos,
             ),
             planning_nanos: subtraction(batch_after.planning_nanos, batch_before.planning_nanos),
+            state_clone_nanos: subtraction(
+                batch_after.state_clone_nanos,
+                batch_before.state_clone_nanos,
+            ),
             physical_execution_nanos: subtraction(
                 batch_after.physical_execution_nanos,
                 batch_before.physical_execution_nanos,
+            ),
+            dirty_union_nanos: subtraction(
+                batch_after.dirty_union_nanos,
+                batch_before.dirty_union_nanos,
             ),
             full_state_clones: subtraction(
                 batch_after.full_state_clones,
@@ -1631,9 +1648,37 @@ impl MetricDelta {
                 batch_after.catalog_construction_nanos,
                 batch_before.catalog_construction_nanos,
             ),
+            catalog_map_clone_nanos: subtraction(
+                batch_after.catalog_map_clone_nanos,
+                batch_before.catalog_map_clone_nanos,
+            ),
+            catalog_state_scan_nanos: subtraction(
+                batch_after.catalog_state_scan_nanos,
+                batch_before.catalog_state_scan_nanos,
+            ),
+            wal_assembly_nanos: subtraction(
+                batch_after.wal_assembly_nanos,
+                batch_before.wal_assembly_nanos,
+            ),
+            state_install_nanos: subtraction(
+                batch_after.state_install_nanos,
+                batch_before.state_install_nanos,
+            ),
             generation_publication_nanos: subtraction(
                 batch_after.generation_publication_nanos,
                 batch_before.generation_publication_nanos,
+            ),
+            publication_swap_nanos: subtraction(
+                batch_after.publication_swap_nanos,
+                batch_before.publication_swap_nanos,
+            ),
+            retired_generation_drop_nanos: subtraction(
+                batch_after.retired_generation_drop_nanos,
+                batch_before.retired_generation_drop_nanos,
+            ),
+            dirty_tracking_nanos: subtraction(
+                batch_after.dirty_tracking_nanos,
+                batch_before.dirty_tracking_nanos,
             ),
         }
     }
@@ -2412,7 +2457,9 @@ fn build_record(
     json.u64("rejected_transactions", delta.rejected_transactions);
     json.u64("logical_admission_nanos", delta.logical_admission_nanos);
     json.u64("planning_nanos", delta.planning_nanos);
+    json.u64("state_clone_nanos_total", delta.state_clone_nanos);
     json.u64("physical_execution_nanos", delta.physical_execution_nanos);
+    json.u64("dirty_union_nanos_total", delta.dirty_union_nanos);
     json.u64("full_state_clones", delta.full_state_clones);
     json.f64(
         "full_state_clones_per_group",
@@ -2445,9 +2492,25 @@ fn build_record(
         delta.catalog_construction_nanos,
     );
     json.u64(
+        "catalog_map_clone_nanos_total",
+        delta.catalog_map_clone_nanos,
+    );
+    json.u64(
+        "catalog_state_scan_nanos_total",
+        delta.catalog_state_scan_nanos,
+    );
+    json.u64("wal_assembly_nanos_total", delta.wal_assembly_nanos);
+    json.u64("state_install_nanos_total", delta.state_install_nanos);
+    json.u64(
         "generation_publication_nanos",
         delta.generation_publication_nanos,
     );
+    json.u64("publication_swap_nanos_total", delta.publication_swap_nanos);
+    json.u64(
+        "retired_generation_drop_nanos_total",
+        delta.retired_generation_drop_nanos,
+    );
+    json.u64("dirty_tracking_nanos_total", delta.dirty_tracking_nanos);
     json.string(
         "component_timing_scope",
         "existing cumulative coordinator/storage/WAL metrics; per-request component percentiles unavailable without production hot-path instrumentation",
