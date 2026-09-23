@@ -102,6 +102,13 @@ impl Workload {
     fn is_expected_conflict(self) -> bool {
         matches!(self, Self::HighConflict)
     }
+
+    fn uses_global_schedule(self) -> bool {
+        matches!(
+            self,
+            Self::Mixed90Get10Put | Self::Mixed50Get50Put | Self::TransactionHeavy
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -793,10 +800,12 @@ async fn measure_async(
     }
 
     let deadline = Instant::now() + settings.measure;
+    let schedule_ticket = Arc::new(AtomicU64::new(0));
     let mut tasks = Vec::with_capacity(concurrency);
     for worker in 0..concurrency {
         let backend = backend.clone();
         let dataset = dataset.clone();
+        let schedule_ticket = Arc::clone(&schedule_ticket);
         tasks.push(tokio::spawn(async move {
             let mut local = Accumulator::default();
             let mut operation = worker;
@@ -804,7 +813,12 @@ async fn measure_async(
                 let started = Instant::now();
                 let mut combined = CallSummary::default();
                 let mut error = None;
-                for plan in plan_sequence(&dataset, workload, worker, operation) {
+                let selection = if workload.uses_global_schedule() {
+                    schedule_ticket.fetch_add(1, Ordering::Relaxed) as usize
+                } else {
+                    operation
+                };
+                for plan in plan_sequence(&dataset, workload, worker, selection) {
                     let summary = backend.call(plan).await;
                     combined.requests = combined.requests.saturating_add(summary.requests);
                     if matches!(summary.status, Some(CallStatus::Conflict)) {
