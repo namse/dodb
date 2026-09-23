@@ -5,6 +5,10 @@ complete. The OCI delay-zero diagnostic found insufficient worker overlap and
 a throughput regression; the worker mechanism needs further review. Phase 5
 has not started. See [`phase4-results.md`](phase4-results.md).
 
+The independent serial generation/catalog lifecycle optimization is recorded in
+[`catalog-cow-results.md`](catalog-cow-results.md). It does not change the
+Phase 4 conclusion or imply Phase 5 readiness.
+
 Baseline branch: `main`
 
 Baseline commit: `1ff96e1` (`storage: rely on crash-consistent storage snapshots`)
