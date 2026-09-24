@@ -502,6 +502,20 @@ impl<'a> WorkingBlinkState<'a> {
         self.pages.get_mut(&page_id)
     }
 
+    fn ensure_overlay_page(&mut self, page_id: PageId) -> Result<bool> {
+        if self.pages.contains_key(&page_id) {
+            return Ok(false);
+        }
+        let page = self
+            .base
+            .pages
+            .get(&page_id)
+            .cloned()
+            .ok_or_else(|| Error::corruption("planned Blink page is missing"))?;
+        self.pages.insert(page_id, page);
+        Ok(true)
+    }
+
     fn into_delta(self) -> BlinkStateDelta {
         BlinkStateDelta {
             pages: self.pages,
@@ -579,7 +593,6 @@ struct AdmittedTransaction {
 
 struct CachedLeaf {
     leaf_id: PageId,
-    page: BlinkPage,
 }
 
 struct PhysicalExecutionState {
@@ -3143,20 +3156,6 @@ fn prepare_planned_serial_execution<'a>(
         batch_metrics.physical_restamp_nanos = batch_metrics
             .physical_restamp_nanos
             .saturating_add(elapsed_nanos(restamp_started));
-        let cached_refresh_started = Instant::now();
-        if let Some(cached_leaf) = execution_state.cached_leaf.as_mut()
-            && dirty.contains(&cached_leaf.leaf_id)
-        {
-            batch_metrics.cached_refresh_clones =
-                batch_metrics.cached_refresh_clones.saturating_add(1);
-            cached_leaf.page = working
-                .page(cached_leaf.leaf_id)
-                .cloned()
-                .ok_or_else(|| Error::invariant("cached planned leaf disappeared"))?;
-        }
-        batch_metrics.physical_cached_refresh_nanos = batch_metrics
-            .physical_cached_refresh_nanos
-            .saturating_add(elapsed_nanos(cached_refresh_started));
         working_superblock = BlinkSuperblock {
             generation: working_superblock
                 .generation
@@ -3227,8 +3226,8 @@ fn prepare_planned_serial_execution<'a>(
     Ok(PlannedExecutionPreparation { working, executed })
 }
 
-fn apply_planned_mutation<S: BlinkMutationState>(
-    state: &mut S,
+fn apply_planned_mutation(
+    state: &mut WorkingBlinkState<'_>,
     dirty: &mut BTreeSet<PageId>,
     split_metrics: &mut BlinkSplitMetrics,
     batch_metrics: &mut BlinkBatchMetrics,
@@ -3239,7 +3238,7 @@ fn apply_planned_mutation<S: BlinkMutationState>(
     let cached_matches = execution_state
         .cached_leaf
         .as_ref()
-        .is_some_and(|cached| cached_leaf_contains(cached, &planned_mutation.encoded_key));
+        .is_some_and(|cached| cached_leaf_contains(state, cached, &planned_mutation.encoded_key));
     if cached_matches {
         batch_metrics.coalesced_mutations = batch_metrics.coalesced_mutations.saturating_add(1);
         let mut cached = execution_state.cached_leaf.take().unwrap();
@@ -3274,19 +3273,22 @@ fn apply_planned_mutation<S: BlinkMutationState>(
         batch_metrics.split_triggered_reroutes =
             batch_metrics.split_triggered_reroutes.saturating_add(1);
     }
-    let page_ref = state.page(leaf_id);
     let leaf_load_started = Instant::now();
-    let page = page_ref.cloned();
-    batch_metrics.leaf_load_clone_nanos = batch_metrics
-        .leaf_load_clone_nanos
-        .saturating_add(elapsed_nanos(leaf_load_started));
-    let page = page.ok_or_else(|| Error::corruption("planned Blink leaf is missing"))?;
-    batch_metrics.leaf_load_clones = batch_metrics.leaf_load_clones.saturating_add(1);
+    let cloned = state.ensure_overlay_page(leaf_id)?;
+    if cloned {
+        batch_metrics.leaf_load_clones = batch_metrics.leaf_load_clones.saturating_add(1);
+        batch_metrics.leaf_load_clone_nanos = batch_metrics
+            .leaf_load_clone_nanos
+            .saturating_add(elapsed_nanos(leaf_load_started));
+    }
+    let page = state
+        .overlay_page_mut(leaf_id)
+        .ok_or_else(|| Error::invariant("planned Blink overlay page disappeared"))?;
     if !matches!(page, BlinkPage::Leaf { .. }) {
         return Err(Error::corruption("planned Blink route ended at non-leaf"));
     }
     batch_metrics.leaf_loads = batch_metrics.leaf_loads.saturating_add(1);
-    let mut cached = CachedLeaf { leaf_id, page };
+    let mut cached = CachedLeaf { leaf_id };
     let split = apply_cached_leaf_mutation(
         state,
         dirty,
@@ -3306,10 +3308,17 @@ fn apply_planned_mutation<S: BlinkMutationState>(
     Ok(())
 }
 
-fn cached_leaf_contains(cached: &CachedLeaf, encoded_key: &[u8]) -> bool {
+fn cached_leaf_contains(
+    state: &WorkingBlinkState<'_>,
+    cached: &CachedLeaf,
+    encoded_key: &[u8],
+) -> bool {
+    let Some(page) = state.page(cached.leaf_id) else {
+        return false;
+    };
     let BlinkPage::Leaf {
         high_key, entries, ..
-    } = &cached.page
+    } = page
     else {
         return false;
     };
@@ -3324,8 +3333,8 @@ fn cached_leaf_contains(cached: &CachedLeaf, encoded_key: &[u8]) -> bool {
         .is_none_or(|entry| encoded_key >= entry.key.as_slice())
 }
 
-fn apply_cached_leaf_mutation<S: BlinkMutationState>(
-    state: &mut S,
+fn apply_cached_leaf_mutation(
+    state: &mut WorkingBlinkState<'_>,
     dirty: &mut BTreeSet<PageId>,
     split_metrics: &mut BlinkSplitMetrics,
     batch_metrics: &mut BlinkBatchMetrics,
@@ -3338,93 +3347,107 @@ fn apply_cached_leaf_mutation<S: BlinkMutationState>(
         TransactionMutation::Delete { .. } => None,
     };
     let encoded = &planned_mutation.encoded_key;
-    let BlinkPage::Leaf {
-        high_key,
-        right_sibling,
-        entries,
-        ..
-    } = &cached.page
-    else {
-        return Err(Error::corruption("cached Blink page is not a leaf"));
-    };
-    let entries_clone_started = Instant::now();
-    let mut next_entries = entries.clone();
-    batch_metrics.leaf_entries_clone_nanos = batch_metrics
-        .leaf_entries_clone_nanos
-        .saturating_add(elapsed_nanos(entries_clone_started));
-    batch_metrics.leaf_entries_clones = batch_metrics.leaf_entries_clones.saturating_add(1);
     let value_ref = match value {
         Some(bytes) => Some(allocate_value(state, dirty, bytes)?),
         None => None,
     };
-    match next_entries.binary_search_by(|entry| entry.key.cmp(encoded)) {
-        Ok(entry_index) => {
-            let old = next_entries[entry_index].value.clone();
-            next_entries[entry_index] = LeafEntry {
-                key: encoded.clone(),
-                revision,
-                value: value_ref,
-            };
-            if !leaf_fits(&next_entries, high_key.as_deref(), *right_sibling) {
-                return Err(Error::invalid_input(
-                    "document key and value cannot fit in a Blink leaf",
-                ));
-            }
-            free_value(state, dirty, old)?;
-        }
-        Err(entry_index) => {
-            next_entries.insert(
-                entry_index,
-                LeafEntry {
-                    key: encoded.clone(),
-                    revision,
-                    value: value_ref,
-                },
-            );
-            if !leaf_fits(&next_entries, high_key.as_deref(), *right_sibling) {
-                let mut path = Vec::new();
-                let routed_leaf = find_leaf_with_path(state, encoded, &mut path, split_metrics)?;
-                if routed_leaf != cached.leaf_id {
-                    batch_metrics.reroutes = batch_metrics.reroutes.saturating_add(1);
-                    batch_metrics.split_triggered_reroutes =
-                        batch_metrics.split_triggered_reroutes.saturating_add(1);
-                    return Err(Error::invariant(
-                        "planned leaf cache became stale before split",
+    let mut old_value = None;
+    let mut split_required = false;
+    {
+        let page = state
+            .overlay_page_mut(cached.leaf_id)
+            .ok_or_else(|| Error::invariant("cached planned leaf is not overlay-owned"))?;
+        let BlinkPage::Leaf {
+            lsn,
+            high_key,
+            right_sibling,
+            entries,
+        } = page
+        else {
+            return Err(Error::corruption("cached Blink page is not a leaf"));
+        };
+        match entries.binary_search_by(|entry| entry.key.cmp(encoded)) {
+            Ok(entry_index) => {
+                old_value = Some(
+                    std::mem::replace(
+                        &mut entries[entry_index],
+                        LeafEntry {
+                            key: encoded.clone(),
+                            revision,
+                            value: value_ref,
+                        },
+                    )
+                    .value,
+                );
+                if !leaf_fits(entries, high_key.as_deref(), *right_sibling) {
+                    return Err(Error::invalid_input(
+                        "document key and value cannot fit in a Blink leaf",
                     ));
                 }
-                batch_metrics.structural_fallbacks =
-                    batch_metrics.structural_fallbacks.saturating_add(1);
-                batch_metrics.coalescing_interruptions =
-                    batch_metrics.coalescing_interruptions.saturating_add(1);
-                split_leaf(
-                    state,
-                    dirty,
-                    split_metrics,
-                    cached.leaf_id,
-                    path,
-                    high_key.clone(),
-                    *right_sibling,
-                    next_entries,
-                    revision,
-                )?;
-                return Ok(true);
+                *lsn = Lsn::new(revision.get());
+            }
+            Err(entry_index) => {
+                entries.insert(
+                    entry_index,
+                    LeafEntry {
+                        key: encoded.clone(),
+                        revision,
+                        value: value_ref,
+                    },
+                );
+                split_required = !leaf_fits(entries, high_key.as_deref(), *right_sibling);
+                if !split_required {
+                    *lsn = Lsn::new(revision.get());
+                }
             }
         }
     }
-    let next_page = BlinkPage::Leaf {
-        lsn: Lsn::new(revision.get()),
-        high_key: high_key.clone(),
-        right_sibling: *right_sibling,
-        entries: next_entries,
-    };
-    let leaf_install_started = Instant::now();
-    state.insert_page(cached.leaf_id, next_page.clone());
-    batch_metrics.leaf_install_clone_nanos = batch_metrics
-        .leaf_install_clone_nanos
-        .saturating_add(elapsed_nanos(leaf_install_started));
-    batch_metrics.leaf_install_clones = batch_metrics.leaf_install_clones.saturating_add(1);
-    cached.page = next_page;
+    if let Some(old_value) = old_value {
+        free_value(state, dirty, old_value)?;
+    }
     dirty.insert(cached.leaf_id);
+    if split_required {
+        let mut path = Vec::new();
+        let routed_leaf = find_leaf_with_path(state, encoded, &mut path, split_metrics)?;
+        if routed_leaf != cached.leaf_id {
+            batch_metrics.reroutes = batch_metrics.reroutes.saturating_add(1);
+            batch_metrics.split_triggered_reroutes =
+                batch_metrics.split_triggered_reroutes.saturating_add(1);
+            return Err(Error::invariant(
+                "planned leaf cache became stale before split",
+            ));
+        }
+        batch_metrics.structural_fallbacks = batch_metrics.structural_fallbacks.saturating_add(1);
+        batch_metrics.coalescing_interruptions =
+            batch_metrics.coalescing_interruptions.saturating_add(1);
+        let (high_key, right_sibling, entries) = {
+            let page = state
+                .overlay_page_mut(cached.leaf_id)
+                .ok_or_else(|| Error::invariant("planned split leaf disappeared"))?;
+            let BlinkPage::Leaf {
+                high_key,
+                right_sibling,
+                entries,
+                ..
+            } = page
+            else {
+                return Err(Error::corruption("planned split page is not a leaf"));
+            };
+            (high_key.take(), *right_sibling, std::mem::take(entries))
+        };
+        split_leaf(
+            state,
+            dirty,
+            split_metrics,
+            cached.leaf_id,
+            path,
+            high_key,
+            right_sibling,
+            entries,
+            revision,
+        )?;
+        return Ok(true);
+    }
     Ok(false)
 }
 
@@ -6791,13 +6814,105 @@ mod tests {
         );
         let metrics = store.batch_metrics();
         assert_eq!(metrics.full_state_clones - before.full_state_clones, 0);
+        assert_eq!(metrics.leaf_load_clones - before.leaf_load_clones, 1);
+        assert_eq!(metrics.leaf_entries_clones - before.leaf_entries_clones, 0);
+        assert_eq!(
+            metrics.leaf_entries_clone_nanos - before.leaf_entries_clone_nanos,
+            0
+        );
+        assert_eq!(metrics.leaf_install_clones - before.leaf_install_clones, 0);
+        assert_eq!(
+            metrics.leaf_install_clone_nanos - before.leaf_install_clone_nanos,
+            0
+        );
+        assert_eq!(
+            metrics.cached_refresh_clones - before.cached_refresh_clones,
+            0
+        );
+        assert_eq!(
+            metrics.physical_cached_refresh_nanos - before.physical_cached_refresh_nanos,
+            0
+        );
         assert!(metrics.same_leaf_groups > before.same_leaf_groups);
         assert!(metrics.coalesced_mutations > before.coalesced_mutations);
         assert!(metrics.leaf_loads < metrics.mutations_planned);
         let committed = store.wal.as_ref().unwrap().committed_batches();
         assert_eq!(committed.len(), 4);
         assert!(committed.iter().all(|batch| !batch.pages.is_empty()));
+        let encoded_key = key.encode();
+        for (transaction_index, expected_revision) in
+            [first_lsn, second_lsn, third_lsn].into_iter().enumerate()
+        {
+            let page = committed[transaction_index]
+                .pages
+                .iter()
+                .filter_map(|image| decode_blink_page(&image.image, image.page_id).ok())
+                .find_map(|page| match page {
+                    BlinkPage::Leaf { entries, .. }
+                        if entries.iter().any(|entry| entry.key == encoded_key) =>
+                    {
+                        Some(entries)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let entry = page.iter().find(|entry| entry.key == encoded_key).unwrap();
+            assert_eq!(entry.revision, expected_revision.into());
+            if transaction_index == 0 {
+                assert_eq!(entry.value, Some(BlinkValueRef::Inline(b"put".to_vec())));
+            } else if transaction_index == 1 {
+                assert_eq!(entry.value, None);
+            } else {
+                assert_eq!(entry.value, Some(BlinkValueRef::Inline(b"final".to_vec())));
+            }
+        }
         store.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_oversize_existing_key_update_does_not_publish_overlay() {
+        let mut store = planned_store();
+        let key = DocumentKey::new(vec![b'k'; 3_500], Vec::new());
+        store.put(key.clone(), b"small".to_vec()).unwrap();
+        let pages_before = store.state.pages.clone();
+        let root_before = store.state.root_page_id;
+        let free_list_before = store.state.free_list_head;
+        let high_water_before = store.state.high_water_page_id;
+        let superblock_before = store.current_superblock.clone();
+        let slot_before = store.active_slot;
+        let revision_before = store.next_revision;
+        let lsn_before = store.next_lsn;
+        let batch_before = store.next_batch_id;
+        let generation_before = store.versioned_read_metrics().published_generations;
+        let wal_before = store.wal.as_ref().unwrap().committed_batches().len();
+        let error = store
+            .apply_transaction_group(&[TransactionRequest::new(
+                Vec::new(),
+                vec![TransactionMutation::Put {
+                    key: key.clone(),
+                    value: vec![b'x'; INLINE_VALUE_LIMIT],
+                }],
+            )])
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput(_)));
+        assert_eq!(store.state.pages, pages_before);
+        assert_eq!(store.state.root_page_id, root_before);
+        assert_eq!(store.state.free_list_head, free_list_before);
+        assert_eq!(store.state.high_water_page_id, high_water_before);
+        assert_eq!(store.current_superblock, superblock_before);
+        assert_eq!(store.active_slot, slot_before);
+        assert_eq!(store.next_revision, revision_before);
+        assert_eq!(store.next_lsn, lsn_before);
+        assert_eq!(store.next_batch_id, batch_before);
+        assert_eq!(
+            store.versioned_read_metrics().published_generations,
+            generation_before
+        );
+        assert_eq!(
+            store.wal.as_ref().unwrap().committed_batches().len(),
+            wal_before
+        );
+        assert_eq!(store.get(&key).unwrap().value(), Some(&b"small"[..]));
     }
 
     #[test]
