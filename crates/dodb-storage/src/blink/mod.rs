@@ -158,6 +158,8 @@ pub struct BlinkBatchMetrics {
     pub physical_cached_refresh_nanos: u64,
     pub physical_page_encode_nanos: u64,
     pub physical_superblock_encode_nanos: u64,
+    pub superblock_images_emitted: u64,
+    pub superblock_images_elided: u64,
     pub leaf_load_clones: u64,
     pub leaf_entries_clones: u64,
     pub leaf_install_clones: u64,
@@ -1086,6 +1088,7 @@ struct ExecutedPlanTransaction {
     images: Vec<WalPageImage>,
     superblock: BlinkSuperblock,
     slot: SuperblockSlot,
+    superblock_image_emitted: bool,
     next_revision: Revision,
     next_lsn: Lsn,
     next_batch_id: u64,
@@ -2028,6 +2031,20 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             self.file.sync_data()?;
         }
 
+        for transaction in &executed {
+            if transaction.superblock_image_emitted {
+                self.batch_metrics.superblock_images_emitted = self
+                    .batch_metrics
+                    .superblock_images_emitted
+                    .saturating_add(1);
+            } else {
+                self.batch_metrics.superblock_images_elided = self
+                    .batch_metrics
+                    .superblock_images_elided
+                    .saturating_add(1);
+            }
+        }
+
         let state_install_started = Instant::now();
         for (page_id, page) in delta.pages {
             self.state.pages.insert(page_id, page);
@@ -2066,15 +2083,12 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 .filter(|(page_id, _)| **page_id != PageId::ZERO && **page_id != PageId::new(1))
                 .map(|(page_id, image)| (*page_id, *image)),
         );
-        self.dirty_superblock = Some(
-            final_images
-                .get(&match final_execution.slot {
-                    SuperblockSlot::A => PageId::ZERO,
-                    SuperblockSlot::B => PageId::new(1),
-                })
-                .copied()
-                .ok_or_else(|| Error::invariant("planned superblock image is missing"))?,
-        );
+        if let Some(image) = final_images.get(&match final_execution.slot {
+            SuperblockSlot::A => PageId::ZERO,
+            SuperblockSlot::B => PageId::new(1),
+        }) {
+            self.dirty_superblock = Some(*image);
+        }
         self.batch_metrics.dirty_tracking_nanos = self
             .batch_metrics
             .dirty_tracking_nanos
@@ -2796,7 +2810,7 @@ fn prepare_parallel_execution<'a>(
         let commit_lsn = Lsn::new(
             next_lsn
                 .get()
-                .checked_add(2)
+                .checked_add(1)
                 .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
         );
         transaction_lsns.insert(transaction.fifo_position, commit_lsn);
@@ -3040,14 +3054,14 @@ fn assemble_parallel_transactions(
     }
     let mut executed = Vec::with_capacity(plan.transactions.len());
     let mut superblock = current_superblock.clone();
-    let mut slot = active_slot;
+    let slot = active_slot;
     let mut next_lsn = starting_lsn;
     let mut next_batch_id = starting_batch_id;
     for transaction in &plan.transactions {
         let commit_lsn = Lsn::new(
             next_lsn
                 .get()
-                .checked_add(2)
+                .checked_add(1)
                 .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
         );
         let (leaf_id, leaf_image) = images_by_fifo
@@ -3072,25 +3086,12 @@ fn assemble_parallel_transactions(
             high_water_page_id: superblock.high_water_page_id,
             ..superblock
         };
-        slot = match slot {
-            SuperblockSlot::A => SuperblockSlot::B,
-            SuperblockSlot::B => SuperblockSlot::A,
-        };
         let mut dirty = BTreeSet::new();
         dirty.insert(leaf_id);
-        let images = vec![
-            WalPageImage {
-                page_id: leaf_id,
-                image: leaf_image,
-            },
-            WalPageImage {
-                page_id: match slot {
-                    SuperblockSlot::A => PageId::ZERO,
-                    SuperblockSlot::B => PageId::new(1),
-                },
-                image: encode_blink_superblock(&superblock)?,
-            },
-        ];
+        let images = vec![WalPageImage {
+            page_id: leaf_id,
+            image: leaf_image,
+        }];
         let next_lsn_after = Lsn::new(
             commit_lsn
                 .get()
@@ -3104,6 +3105,7 @@ fn assemble_parallel_transactions(
             images,
             superblock: superblock.clone(),
             slot,
+            superblock_image_emitted: false,
             next_revision: Revision::from(next_lsn_after),
             next_lsn: next_lsn_after,
             next_batch_id: next_batch_id
@@ -3158,11 +3160,34 @@ fn prepare_planned_serial_execution<'a>(
         batch_metrics.physical_mutation_nanos = batch_metrics
             .physical_mutation_nanos
             .saturating_add(elapsed_nanos(mutation_started));
+        let previous_root_page_id = working_superblock.root_page_id;
+        let previous_free_list_head = working_superblock.free_list_head;
+        let previous_high_water_page_id = working_superblock.high_water_page_id;
+        working_superblock = BlinkSuperblock {
+            generation: working_superblock
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("experimental generation exhausted"))?,
+            root_page_id: working.root_page_id(),
+            free_list_head: working.free_list_head(),
+            high_water_page_id: working.high_water_page_id(),
+            ..working_superblock
+        };
+        let metadata_changed = working_superblock.root_page_id != previous_root_page_id
+            || working_superblock.free_list_head != previous_free_list_head
+            || working_superblock.high_water_page_id != previous_high_water_page_id;
+        if metadata_changed {
+            working_slot = match working_slot {
+                SuperblockSlot::A => SuperblockSlot::B,
+                SuperblockSlot::B => SuperblockSlot::A,
+            };
+        }
+        let commit_image_count = dirty.len() + usize::from(metadata_changed);
         let commit_lsn = Lsn::new(
             next_lsn
                 .get()
                 .checked_add(
-                    u64::try_from(dirty.len() + 1)
+                    u64::try_from(commit_image_count)
                         .map_err(|_| Error::invariant("Blink page count overflows LSN"))?,
                 )
                 .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
@@ -3181,21 +3206,7 @@ fn prepare_planned_serial_execution<'a>(
         batch_metrics.physical_restamp_nanos = batch_metrics
             .physical_restamp_nanos
             .saturating_add(elapsed_nanos(restamp_started));
-        working_superblock = BlinkSuperblock {
-            generation: working_superblock
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("experimental generation exhausted"))?,
-            root_page_id: working.root_page_id(),
-            free_list_head: working.free_list_head(),
-            high_water_page_id: working.high_water_page_id(),
-            ..working_superblock
-        };
-        working_slot = match working_slot {
-            SuperblockSlot::A => SuperblockSlot::B,
-            SuperblockSlot::B => SuperblockSlot::A,
-        };
-        let mut images = Vec::with_capacity(dirty.len() + 1);
+        let mut images = Vec::with_capacity(commit_image_count);
         let page_encode_started = Instant::now();
         for page_id in &dirty {
             let page = working
@@ -3212,18 +3223,20 @@ fn prepare_planned_serial_execution<'a>(
         batch_metrics.physical_page_encode_nanos = batch_metrics
             .physical_page_encode_nanos
             .saturating_add(elapsed_nanos(page_encode_started));
-        let superblock_encode_started = Instant::now();
-        let superblock_image = encode_blink_superblock(&working_superblock)?;
-        batch_metrics.physical_superblock_encode_nanos = batch_metrics
-            .physical_superblock_encode_nanos
-            .saturating_add(elapsed_nanos(superblock_encode_started));
-        images.push(WalPageImage {
-            page_id: match working_slot {
-                SuperblockSlot::A => PageId::ZERO,
-                SuperblockSlot::B => PageId::new(1),
-            },
-            image: superblock_image,
-        });
+        if metadata_changed {
+            let superblock_encode_started = Instant::now();
+            let superblock_image = encode_blink_superblock(&working_superblock)?;
+            batch_metrics.physical_superblock_encode_nanos = batch_metrics
+                .physical_superblock_encode_nanos
+                .saturating_add(elapsed_nanos(superblock_encode_started));
+            images.push(WalPageImage {
+                page_id: match working_slot {
+                    SuperblockSlot::A => PageId::ZERO,
+                    SuperblockSlot::B => PageId::new(1),
+                },
+                image: superblock_image,
+            });
+        }
         let next_lsn_after = Lsn::new(
             commit_lsn
                 .get()
@@ -3237,6 +3250,7 @@ fn prepare_planned_serial_execution<'a>(
             images,
             superblock: working_superblock.clone(),
             slot: working_slot,
+            superblock_image_emitted: metadata_changed,
             next_revision: Revision::from(next_lsn_after),
             next_lsn: next_lsn_after,
             next_batch_id: next_batch_id
@@ -7453,6 +7467,262 @@ mod tests {
     }
 
     #[test]
+    fn planned_metadata_stable_transactions_elide_superblocks_and_recover() {
+        let config = DatabaseConfig::default();
+        let mut store = planned_store();
+        let keys = (0u64..4)
+            .map(|position| DocumentKey::new(b"stable".to_vec(), position.to_be_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            store.put(key.clone(), b"before".to_vec()).unwrap();
+        }
+        let root_page_id = store.current_superblock.root_page_id;
+        let free_list_head = store.current_superblock.free_list_head;
+        let high_water_page_id = store.current_superblock.high_water_page_id;
+        let before_metrics = store.batch_metrics();
+        let results = store
+            .apply_transaction_group(
+                &keys
+                    .iter()
+                    .enumerate()
+                    .map(|(position, key)| {
+                        TransactionRequest::new(
+                            Vec::new(),
+                            vec![TransactionMutation::Put {
+                                key: key.clone(),
+                                value: vec![position as u8 + 1],
+                            }],
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let batches = store.wal.as_ref().unwrap().committed_batches();
+        assert_eq!(batches.len(), 8);
+        for batch in &batches[4..] {
+            assert_eq!(batch.pages.len(), 1);
+            assert!(
+                batch
+                    .pages
+                    .iter()
+                    .all(|image| image.page_id.get() >= FIRST_DATA_PAGE)
+            );
+        }
+        assert_eq!(store.current_superblock.root_page_id, root_page_id);
+        assert_eq!(store.current_superblock.free_list_head, free_list_head);
+        assert_eq!(
+            store.current_superblock.high_water_page_id,
+            high_water_page_id
+        );
+        let metrics = store.batch_metrics();
+        assert_eq!(
+            metrics.superblock_images_emitted - before_metrics.superblock_images_emitted,
+            0
+        );
+        assert_eq!(
+            metrics.superblock_images_elided - before_metrics.superblock_images_elided,
+            4
+        );
+        for (position, key) in keys.iter().enumerate() {
+            let state = store.get(key).unwrap();
+            assert_eq!(state.value(), Some(&[position as u8 + 1][..]));
+            assert_eq!(
+                state.revision(),
+                results[position].as_ref().unwrap().commit_lsn.into()
+            );
+        }
+        let (data, wal) = store.into_files();
+        let mut reopened = BlinkStore::open_with_wal(data, wal.unwrap(), config).unwrap();
+        for (position, key) in keys.iter().enumerate() {
+            let state = reopened.get(key).unwrap();
+            assert_eq!(state.value(), Some(&[position as u8 + 1][..]));
+            assert_eq!(
+                state.revision(),
+                results[position].as_ref().unwrap().commit_lsn.into()
+            );
+        }
+        reopened.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_structural_transactions_emit_superblocks_and_later_updates_elide() {
+        let config = DatabaseConfig::default();
+        let mut store = planned_store();
+        let replacement_key = DocumentKey::new(b"structure".to_vec(), b"replacement".to_vec());
+        store.put(replacement_key.clone(), b"old".to_vec()).unwrap();
+        let replacement_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        store.put(replacement_key.clone(), b"new".to_vec()).unwrap();
+        let replacement = &store.wal.as_ref().unwrap().committed_batches()[replacement_batch];
+        assert_eq!(replacement.pages.len(), 1);
+
+        let insert_key = DocumentKey::new(b"structure".to_vec(), b"insert".to_vec());
+        let insert_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        store.put(insert_key.clone(), b"value".to_vec()).unwrap();
+        let insert = &store.wal.as_ref().unwrap().committed_batches()[insert_batch];
+        assert_eq!(insert.pages.len(), 1);
+
+        let overflow_key = DocumentKey::new(b"structure".to_vec(), b"overflow".to_vec());
+        let overflow_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        store.put(overflow_key.clone(), vec![7; 2_000]).unwrap();
+        let overflow = &store.wal.as_ref().unwrap().committed_batches()[overflow_batch];
+        assert!(
+            overflow
+                .pages
+                .iter()
+                .any(|image| image.page_id.get() < FIRST_DATA_PAGE)
+        );
+
+        let freed_overflow_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        store.delete(overflow_key.clone()).unwrap();
+        let freed_overflow = &store.wal.as_ref().unwrap().committed_batches()[freed_overflow_batch];
+        assert!(
+            freed_overflow
+                .pages
+                .iter()
+                .any(|image| image.page_id.get() < FIRST_DATA_PAGE)
+        );
+
+        let reused_overflow_key =
+            DocumentKey::new(b"structure".to_vec(), b"overflow-reused".to_vec());
+        let reused_overflow_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        store
+            .put(reused_overflow_key.clone(), vec![9; 2_000])
+            .unwrap();
+        let reused_overflow =
+            &store.wal.as_ref().unwrap().committed_batches()[reused_overflow_batch];
+        assert!(
+            reused_overflow
+                .pages
+                .iter()
+                .any(|image| image.page_id.get() < FIRST_DATA_PAGE)
+        );
+
+        let mut observed_leaf_split = false;
+        let mut observed_root_split = false;
+        for position in 0..800u64 {
+            let prior_metrics = store.split_metrics();
+            let prior_batch_count = store.wal.as_ref().unwrap().committed_batches().len();
+            store
+                .put(
+                    DocumentKey::new(b"split".to_vec(), position.to_be_bytes().to_vec()),
+                    vec![position as u8; 32],
+                )
+                .unwrap();
+            let next_metrics = store.split_metrics();
+            let batch = &store.wal.as_ref().unwrap().committed_batches()[prior_batch_count];
+            if next_metrics.leaf_splits > prior_metrics.leaf_splits {
+                observed_leaf_split = true;
+                assert!(
+                    batch
+                        .pages
+                        .iter()
+                        .any(|image| image.page_id.get() < FIRST_DATA_PAGE)
+                );
+            }
+            if next_metrics.root_splits > prior_metrics.root_splits {
+                observed_root_split = true;
+                assert!(
+                    batch
+                        .pages
+                        .iter()
+                        .any(|image| image.page_id.get() < FIRST_DATA_PAGE)
+                );
+                break;
+            }
+        }
+        assert!(observed_leaf_split);
+        assert!(observed_root_split);
+
+        let stable_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        let root_page_id = store.current_superblock.root_page_id;
+        let high_water_page_id = store.current_superblock.high_water_page_id;
+        store
+            .put(replacement_key.clone(), b"after-split".to_vec())
+            .unwrap();
+        let stable = &store.wal.as_ref().unwrap().committed_batches()[stable_batch];
+        assert_eq!(stable.pages.len(), 1);
+        let (data, wal) = store.into_files();
+        let mut reopened = BlinkStore::open_with_wal(data, wal.unwrap(), config).unwrap();
+        assert_eq!(reopened.current_superblock.root_page_id, root_page_id);
+        assert_eq!(
+            reopened.current_superblock.high_water_page_id,
+            high_water_page_id
+        );
+        assert_eq!(
+            reopened.get(&replacement_key).unwrap().value(),
+            Some(&b"after-split"[..])
+        );
+        assert!(reopened.get(&insert_key).unwrap().value().is_some());
+        assert!(reopened.get(&overflow_key).unwrap().is_missing());
+        assert_eq!(
+            reopened.get(&reused_overflow_key).unwrap().value(),
+            Some(&vec![9; 2_000][..])
+        );
+        reopened.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_checkpoint_after_superblock_elision_reopens() {
+        let config = DatabaseConfig::default();
+        let mut store = planned_store();
+        let keys = (0u64..8)
+            .map(|position| {
+                DocumentKey::new(b"checkpoint".to_vec(), position.to_be_bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+        for key in &keys {
+            store.put(key.clone(), b"before".to_vec()).unwrap();
+        }
+        let metrics_before_updates = store.batch_metrics();
+        for (position, key) in keys.iter().enumerate() {
+            store.put(key.clone(), vec![position as u8]).unwrap();
+        }
+        let metrics_before_checkpoint = store.batch_metrics();
+        assert_eq!(
+            metrics_before_checkpoint.superblock_images_elided
+                - metrics_before_updates.superblock_images_elided,
+            8
+        );
+        store.checkpoint().unwrap();
+        let (data, wal) = store.into_files();
+        let mut reopened = BlinkStore::open_with_wal(data, wal.unwrap(), config).unwrap();
+        for (position, key) in keys.iter().enumerate() {
+            assert_eq!(
+                reopened.get(key).unwrap().value(),
+                Some(&[position as u8][..])
+            );
+        }
+        reopened.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn planned_superblock_elision_wal_sync_failure_does_not_install_state() {
+        let mut store = planned_store();
+        let key = DocumentKey::new(b"elision-fault".to_vec(), b"key".to_vec());
+        store.put(key.clone(), b"before".to_vec()).unwrap();
+        let before_contents = store.scan(None, 100).unwrap();
+        let before_lsn = store.next_lsn;
+        let before_batches = store.wal.as_ref().unwrap().committed_batches().len();
+        let before_publications = store.versioned_read_metrics().published_generations;
+        store.set_fault_injector(FailOnce {
+            point: "before_wal_sync",
+            fired: false,
+        });
+        assert!(store.put(key.clone(), b"after".to_vec()).is_err());
+        assert_eq!(store.scan(None, 100).unwrap(), before_contents);
+        assert_eq!(store.next_lsn, before_lsn);
+        assert_eq!(
+            store.wal.as_ref().unwrap().committed_batches().len(),
+            before_batches
+        );
+        assert_eq!(
+            store.versioned_read_metrics().published_generations,
+            before_publications
+        );
+        assert_eq!(store.get(&key).unwrap().value(), Some(&b"before"[..]));
+    }
+
+    #[test]
     fn planned_oversize_existing_key_update_does_not_publish_overlay() {
         let mut store = planned_store();
         let key = DocumentKey::new(vec![b'k'; 3_500], Vec::new());
@@ -7817,9 +8087,9 @@ mod tests {
             ..BatchPlan::default()
         };
         let reversed_images = vec![
-            (2, PageId::new(4), page(PageId::new(4), Lsn::new(8))),
-            (1, PageId::new(3), page(PageId::new(3), Lsn::new(5))),
-            (0, PageId::new(2), page(PageId::new(2), Lsn::new(2))),
+            (2, PageId::new(4), page(PageId::new(4), Lsn::new(5))),
+            (1, PageId::new(3), page(PageId::new(3), Lsn::new(3))),
+            (0, PageId::new(2), page(PageId::new(2), Lsn::new(1))),
         ];
         let executed = assemble_parallel_transactions(
             &plan,
@@ -7835,7 +8105,7 @@ mod tests {
                 .iter()
                 .map(|transaction| transaction.result.commit_lsn)
                 .collect::<Vec<_>>(),
-            vec![Lsn::new(2), Lsn::new(5), Lsn::new(8)]
+            vec![Lsn::new(1), Lsn::new(3), Lsn::new(5)]
         );
         assert_eq!(
             executed

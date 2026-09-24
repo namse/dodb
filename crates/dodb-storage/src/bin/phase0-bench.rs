@@ -1474,6 +1474,8 @@ struct MetricDelta {
     physical_cached_refresh_nanos: u64,
     physical_page_encode_nanos: u64,
     physical_superblock_encode_nanos: u64,
+    superblock_images_emitted: u64,
+    superblock_images_elided: u64,
     leaf_load_clones: u64,
     leaf_entries_clones: u64,
     leaf_install_clones: u64,
@@ -1778,6 +1780,14 @@ impl MetricDelta {
             physical_superblock_encode_nanos: subtraction(
                 batch_after.physical_superblock_encode_nanos,
                 batch_before.physical_superblock_encode_nanos,
+            ),
+            superblock_images_emitted: subtraction(
+                batch_after.superblock_images_emitted,
+                batch_before.superblock_images_emitted,
+            ),
+            superblock_images_elided: subtraction(
+                batch_after.superblock_images_elided,
+                batch_before.superblock_images_elided,
             ),
             leaf_load_clones: subtraction(
                 batch_after.leaf_load_clones,
@@ -2855,6 +2865,8 @@ fn build_record(
         "physical_superblock_encode_nanos_total",
         delta.physical_superblock_encode_nanos,
     );
+    json.u64("superblock_images_emitted", delta.superblock_images_emitted);
+    json.u64("superblock_images_elided", delta.superblock_images_elided);
     json.u64("leaf_load_clones_delta", delta.leaf_load_clones);
     json.u64("leaf_entries_clones_delta", delta.leaf_entries_clones);
     json.u64("leaf_install_clones_delta", delta.leaf_install_clones);
