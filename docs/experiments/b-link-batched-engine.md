@@ -31,6 +31,12 @@ policy, batch semantics, WAL semantics, or encoder format changed; only
 canonical encoded-key validation changed from allocating decode to
 allocation-free scanning.
 
+The direct fixed-buffer Blink page encoding result is recorded in
+[`direct-page-encoding-results.md`](direct-page-encoding-results.md). The page
+format is unchanged. Direct encoding produces byte-identical 4096-byte page
+images. B-link split policy, batching semantics, WAL semantics, and recovery
+format are unchanged.
+
 Baseline branch: `main`
 
 Baseline commit: `1ff96e1` (`storage: rely on crash-consistent storage snapshots`)
