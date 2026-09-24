@@ -7017,6 +7017,107 @@ mod tests {
     }
 
     #[test]
+    fn direct_wal_group_encoding_matches_reference_for_blink_page_shapes() {
+        struct NoopWalInjector;
+
+        impl FaultInjector for NoopWalInjector {
+            fn hit(&mut self, _point: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let config = DatabaseConfig::default();
+        let identity = WalIdentity::new(
+            config.database_uuid,
+            config.tenant_id,
+            config.shard_id,
+            config.shard_epoch,
+        );
+        let commit_lsn = Lsn::new(5);
+        let leaf_page_id = PageId::new(FIRST_DATA_PAGE + 20);
+        let internal_page_id = PageId::new(FIRST_DATA_PAGE + 21);
+        let overflow_page_id = PageId::new(FIRST_DATA_PAGE + 22);
+        let superblock = BlinkSuperblock::new(&config, leaf_page_id);
+        let commits = [WalCommit {
+            batch_id: 1,
+            commit_lsn,
+            pages: vec![
+                WalPageImage {
+                    page_id: leaf_page_id,
+                    image: encode_blink_page(
+                        leaf_page_id,
+                        &BlinkPage::Leaf {
+                            lsn: commit_lsn,
+                            high_key: None,
+                            right_sibling: None,
+                            entries: Vec::new(),
+                        },
+                    )
+                    .unwrap(),
+                },
+                WalPageImage {
+                    page_id: internal_page_id,
+                    image: encode_blink_page(
+                        internal_page_id,
+                        &BlinkPage::Internal {
+                            lsn: commit_lsn,
+                            level: 1,
+                            high_key: None,
+                            right_sibling: None,
+                            leftmost_child: leaf_page_id,
+                            entries: vec![layout_test_internal_entry(1)],
+                        },
+                    )
+                    .unwrap(),
+                },
+                WalPageImage {
+                    page_id: overflow_page_id,
+                    image: encode_blink_page(
+                        overflow_page_id,
+                        &BlinkPage::Overflow {
+                            lsn: commit_lsn,
+                            next: None,
+                            total_length: 16,
+                            chunk: vec![0x61; 16],
+                        },
+                    )
+                    .unwrap(),
+                },
+                WalPageImage {
+                    page_id: PageId::new(1),
+                    image: encode_blink_superblock(&superblock).unwrap(),
+                },
+            ],
+        }];
+
+        let mut direct_wal = WalLog::open_with_page_image_format(
+            MemoryFile::default(),
+            identity.clone(),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        let direct_reports = direct_wal.append_group(&commits, None).unwrap();
+        let direct_next_lsn = direct_wal.next_lsn();
+        let direct_next_batch_id = direct_wal.next_batch_id();
+        let direct_bytes = direct_wal.into_file().0;
+
+        let mut reference_wal = WalLog::open_with_page_image_format(
+            MemoryFile::default(),
+            identity,
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        let mut injector = NoopWalInjector;
+        let reference_reports = reference_wal
+            .append_group(&commits, Some(&mut injector))
+            .unwrap();
+        assert_eq!(direct_reports, reference_reports);
+        assert_eq!(direct_next_lsn, reference_wal.next_lsn());
+        assert_eq!(direct_next_batch_id, reference_wal.next_batch_id());
+        assert_eq!(direct_bytes, reference_wal.into_file().0);
+    }
+
+    #[test]
     fn serial_insert_reopen_and_checker() {
         let config = DatabaseConfig::default();
         let mut store = BlinkStore::<MemoryFile, MemoryFile>::open_with_wal(
