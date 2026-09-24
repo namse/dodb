@@ -67,6 +67,7 @@ pub struct DecodedPage {
 /// The checksum covers all 4096 bytes. The checksum field at bytes 28..32 is
 /// zeroed while calculating CRC32C, then filled with the result.
 pub fn encode_page(header: PageHeader, body: &[u8]) -> Result<[u8; PAGE_SIZE]> {
+    validate_encoded_page_header(header)?;
     if body.len() > PAGE_SIZE - PAGE_HEADER_SIZE {
         return Err(Error::invalid_input(format!(
             "page body is {} bytes, maximum is {}",
@@ -82,12 +83,7 @@ pub fn encode_page(header: PageHeader, body: &[u8]) -> Result<[u8; PAGE_SIZE]> {
 }
 
 pub(crate) fn finalize_encoded_page(header: PageHeader, page: &mut [u8; PAGE_SIZE]) -> Result<()> {
-    if header.format_version != PAGE_FORMAT_VERSION {
-        return Err(Error::unsupported_format(format!(
-            "cannot encode page version {}",
-            header.format_version
-        )));
-    }
+    validate_encoded_page_header(header)?;
     page[0..4].copy_from_slice(&PAGE_MAGIC);
     page[4..6].copy_from_slice(&header.format_version.to_le_bytes());
     page[6] = header.page_type as u8;
@@ -98,6 +94,16 @@ pub(crate) fn finalize_encoded_page(header: PageHeader, page: &mut [u8; PAGE_SIZ
     page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
     let checksum = crc32c::crc32c(page);
     page[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+    Ok(())
+}
+
+fn validate_encoded_page_header(header: PageHeader) -> Result<()> {
+    if header.format_version != PAGE_FORMAT_VERSION {
+        return Err(Error::unsupported_format(format!(
+            "cannot encode page version {}",
+            header.format_version
+        )));
+    }
     Ok(())
 }
 
@@ -219,6 +225,17 @@ mod tests {
             encode_page(header, &body).unwrap(),
             legacy_encode_page(header, &body)
         );
+    }
+
+    #[test]
+    fn generic_encode_page_preserves_header_validation_order() {
+        let mut header = PageHeader::new(PageType::Leaf, PageId::new(7), Lsn::new(42));
+        header.format_version = PAGE_FORMAT_VERSION + 1;
+        let oversized_body = vec![0; PAGE_SIZE];
+        assert!(matches!(
+            encode_page(header, &oversized_body),
+            Err(Error::UnsupportedFormat(_))
+        ));
     }
 
     #[test]
