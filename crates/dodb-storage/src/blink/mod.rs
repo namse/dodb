@@ -2002,7 +2002,11 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .saturating_add(elapsed_nanos(wal_assembly_started));
         let delta = working.into_delta();
         if let Some(wal) = self.wal.as_mut() {
-            let reports = match wal.append_group(&wal_commits, self.fault_injector.as_deref_mut()) {
+            // Each WAL image above comes from this execution's successful
+            // encode_blink_page or encode_blink_superblock call in this process.
+            let reports = match wal
+                .append_group_trusted_internal(&wal_commits, self.fault_injector.as_deref_mut())
+            {
                 Ok(reports) => reports,
                 Err(error) => {
                     self.broken = Some(error.to_string());
@@ -6532,6 +6536,141 @@ mod tests {
         let mut bad_checksum = image;
         bad_checksum[100] ^= 1;
         assert!(decode_blink_page(&bad_checksum, page_id).is_err());
+    }
+
+    #[test]
+    fn public_wal_append_rejects_malformed_blink_images() {
+        let config = DatabaseConfig::default();
+        let identity = WalIdentity::new(
+            config.database_uuid,
+            config.tenant_id,
+            config.shard_id,
+            config.shard_epoch,
+        );
+        let page_id = PageId::new(FIRST_DATA_PAGE);
+        let page_lsn = Lsn::new(2);
+        let page = BlinkPage::Leaf {
+            lsn: page_lsn,
+            high_key: None,
+            right_sibling: None,
+            entries: Vec::new(),
+        };
+        let valid_image = encode_blink_page(page_id, &page).unwrap();
+
+        let mut bad_checksum_image = valid_image;
+        bad_checksum_image[100] ^= 1;
+        let bad_checksum_commit = WalCommit {
+            batch_id: 1,
+            commit_lsn: page_lsn,
+            pages: vec![WalPageImage {
+                page_id,
+                image: bad_checksum_image,
+            }],
+        };
+
+        let wrong_page_id_commit = WalCommit {
+            batch_id: 1,
+            commit_lsn: page_lsn,
+            pages: vec![WalPageImage {
+                page_id: PageId::new(FIRST_DATA_PAGE + 1),
+                image: valid_image,
+            }],
+        };
+
+        let mut malformed_body_image = valid_image;
+        malformed_body_image[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4].copy_from_slice(b"NOPE");
+        let page_header = decode_page_at(&valid_image, Some(page_id)).unwrap().header;
+        finalize_encoded_page(page_header, &mut malformed_body_image).unwrap();
+        let malformed_body_commit = WalCommit {
+            batch_id: 1,
+            commit_lsn: page_lsn,
+            pages: vec![WalPageImage {
+                page_id,
+                image: malformed_body_image,
+            }],
+        };
+
+        for commit in [
+            bad_checksum_commit,
+            wrong_page_id_commit,
+            malformed_body_commit,
+        ] {
+            let mut wal = WalLog::open_with_page_image_format(
+                MemoryFile::default(),
+                identity.clone(),
+                WalPageImageFormat::ExperimentalBlink,
+            )
+            .unwrap();
+            assert!(wal.append_group(&[commit], None).is_err());
+            assert!(wal.committed_batches().is_empty());
+        }
+    }
+
+    #[test]
+    fn trusted_wal_images_match_strict_blink_encoding() {
+        let config = DatabaseConfig::default();
+        let identity = WalIdentity::new(
+            config.database_uuid,
+            config.tenant_id,
+            config.shard_id,
+            config.shard_epoch,
+        );
+        let commit_lsn = Lsn::new(3);
+        let page_id = PageId::new(FIRST_DATA_PAGE);
+        let page = BlinkPage::Leaf {
+            lsn: commit_lsn,
+            high_key: None,
+            right_sibling: None,
+            entries: Vec::new(),
+        };
+        let superblock = BlinkSuperblock::new(&config, page_id);
+        let commits = [WalCommit {
+            batch_id: 1,
+            commit_lsn,
+            pages: vec![
+                WalPageImage {
+                    page_id,
+                    image: encode_blink_page(page_id, &page).unwrap(),
+                },
+                WalPageImage {
+                    page_id: PageId::new(1),
+                    image: encode_blink_superblock(&superblock).unwrap(),
+                },
+            ],
+        }];
+
+        let mut strict_wal = WalLog::open_with_page_image_format(
+            MemoryFile::default(),
+            identity.clone(),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        let strict_reports = strict_wal.append_group(&commits, None).unwrap();
+        let strict_metrics = strict_wal.metrics().unwrap();
+        let strict_next_lsn = strict_wal.next_lsn();
+        let strict_next_batch_id = strict_wal.next_batch_id();
+        let strict_bytes = strict_wal.into_file().0;
+
+        let mut trusted_wal = WalLog::open_with_page_image_format(
+            MemoryFile::default(),
+            identity,
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        let trusted_reports = trusted_wal
+            .append_group_trusted_internal(&commits, None)
+            .unwrap();
+        let trusted_metrics = trusted_wal.metrics().unwrap();
+
+        assert_eq!(trusted_reports, strict_reports);
+        assert_eq!(trusted_wal.next_lsn(), strict_next_lsn);
+        assert_eq!(trusted_wal.next_batch_id(), strict_next_batch_id);
+        assert_eq!(
+            trusted_metrics.group_page_validations,
+            if cfg!(debug_assertions) { 2 } else { 0 }
+        );
+        assert_eq!(strict_metrics.group_page_validations, 2);
+        assert_eq!(trusted_wal.into_file().0, strict_bytes);
     }
 
     #[test]

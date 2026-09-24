@@ -47,6 +47,12 @@ pub enum WalPageImageFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageImageValidationMode {
+    Strict,
+    TrustedInternal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum WalRecordType {
     Init = 1,
@@ -554,7 +560,31 @@ impl<F: DurableFile> WalLog<F> {
     pub fn append_group(
         &mut self,
         commits: &[WalCommit],
+        injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Vec<WalAppendReport>> {
+        self.append_group_inner(commits, injector, PageImageValidationMode::Strict)
+    }
+
+    /// Appends page images produced moments earlier by this storage engine's
+    /// internal Blink page and superblock encoders in the same process. Never
+    /// use this path for caller-provided bytes. Fault-injected calls delegate
+    /// to the strict public path.
+    pub(crate) fn append_group_trusted_internal(
+        &mut self,
+        commits: &[WalCommit],
+        injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Vec<WalAppendReport>> {
+        if injector.is_some() {
+            return self.append_group(commits, injector);
+        }
+        self.append_group_inner(commits, None, PageImageValidationMode::TrustedInternal)
+    }
+
+    fn append_group_inner(
+        &mut self,
+        commits: &[WalCommit],
         mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+        validation_mode: PageImageValidationMode,
     ) -> Result<Vec<WalAppendReport>> {
         if commits.is_empty() {
             return Err(Error::invalid_input("a WAL group must contain a commit"));
@@ -566,7 +596,7 @@ impl<F: DurableFile> WalLog<F> {
             self.append_group_fault_injectable(commits, &mut injector)?
         } else {
             let encode_started = Instant::now();
-            let encoded = self.encode_group(commits)?;
+            let encoded = self.encode_group(commits, validation_mode)?;
             self.group_encode_nanos = self
                 .group_encode_nanos
                 .checked_add(elapsed_nanos(encode_started)?)
@@ -675,7 +705,11 @@ impl<F: DurableFile> WalLog<F> {
         Ok((reports, next_lsn, next_batch_id))
     }
 
-    fn encode_group(&self, commits: &[WalCommit]) -> Result<EncodedWalGroup> {
+    fn encode_group(
+        &self,
+        commits: &[WalCommit],
+        validation_mode: PageImageValidationMode,
+    ) -> Result<EncodedWalGroup> {
         let mut attribution = WalEncodeAttribution::default();
         let mut capacity = 0usize;
         for commit in commits {
@@ -743,8 +777,12 @@ impl<F: DurableFile> WalLog<F> {
                 validate_page_image_lsn(page, commit.commit_lsn)?;
                 attribution.group_page_lsn_validate_nanos +=
                     elapsed_nanos(page_lsn_validation_started)?;
-                let payload =
-                    encode_page_image_attributed(page, self.page_image_format, &mut attribution)?;
+                let payload = encode_page_image_attributed(
+                    page,
+                    self.page_image_format,
+                    validation_mode,
+                    &mut attribution,
+                )?;
                 let digest_copy_started = Instant::now();
                 digest_input.extend_from_slice(&payload);
                 attribution.group_digest_copy_nanos += elapsed_nanos(digest_copy_started)?;
@@ -1417,6 +1455,7 @@ fn encode_page_image(
 fn encode_page_image_attributed(
     page: &WalPageImage,
     page_image_format: WalPageImageFormat,
+    validation_mode: PageImageValidationMode,
     attribution: &mut WalEncodeAttribution,
 ) -> Result<Vec<u8>> {
     let materialize_started = Instant::now();
@@ -1424,10 +1463,12 @@ fn encode_page_image_attributed(
     payload.extend_from_slice(&page.page_id.get().to_le_bytes());
     payload.extend_from_slice(&page.image);
     attribution.group_page_image_materialize_nanos += elapsed_nanos(materialize_started)?;
-    let validation_started = Instant::now();
-    validate_page_image(page, page_image_format)?;
-    attribution.group_page_image_validate_nanos += elapsed_nanos(validation_started)?;
-    attribution.group_page_validations += 1;
+    if validation_mode == PageImageValidationMode::Strict || cfg!(debug_assertions) {
+        let validation_started = Instant::now();
+        validate_page_image(page, page_image_format)?;
+        attribution.group_page_image_validate_nanos += elapsed_nanos(validation_started)?;
+        attribution.group_page_validations += 1;
+    }
     Ok(payload)
 }
 
@@ -1666,6 +1707,16 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingInjector(Vec<String>);
+
+    impl FaultInjector for RecordingInjector {
+        fn hit(&mut self, point: &str) -> Result<()> {
+            self.0.push(point.to_owned());
+            Ok(())
+        }
+    }
+
     impl DurableFile for MemoryFile {
         fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
             let offset = usize::try_from(offset).unwrap();
@@ -1787,6 +1838,88 @@ mod tests {
         assert_eq!(fast_next_batch_id, injected_wal.next_batch_id);
         let injected_bytes = injected_wal.into_file().0;
         assert_eq!(fast_bytes, injected_bytes);
+    }
+
+    #[test]
+    fn trusted_internal_valid_images_are_byte_identical_to_strict_images() {
+        let commits = wal_commits(4, 2);
+        let mut strict_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        let strict_reports = strict_wal.append_group(&commits, None).unwrap();
+        let strict_next_lsn = strict_wal.next_lsn();
+        let strict_next_batch_id = strict_wal.next_batch_id();
+        let strict_bytes = strict_wal.into_file().0;
+
+        let mut trusted_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        let trusted_reports = trusted_wal
+            .append_group_trusted_internal(&commits, None)
+            .unwrap();
+        assert_eq!(trusted_reports, strict_reports);
+        assert_eq!(trusted_wal.next_lsn(), strict_next_lsn);
+        assert_eq!(trusted_wal.next_batch_id(), strict_next_batch_id);
+        assert_eq!(trusted_wal.into_file().0, strict_bytes);
+    }
+
+    #[test]
+    fn trusted_internal_fault_injection_delegates_to_the_strict_path() {
+        let commits = wal_commits(2, 1);
+        let mut strict_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        let mut strict_injector = RecordingInjector::default();
+        let strict_reports = strict_wal
+            .append_group(&commits, Some(&mut strict_injector))
+            .unwrap();
+
+        let mut trusted_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        let mut trusted_injector = RecordingInjector::default();
+        let trusted_reports = trusted_wal
+            .append_group_trusted_internal(&commits, Some(&mut trusted_injector))
+            .unwrap();
+
+        assert_eq!(trusted_reports, strict_reports);
+        assert_eq!(trusted_injector.0, strict_injector.0);
+        assert!(
+            trusted_injector
+                .0
+                .iter()
+                .any(|point| point == "before_wal_append")
+        );
+        assert!(
+            trusted_injector
+                .0
+                .iter()
+                .any(|point| point == "after_group_records_written")
+        );
+        assert!(
+            trusted_injector
+                .0
+                .iter()
+                .any(|point| point == "before_wal_sync")
+        );
+        assert!(
+            trusted_injector
+                .0
+                .iter()
+                .any(|point| point == "during_wal_sync")
+        );
+        assert!(
+            trusted_injector
+                .0
+                .iter()
+                .any(|point| point == "after_wal_sync")
+        );
+        assert_eq!(trusted_wal.into_file().0, strict_wal.into_file().0);
+    }
+
+    #[test]
+    fn trusted_internal_fault_injection_still_rejects_invalid_images() {
+        let mut malformed_commit = wal_commits(1, 1);
+        malformed_commit[0].pages[0].image[100] ^= 1;
+        let mut wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        let mut injector = NoopInjector;
+        assert!(
+            wal.append_group_trusted_internal(&malformed_commit, Some(&mut injector))
+                .is_err()
+        );
+        assert!(wal.committed_batches().is_empty());
     }
 
     #[test]
