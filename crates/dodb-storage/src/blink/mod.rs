@@ -26,7 +26,11 @@ use crate::btree::{
 };
 use crate::durable_file::{DurableFile, ProductionFile};
 use crate::fault::FaultInjector;
-use crate::page::{PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageType, decode_page_at, encode_page};
+#[cfg(test)]
+use crate::page::encode_page;
+use crate::page::{
+    PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageType, decode_page_at, finalize_encoded_page,
+};
 use crate::wal::{
     CommittedWalBatch, WalCommit, WalIdentity, WalLog, WalMetrics, WalPageImage, WalPageImageFormat,
 };
@@ -4237,6 +4241,49 @@ fn split_internal<S: BlinkMutationState>(
 }
 
 fn encode_blink_page(page_id: PageId, page: &BlinkPage) -> Result<[u8; PAGE_SIZE]> {
+    let mut encoded = [0u8; PAGE_SIZE];
+    {
+        let body = &mut encoded[PAGE_HEADER_SIZE..];
+        match page {
+            BlinkPage::Leaf {
+                high_key,
+                right_sibling,
+                entries,
+                ..
+            } => encode_leaf_body_into(body, high_key.as_deref(), *right_sibling, entries)?,
+            BlinkPage::Internal {
+                level,
+                high_key,
+                right_sibling,
+                leftmost_child,
+                entries,
+                ..
+            } => encode_internal_body_into(
+                body,
+                *level,
+                high_key.as_deref(),
+                *right_sibling,
+                *leftmost_child,
+                entries,
+            )?,
+            BlinkPage::Overflow {
+                next,
+                total_length,
+                chunk,
+                ..
+            } => encode_overflow_body_into(body, *next, *total_length, chunk)?,
+            BlinkPage::Free { next, .. } => encode_free_body_into(body, *next)?,
+        }
+    }
+    finalize_encoded_page(
+        PageHeader::new(page.page_type(), page_id, page.lsn()),
+        &mut encoded,
+    )?;
+    Ok(encoded)
+}
+
+#[cfg(test)]
+fn encode_blink_page_reference(page_id: PageId, page: &BlinkPage) -> Result<[u8; PAGE_SIZE]> {
     let body = match page {
         BlinkPage::Leaf {
             high_key,
@@ -4290,6 +4337,165 @@ pub(crate) fn validate_blink_page_image(bytes: &[u8], expected_page_id: PageId) 
     decode_blink_page(bytes, expected_page_id).map(|_| ())
 }
 
+fn encode_leaf_body_into(
+    body: &mut [u8],
+    high_key: Option<&[u8]>,
+    right_sibling: Option<PageId>,
+    entries: &[LeafEntry],
+) -> Result<()> {
+    debug_assert_eq!(body.len(), BODY_SIZE);
+    let layout = leaf_body_layout(entries, high_key)?;
+    body[0..4].copy_from_slice(&LEAF_MAGIC);
+    body[4..6].copy_from_slice(&BODY_VERSION.to_le_bytes());
+    body[8..10].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+    body[10..12].copy_from_slice(&(layout.slot_end as u16).to_le_bytes());
+    body[12..14].copy_from_slice(&(layout.records_start as u16).to_le_bytes());
+    let high_offset = if high_key.is_some() {
+        layout.slot_end
+    } else {
+        0
+    };
+    body[14..16].copy_from_slice(&(high_offset as u16).to_le_bytes());
+    body[16..18].copy_from_slice(&(high_key.map_or(0, <[u8]>::len) as u16).to_le_bytes());
+    body[20..28].copy_from_slice(&encode_page_id(right_sibling).to_le_bytes());
+    if let Some(high_key) = high_key {
+        body[layout.slot_end..layout.records_start].copy_from_slice(high_key);
+    }
+
+    let mut record_offset = BODY_SIZE;
+    for entry_index in (0..entries.len()).rev() {
+        let entry = &entries[entry_index];
+        let record_length = leaf_record_encoded_len(entry)?;
+        record_offset = record_offset
+            .checked_sub(record_length)
+            .ok_or_else(|| Error::invalid_input("Blink leaf records exceed page"))?;
+        if record_offset < layout.records_start {
+            return Err(Error::invalid_input("Blink leaf records exceed page"));
+        }
+        encode_leaf_record_into(
+            &mut body[record_offset..record_offset + record_length],
+            entry,
+        )?;
+        let slot = LEAF_HEADER_SIZE + entry_index * SLOT_SIZE;
+        body[slot..slot + 2].copy_from_slice(&(record_offset as u16).to_le_bytes());
+        body[slot + 2..slot + 4].copy_from_slice(&(record_length as u16).to_le_bytes());
+        body[slot + 4..slot + 6].copy_from_slice(&(entry.key.len() as u16).to_le_bytes());
+    }
+    body[18..20].copy_from_slice(&(layout.records_end as u16).to_le_bytes());
+    Ok(())
+}
+
+fn encode_leaf_record_into(target: &mut [u8], entry: &LeafEntry) -> Result<()> {
+    validate_encoded_key(&entry.key)?;
+    let (flags, value_length, aux, inline) = match &entry.value {
+        None => (0u8, 0u64, NULL_PAGE_ID, &[][..]),
+        Some(BlinkValueRef::Inline(value)) => (1u8, value.len() as u64, 0, value.as_slice()),
+        Some(BlinkValueRef::Overflow { head, length }) => (2u8, *length, head.get(), &[][..]),
+    };
+    let record_length = leaf_record_encoded_len(entry)?;
+    if target.len() != record_length {
+        return Err(Error::invalid_input(
+            "Blink leaf record target has invalid size",
+        ));
+    }
+    target[0..8].copy_from_slice(&entry.revision.get().to_le_bytes());
+    target[8..16].copy_from_slice(&value_length.to_le_bytes());
+    target[16..24].copy_from_slice(&aux.to_le_bytes());
+    target[24] = flags;
+    target[26..28].copy_from_slice(&(entry.key.len() as u16).to_le_bytes());
+    target[LEAF_RECORD_HEADER_SIZE..LEAF_RECORD_HEADER_SIZE + entry.key.len()]
+        .copy_from_slice(&entry.key);
+    target[LEAF_RECORD_HEADER_SIZE + entry.key.len()..].copy_from_slice(inline);
+    Ok(())
+}
+
+fn encode_internal_body_into(
+    body: &mut [u8],
+    level: u16,
+    high_key: Option<&[u8]>,
+    right_sibling: Option<PageId>,
+    leftmost_child: PageId,
+    entries: &[InternalEntry],
+) -> Result<()> {
+    debug_assert_eq!(body.len(), BODY_SIZE);
+    let layout = internal_body_layout(leftmost_child, entries, high_key)?;
+    body[0..4].copy_from_slice(&INTERNAL_MAGIC);
+    body[4..6].copy_from_slice(&BODY_VERSION.to_le_bytes());
+    body[8..10].copy_from_slice(&level.to_le_bytes());
+    body[10..12].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+    body[12..14].copy_from_slice(&(layout.slot_end as u16).to_le_bytes());
+    body[14..16].copy_from_slice(&(layout.records_start as u16).to_le_bytes());
+    let high_offset = if high_key.is_some() {
+        layout.slot_end
+    } else {
+        0
+    };
+    body[16..18].copy_from_slice(&(high_offset as u16).to_le_bytes());
+    body[18..20].copy_from_slice(&(high_key.map_or(0, <[u8]>::len) as u16).to_le_bytes());
+    body[20..28].copy_from_slice(&encode_page_id(right_sibling).to_le_bytes());
+    body[28..36].copy_from_slice(&leftmost_child.get().to_le_bytes());
+    if let Some(high_key) = high_key {
+        body[layout.slot_end..layout.records_start].copy_from_slice(high_key);
+    }
+
+    let mut record_offset = BODY_SIZE;
+    for entry_index in (0..entries.len()).rev() {
+        let entry = &entries[entry_index];
+        if entry.key.len() > u16::MAX as usize {
+            return Err(Error::invalid_input("Blink separator is too large"));
+        }
+        let record_length = INTERNAL_RECORD_HEADER_SIZE
+            .checked_add(entry.key.len())
+            .ok_or_else(|| Error::invalid_input("Blink internal record size overflow"))?;
+        record_offset = record_offset
+            .checked_sub(record_length)
+            .ok_or_else(|| Error::invalid_input("Blink internal records exceed page"))?;
+        if record_offset < layout.records_start {
+            return Err(Error::invalid_input("Blink internal records exceed page"));
+        }
+        body[record_offset..record_offset + 8]
+            .copy_from_slice(&entry.right_child.get().to_le_bytes());
+        body[record_offset + 12..record_offset + 14]
+            .copy_from_slice(&(entry.key.len() as u16).to_le_bytes());
+        body[record_offset + INTERNAL_RECORD_HEADER_SIZE..record_offset + record_length]
+            .copy_from_slice(&entry.key);
+        let slot = INTERNAL_HEADER_SIZE + entry_index * SLOT_SIZE;
+        body[slot..slot + 2].copy_from_slice(&(record_offset as u16).to_le_bytes());
+        body[slot + 2..slot + 4].copy_from_slice(&(record_length as u16).to_le_bytes());
+        body[slot + 4..slot + 6].copy_from_slice(&(entry.key.len() as u16).to_le_bytes());
+    }
+    body[36..38].copy_from_slice(&(layout.records_end as u16).to_le_bytes());
+    Ok(())
+}
+
+fn encode_overflow_body_into(
+    body: &mut [u8],
+    next: Option<PageId>,
+    total_length: u64,
+    chunk: &[u8],
+) -> Result<()> {
+    debug_assert_eq!(body.len(), BODY_SIZE);
+    if chunk.len() > BODY_SIZE - OVERFLOW_HEADER_SIZE {
+        return Err(Error::invalid_input("Blink overflow chunk is too large"));
+    }
+    body[0..4].copy_from_slice(&OVERFLOW_MAGIC);
+    body[4..6].copy_from_slice(&BODY_VERSION.to_le_bytes());
+    body[8..16].copy_from_slice(&encode_page_id(next).to_le_bytes());
+    body[16..24].copy_from_slice(&total_length.to_le_bytes());
+    body[24..28].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+    body[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
+    Ok(())
+}
+
+fn encode_free_body_into(body: &mut [u8], next: Option<PageId>) -> Result<()> {
+    debug_assert_eq!(body.len(), BODY_SIZE);
+    body[0..4].copy_from_slice(&FREE_MAGIC);
+    body[4..6].copy_from_slice(&BODY_VERSION.to_le_bytes());
+    body[8..16].copy_from_slice(&encode_page_id(next).to_le_bytes());
+    Ok(())
+}
+
+#[cfg(test)]
 fn encode_leaf_body(
     high_key: Option<&[u8]>,
     right_sibling: Option<PageId>,
@@ -4328,6 +4534,7 @@ fn encode_leaf_body(
     encode_leaf_records(&mut body, slot_end, records_start, entries)
 }
 
+#[cfg(test)]
 fn encode_leaf_records(
     body: &mut [u8],
     slot_end: usize,
@@ -4358,6 +4565,7 @@ fn encode_leaf_records(
     Ok(body.to_vec())
 }
 
+#[cfg(test)]
 fn encode_leaf_record(entry: &LeafEntry) -> Result<Vec<u8>> {
     validate_encoded_key(&entry.key)?;
     let (flags, value_length, aux, inline) = match &entry.value {
@@ -4381,6 +4589,7 @@ fn encode_leaf_record(entry: &LeafEntry) -> Result<Vec<u8>> {
     Ok(record)
 }
 
+#[cfg(test)]
 fn encode_internal_body(
     level: u16,
     high_key: Option<&[u8]>,
@@ -4454,6 +4663,7 @@ fn encode_internal_body(
     Ok(body)
 }
 
+#[cfg(test)]
 fn encode_overflow_body(next: Option<PageId>, total_length: u64, chunk: &[u8]) -> Result<Vec<u8>> {
     if chunk.len() > BODY_SIZE - OVERFLOW_HEADER_SIZE {
         return Err(Error::invalid_input("Blink overflow chunk is too large"));
@@ -4468,6 +4678,7 @@ fn encode_overflow_body(next: Option<PageId>, total_length: u64, chunk: &[u8]) -
     Ok(body)
 }
 
+#[cfg(test)]
 fn encode_free_body(next: Option<PageId>) -> Result<Vec<u8>> {
     let mut body = vec![0u8; BODY_SIZE];
     body[0..4].copy_from_slice(&FREE_MAGIC);
@@ -5511,6 +5722,235 @@ mod tests {
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         *state
+    }
+
+    fn differential_key(index: u64) -> Vec<u8> {
+        DocumentKey::new(b"direct-encoding".to_vec(), index.to_be_bytes().to_vec()).encode()
+    }
+
+    fn assert_direct_reference_round_trip(
+        page_id: PageId,
+        page: BlinkPage,
+        seed: u64,
+        iteration: usize,
+    ) {
+        let direct = encode_blink_page(page_id, &page).unwrap_or_else(|error| {
+            panic!(
+                "seed={seed:#x} iteration={iteration} page_type={:?} entry_count={} direct encode failed: {error}",
+                page.page_type(),
+                blink_page_entry_count(&page)
+            )
+        });
+        let reference = encode_blink_page_reference(page_id, &page).unwrap_or_else(|error| {
+            panic!(
+                "seed={seed:#x} iteration={iteration} page_type={:?} entry_count={} reference encode failed: {error}",
+                page.page_type(),
+                blink_page_entry_count(&page)
+            )
+        });
+        assert_eq!(
+            direct,
+            reference,
+            "seed={seed:#x} iteration={iteration} page_type={:?} entry_count={}",
+            page.page_type(),
+            blink_page_entry_count(&page)
+        );
+        assert_eq!(
+            decode_blink_page(&direct, page_id).unwrap(),
+            page,
+            "seed={seed:#x} iteration={iteration} page_type={:?} entry_count={} round trip",
+            page.page_type(),
+            blink_page_entry_count(&page)
+        );
+    }
+
+    fn blink_page_entry_count(page: &BlinkPage) -> usize {
+        match page {
+            BlinkPage::Leaf { entries, .. } => entries.len(),
+            BlinkPage::Internal { entries, .. } => entries.len(),
+            BlinkPage::Overflow { .. } | BlinkPage::Free { .. } => 0,
+        }
+    }
+
+    #[test]
+    fn direct_blink_encoding_matches_reference_for_required_shapes() {
+        let page_id = PageId::new(FIRST_DATA_PAGE);
+        let lsn = Lsn::new(42);
+        let sibling = Some(PageId::new(FIRST_DATA_PAGE + 1));
+        let mut cases = vec![
+            BlinkPage::Leaf {
+                lsn,
+                high_key: None,
+                right_sibling: None,
+                entries: Vec::new(),
+            },
+            BlinkPage::Leaf {
+                lsn,
+                high_key: None,
+                right_sibling: None,
+                entries: vec![layout_test_leaf_entry(1, 32)],
+            },
+            BlinkPage::Leaf {
+                lsn,
+                high_key: Some(differential_key(80)),
+                right_sibling: sibling,
+                entries: (0..48)
+                    .map(|entry_index| layout_test_leaf_entry(entry_index, 12))
+                    .collect(),
+            },
+            BlinkPage::Leaf {
+                lsn,
+                high_key: None,
+                right_sibling: None,
+                entries: vec![LeafEntry {
+                    key: differential_key(1),
+                    revision: Revision::new(2),
+                    value: None,
+                }],
+            },
+            BlinkPage::Leaf {
+                lsn,
+                high_key: None,
+                right_sibling: None,
+                entries: vec![LeafEntry {
+                    key: differential_key(1),
+                    revision: Revision::new(3),
+                    value: Some(BlinkValueRef::Overflow {
+                        head: PageId::new(FIRST_DATA_PAGE + 9),
+                        length: 4096,
+                    }),
+                }],
+            },
+            BlinkPage::Leaf {
+                lsn,
+                high_key: Some(differential_key(32)),
+                right_sibling: sibling,
+                entries: (0..9)
+                    .map(|entry_index| layout_test_leaf_entry(entry_index, 330))
+                    .collect(),
+            },
+            BlinkPage::Internal {
+                lsn,
+                level: 1,
+                high_key: None,
+                right_sibling: None,
+                leftmost_child: page_id,
+                entries: vec![layout_test_internal_entry(1)],
+            },
+            BlinkPage::Internal {
+                lsn,
+                level: 7,
+                high_key: Some(differential_key(80)),
+                right_sibling: sibling,
+                leftmost_child: page_id,
+                entries: (0..60).map(layout_test_internal_entry).collect(),
+            },
+            BlinkPage::Internal {
+                lsn,
+                level: 3,
+                high_key: Some(differential_key(20)),
+                right_sibling: sibling,
+                leftmost_child: page_id,
+                entries: (0u64..42)
+                    .map(|entry_index| InternalEntry {
+                        key: DocumentKey::new(vec![b'k'; 48], entry_index.to_be_bytes().to_vec())
+                            .encode(),
+                        right_child: PageId::new(FIRST_DATA_PAGE + entry_index + 1),
+                    })
+                    .collect(),
+            },
+            BlinkPage::Overflow {
+                lsn,
+                next: sibling,
+                total_length: (BODY_SIZE - OVERFLOW_HEADER_SIZE) as u64,
+                chunk: vec![0xa7; BODY_SIZE - OVERFLOW_HEADER_SIZE],
+            },
+            BlinkPage::Free { lsn, next: sibling },
+        ];
+        for (iteration, page) in cases.drain(..).enumerate() {
+            assert_direct_reference_round_trip(page_id, page, 0, iteration);
+        }
+    }
+
+    #[test]
+    fn randomized_direct_blink_encoding_matches_reference() {
+        let seed = 0x91d4_2c73_5a06_b8ef;
+        let mut random_state = seed;
+        let page_id = PageId::new(FIRST_DATA_PAGE + 40);
+        for iteration in 0..800 {
+            let lsn = Lsn::new(next_layout_random(&mut random_state));
+            let page = match next_layout_random(&mut random_state) % 4 {
+                0 => {
+                    let entry_count = (next_layout_random(&mut random_state) % 20) as usize;
+                    let entries = (0..entry_count)
+                        .map(|entry_index| {
+                            let random_value = next_layout_random(&mut random_state);
+                            LeafEntry {
+                                key: differential_key(entry_index as u64),
+                                revision: Revision::new(random_value.max(1)),
+                                value: match random_value % 3 {
+                                    0 => None,
+                                    1 => Some(BlinkValueRef::Inline(vec![
+                                        random_value as u8;
+                                        random_value as usize
+                                            % 48
+                                    ])),
+                                    _ => Some(BlinkValueRef::Overflow {
+                                        head: PageId::new(FIRST_DATA_PAGE + random_value % 200),
+                                        length: random_value.max(1),
+                                    }),
+                                },
+                            }
+                        })
+                        .collect();
+                    let high_key = (next_layout_random(&mut random_state) & 1 == 0)
+                        .then(|| differential_key(entry_count as u64 + 10));
+                    BlinkPage::Leaf {
+                        lsn,
+                        high_key,
+                        right_sibling: (next_layout_random(&mut random_state) & 1 == 0)
+                            .then_some(PageId::new(FIRST_DATA_PAGE + 41)),
+                        entries,
+                    }
+                }
+                1 => {
+                    let entry_count = (next_layout_random(&mut random_state) % 50) as usize;
+                    let entries = (0..entry_count)
+                        .map(|entry_index| InternalEntry {
+                            key: differential_key(entry_index as u64),
+                            right_child: PageId::new(FIRST_DATA_PAGE + entry_index as u64 + 1),
+                        })
+                        .collect();
+                    let high_key = (next_layout_random(&mut random_state) & 1 == 0)
+                        .then(|| differential_key(entry_count as u64 + 10));
+                    BlinkPage::Internal {
+                        lsn,
+                        level: (next_layout_random(&mut random_state) % 20 + 1) as u16,
+                        high_key,
+                        right_sibling: (next_layout_random(&mut random_state) & 1 == 0)
+                            .then_some(PageId::new(FIRST_DATA_PAGE + 41)),
+                        leftmost_child: PageId::new(FIRST_DATA_PAGE),
+                        entries,
+                    }
+                }
+                2 => {
+                    let chunk_length = (next_layout_random(&mut random_state)
+                        % (BODY_SIZE - OVERFLOW_HEADER_SIZE + 1) as u64)
+                        as usize;
+                    BlinkPage::Overflow {
+                        lsn,
+                        next: Some(PageId::new(FIRST_DATA_PAGE + 41)),
+                        total_length: chunk_length as u64,
+                        chunk: vec![next_layout_random(&mut random_state) as u8; chunk_length],
+                    }
+                }
+                _ => BlinkPage::Free {
+                    lsn,
+                    next: Some(PageId::new(FIRST_DATA_PAGE + 41)),
+                },
+            };
+            assert_direct_reference_round_trip(page_id, page, seed, iteration);
+        }
     }
 
     #[test]
