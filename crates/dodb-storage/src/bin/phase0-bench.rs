@@ -1414,6 +1414,22 @@ struct MetricDelta {
     wal_append_nanos: u64,
     wal_sync_nanos: u64,
     wal_group_encode_nanos: u64,
+    wal_group_page_lsn_validate_nanos: u64,
+    wal_group_page_image_materialize_nanos: u64,
+    wal_group_page_image_validate_nanos: u64,
+    wal_group_digest_copy_nanos: u64,
+    wal_group_page_payload_crc_nanos: u64,
+    wal_group_page_header_crc_nanos: u64,
+    wal_group_page_frame_materialize_nanos: u64,
+    wal_group_page_frame_append_nanos: u64,
+    wal_group_commit_digest_crc_nanos: u64,
+    wal_group_commit_payload_crc_nanos: u64,
+    wal_group_commit_header_crc_nanos: u64,
+    wal_group_commit_frame_materialize_nanos: u64,
+    wal_group_commit_frame_append_nanos: u64,
+    wal_group_page_frames: u64,
+    wal_group_commit_frames: u64,
+    wal_group_page_validations: u64,
     wal_group_write_nanos: u64,
     wal_physical_write_calls: u64,
     leaf_splits: u64,
@@ -1564,6 +1580,70 @@ impl MetricDelta {
             wal_group_encode_nanos: subtraction(
                 wal_after.group_encode_nanos,
                 wal_before.group_encode_nanos,
+            ),
+            wal_group_page_lsn_validate_nanos: subtraction(
+                wal_after.group_page_lsn_validate_nanos,
+                wal_before.group_page_lsn_validate_nanos,
+            ),
+            wal_group_page_image_materialize_nanos: subtraction(
+                wal_after.group_page_image_materialize_nanos,
+                wal_before.group_page_image_materialize_nanos,
+            ),
+            wal_group_page_image_validate_nanos: subtraction(
+                wal_after.group_page_image_validate_nanos,
+                wal_before.group_page_image_validate_nanos,
+            ),
+            wal_group_digest_copy_nanos: subtraction(
+                wal_after.group_digest_copy_nanos,
+                wal_before.group_digest_copy_nanos,
+            ),
+            wal_group_page_payload_crc_nanos: subtraction(
+                wal_after.group_page_payload_crc_nanos,
+                wal_before.group_page_payload_crc_nanos,
+            ),
+            wal_group_page_header_crc_nanos: subtraction(
+                wal_after.group_page_header_crc_nanos,
+                wal_before.group_page_header_crc_nanos,
+            ),
+            wal_group_page_frame_materialize_nanos: subtraction(
+                wal_after.group_page_frame_materialize_nanos,
+                wal_before.group_page_frame_materialize_nanos,
+            ),
+            wal_group_page_frame_append_nanos: subtraction(
+                wal_after.group_page_frame_append_nanos,
+                wal_before.group_page_frame_append_nanos,
+            ),
+            wal_group_commit_digest_crc_nanos: subtraction(
+                wal_after.group_commit_digest_crc_nanos,
+                wal_before.group_commit_digest_crc_nanos,
+            ),
+            wal_group_commit_payload_crc_nanos: subtraction(
+                wal_after.group_commit_payload_crc_nanos,
+                wal_before.group_commit_payload_crc_nanos,
+            ),
+            wal_group_commit_header_crc_nanos: subtraction(
+                wal_after.group_commit_header_crc_nanos,
+                wal_before.group_commit_header_crc_nanos,
+            ),
+            wal_group_commit_frame_materialize_nanos: subtraction(
+                wal_after.group_commit_frame_materialize_nanos,
+                wal_before.group_commit_frame_materialize_nanos,
+            ),
+            wal_group_commit_frame_append_nanos: subtraction(
+                wal_after.group_commit_frame_append_nanos,
+                wal_before.group_commit_frame_append_nanos,
+            ),
+            wal_group_page_frames: subtraction(
+                wal_after.group_page_frames,
+                wal_before.group_page_frames,
+            ),
+            wal_group_commit_frames: subtraction(
+                wal_after.group_commit_frames,
+                wal_before.group_commit_frames,
+            ),
+            wal_group_page_validations: subtraction(
+                wal_after.group_page_validations,
+                wal_before.group_page_validations,
             ),
             wal_group_write_nanos: subtraction(
                 wal_after.group_write_nanos,
@@ -2602,6 +2682,67 @@ fn build_record(
     json.u64("wal_append_nanos_total", delta.wal_append_nanos);
     json.u64("wal_sync_nanos_total", delta.wal_sync_nanos);
     json.u64("wal_group_encode_nanos_total", delta.wal_group_encode_nanos);
+    json.u64(
+        "wal_group_page_lsn_validate_nanos_total",
+        delta.wal_group_page_lsn_validate_nanos,
+    );
+    json.u64(
+        "wal_group_page_image_materialize_nanos_total",
+        delta.wal_group_page_image_materialize_nanos,
+    );
+    json.u64(
+        "wal_group_page_image_validate_nanos_total",
+        delta.wal_group_page_image_validate_nanos,
+    );
+    json.u64(
+        "wal_group_digest_copy_nanos_total",
+        delta.wal_group_digest_copy_nanos,
+    );
+    json.u64(
+        "wal_group_page_payload_crc_nanos_total",
+        delta.wal_group_page_payload_crc_nanos,
+    );
+    json.u64(
+        "wal_group_page_header_crc_nanos_total",
+        delta.wal_group_page_header_crc_nanos,
+    );
+    json.u64(
+        "wal_group_page_frame_materialize_nanos_total",
+        delta.wal_group_page_frame_materialize_nanos,
+    );
+    json.u64(
+        "wal_group_page_frame_append_nanos_total",
+        delta.wal_group_page_frame_append_nanos,
+    );
+    json.u64(
+        "wal_group_commit_digest_crc_nanos_total",
+        delta.wal_group_commit_digest_crc_nanos,
+    );
+    json.u64(
+        "wal_group_commit_payload_crc_nanos_total",
+        delta.wal_group_commit_payload_crc_nanos,
+    );
+    json.u64(
+        "wal_group_commit_header_crc_nanos_total",
+        delta.wal_group_commit_header_crc_nanos,
+    );
+    json.u64(
+        "wal_group_commit_frame_materialize_nanos_total",
+        delta.wal_group_commit_frame_materialize_nanos,
+    );
+    json.u64(
+        "wal_group_commit_frame_append_nanos_total",
+        delta.wal_group_commit_frame_append_nanos,
+    );
+    json.u64("wal_group_page_frames_delta", delta.wal_group_page_frames);
+    json.u64(
+        "wal_group_commit_frames_delta",
+        delta.wal_group_commit_frames,
+    );
+    json.u64(
+        "wal_group_page_validations_delta",
+        delta.wal_group_page_validations,
+    );
     json.u64("wal_group_write_nanos_total", delta.wal_group_write_nanos);
     json.u64(
         "wal_physical_write_calls_delta",

@@ -137,6 +137,22 @@ pub struct WalMetrics {
     pub append_nanos: u64,
     pub sync_nanos: u64,
     pub group_encode_nanos: u64,
+    pub group_page_lsn_validate_nanos: u64,
+    pub group_page_image_materialize_nanos: u64,
+    pub group_page_image_validate_nanos: u64,
+    pub group_digest_copy_nanos: u64,
+    pub group_page_payload_crc_nanos: u64,
+    pub group_page_header_crc_nanos: u64,
+    pub group_page_frame_materialize_nanos: u64,
+    pub group_page_frame_append_nanos: u64,
+    pub group_commit_digest_crc_nanos: u64,
+    pub group_commit_payload_crc_nanos: u64,
+    pub group_commit_header_crc_nanos: u64,
+    pub group_commit_frame_materialize_nanos: u64,
+    pub group_commit_frame_append_nanos: u64,
+    pub group_page_frames: u64,
+    pub group_commit_frames: u64,
+    pub group_page_validations: u64,
     pub group_write_nanos: u64,
     pub physical_write_calls: u64,
 }
@@ -164,6 +180,27 @@ struct EncodedWalGroup {
     reports: Vec<WalAppendReport>,
     next_lsn: Lsn,
     next_batch_id: u64,
+    attribution: WalEncodeAttribution,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WalEncodeAttribution {
+    group_page_lsn_validate_nanos: u64,
+    group_page_image_materialize_nanos: u64,
+    group_page_image_validate_nanos: u64,
+    group_digest_copy_nanos: u64,
+    group_page_payload_crc_nanos: u64,
+    group_page_header_crc_nanos: u64,
+    group_page_frame_materialize_nanos: u64,
+    group_page_frame_append_nanos: u64,
+    group_commit_digest_crc_nanos: u64,
+    group_commit_payload_crc_nanos: u64,
+    group_commit_header_crc_nanos: u64,
+    group_commit_frame_materialize_nanos: u64,
+    group_commit_frame_append_nanos: u64,
+    group_page_frames: u64,
+    group_commit_frames: u64,
+    group_page_validations: u64,
 }
 
 /// A WAL file with a validated in-memory index of complete commits.
@@ -181,6 +218,7 @@ pub struct WalLog<F: DurableFile> {
     append_nanos: u64,
     sync_nanos: u64,
     group_encode_nanos: u64,
+    attribution: WalEncodeAttribution,
     group_write_nanos: u64,
     physical_write_calls: u64,
     page_image_format: WalPageImageFormat,
@@ -286,6 +324,7 @@ impl<F: DurableFile> WalLog<F> {
             append_nanos: 0,
             sync_nanos: 0,
             group_encode_nanos: 0,
+            attribution: WalEncodeAttribution::default(),
             group_write_nanos: 0,
             physical_write_calls: 0,
             page_image_format,
@@ -317,6 +356,7 @@ impl<F: DurableFile> WalLog<F> {
             append_nanos: 0,
             sync_nanos: 0,
             group_encode_nanos: 0,
+            attribution: WalEncodeAttribution::default(),
             group_write_nanos: 0,
             physical_write_calls: 0,
             page_image_format,
@@ -437,9 +477,56 @@ impl<F: DurableFile> WalLog<F> {
             append_nanos: self.append_nanos,
             sync_nanos: self.sync_nanos,
             group_encode_nanos: self.group_encode_nanos,
+            group_page_lsn_validate_nanos: self.attribution.group_page_lsn_validate_nanos,
+            group_page_image_materialize_nanos: self.attribution.group_page_image_materialize_nanos,
+            group_page_image_validate_nanos: self.attribution.group_page_image_validate_nanos,
+            group_digest_copy_nanos: self.attribution.group_digest_copy_nanos,
+            group_page_payload_crc_nanos: self.attribution.group_page_payload_crc_nanos,
+            group_page_header_crc_nanos: self.attribution.group_page_header_crc_nanos,
+            group_page_frame_materialize_nanos: self.attribution.group_page_frame_materialize_nanos,
+            group_page_frame_append_nanos: self.attribution.group_page_frame_append_nanos,
+            group_commit_digest_crc_nanos: self.attribution.group_commit_digest_crc_nanos,
+            group_commit_payload_crc_nanos: self.attribution.group_commit_payload_crc_nanos,
+            group_commit_header_crc_nanos: self.attribution.group_commit_header_crc_nanos,
+            group_commit_frame_materialize_nanos: self
+                .attribution
+                .group_commit_frame_materialize_nanos,
+            group_commit_frame_append_nanos: self.attribution.group_commit_frame_append_nanos,
+            group_page_frames: self.attribution.group_page_frames,
+            group_commit_frames: self.attribution.group_commit_frames,
+            group_page_validations: self.attribution.group_page_validations,
             group_write_nanos: self.group_write_nanos,
             physical_write_calls: self.physical_write_calls,
         })
+    }
+
+    fn add_attribution(&mut self, attribution: &WalEncodeAttribution) -> Result<()> {
+        macro_rules! add_metric {
+            ($field:ident) => {
+                self.attribution.$field =
+                    self.attribution
+                        .$field
+                        .checked_add(attribution.$field)
+                        .ok_or_else(|| Error::invariant("WAL attribution metric overflow"))?;
+            };
+        }
+        add_metric!(group_page_lsn_validate_nanos);
+        add_metric!(group_page_image_materialize_nanos);
+        add_metric!(group_page_image_validate_nanos);
+        add_metric!(group_digest_copy_nanos);
+        add_metric!(group_page_payload_crc_nanos);
+        add_metric!(group_page_header_crc_nanos);
+        add_metric!(group_page_frame_materialize_nanos);
+        add_metric!(group_page_frame_append_nanos);
+        add_metric!(group_commit_digest_crc_nanos);
+        add_metric!(group_commit_payload_crc_nanos);
+        add_metric!(group_commit_header_crc_nanos);
+        add_metric!(group_commit_frame_materialize_nanos);
+        add_metric!(group_commit_frame_append_nanos);
+        add_metric!(group_page_frames);
+        add_metric!(group_commit_frames);
+        add_metric!(group_page_validations);
+        Ok(())
     }
 
     /// Appends one logical commit and syncs the WAL.
@@ -484,6 +571,7 @@ impl<F: DurableFile> WalLog<F> {
                 .group_encode_nanos
                 .checked_add(elapsed_nanos(encode_started)?)
                 .ok_or_else(|| Error::invariant("WAL group-encode timing overflow"))?;
+            self.add_attribution(&encoded.attribution)?;
 
             let write_started = Instant::now();
             let write_result = (|| {
@@ -588,6 +676,7 @@ impl<F: DurableFile> WalLog<F> {
     }
 
     fn encode_group(&self, commits: &[WalCommit]) -> Result<EncodedWalGroup> {
+        let mut attribution = WalEncodeAttribution::default();
         let mut capacity = 0usize;
         for commit in commits {
             if commit.pages.is_empty() {
@@ -650,9 +739,15 @@ impl<F: DurableFile> WalLog<F> {
                 .map_err(|_| Error::invalid_input("WAL digest input is too large"))?;
             let mut bytes_written = 0usize;
             for (page_index, page) in commit.pages.iter().enumerate() {
+                let page_lsn_validation_started = Instant::now();
                 validate_page_image_lsn(page, commit.commit_lsn)?;
-                let payload = encode_page_image(page, self.page_image_format)?;
+                attribution.group_page_lsn_validate_nanos +=
+                    elapsed_nanos(page_lsn_validation_started)?;
+                let payload =
+                    encode_page_image_attributed(page, self.page_image_format, &mut attribution)?;
+                let digest_copy_started = Instant::now();
                 digest_input.extend_from_slice(&payload);
+                attribution.group_digest_copy_nanos += elapsed_nanos(digest_copy_started)?;
                 let record_lsn = first_record_lsn
                     .get()
                     .checked_add(
@@ -663,21 +758,27 @@ impl<F: DurableFile> WalLog<F> {
                     .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
                 let record_index = u32::try_from(page_index)
                     .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
-                let frame = encode_frame(
+                let frame = encode_frame_attributed(
                     self.format_version,
                     WalRecordType::PageImage,
                     record_lsn,
                     commit.batch_id,
                     record_index,
                     &payload,
+                    Some((&mut attribution, WalFrameClass::Page)),
                 )?;
                 bytes_written = bytes_written
                     .checked_add(frame.len())
                     .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+                let frame_append_started = Instant::now();
                 bytes.extend_from_slice(&frame);
+                attribution.group_page_frame_append_nanos += elapsed_nanos(frame_append_started)?;
+                attribution.group_page_frames += 1;
             }
 
+            let commit_digest_started = Instant::now();
             let digest = crc32c::crc32c(&digest_input);
+            attribution.group_commit_digest_crc_nanos += elapsed_nanos(commit_digest_started)?;
             let mut commit_payload = [0u8; COMMIT_PAYLOAD_SIZE];
             commit_payload[0..8].copy_from_slice(&first_record_lsn.get().to_le_bytes());
             commit_payload[8..12].copy_from_slice(
@@ -688,18 +789,23 @@ impl<F: DurableFile> WalLog<F> {
             commit_payload[12..16].copy_from_slice(&digest.to_le_bytes());
             let commit_record_index = u32::try_from(commit.pages.len())
                 .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
-            let commit_frame = encode_frame(
+            let commit_frame = encode_frame_attributed(
                 self.format_version,
                 WalRecordType::Commit,
                 commit.commit_lsn,
                 commit.batch_id,
                 commit_record_index,
                 &commit_payload,
+                Some((&mut attribution, WalFrameClass::Commit)),
             )?;
             bytes_written = bytes_written
                 .checked_add(commit_frame.len())
                 .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+            let commit_frame_append_started = Instant::now();
             bytes.extend_from_slice(&commit_frame);
+            attribution.group_commit_frame_append_nanos +=
+                elapsed_nanos(commit_frame_append_started)?;
+            attribution.group_commit_frames += 1;
             reports.push(WalAppendReport {
                 first_record_lsn,
                 commit_lsn: commit.commit_lsn,
@@ -723,6 +829,7 @@ impl<F: DurableFile> WalLog<F> {
             reports,
             next_lsn,
             next_batch_id,
+            attribution,
         })
     }
 
@@ -928,6 +1035,52 @@ fn encode_frame(
     record_index: u32,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
+    encode_frame_impl(
+        format_version,
+        record_type,
+        record_lsn,
+        batch_id,
+        record_index,
+        payload,
+        None,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum WalFrameClass {
+    Page,
+    Commit,
+}
+
+fn encode_frame_attributed(
+    format_version: u16,
+    record_type: WalRecordType,
+    record_lsn: Lsn,
+    batch_id: u64,
+    record_index: u32,
+    payload: &[u8],
+    attribution: Option<(&mut WalEncodeAttribution, WalFrameClass)>,
+) -> Result<Vec<u8>> {
+    encode_frame_impl(
+        format_version,
+        record_type,
+        record_lsn,
+        batch_id,
+        record_index,
+        payload,
+        attribution,
+    )
+}
+
+fn encode_frame_impl(
+    format_version: u16,
+    record_type: WalRecordType,
+    record_lsn: Lsn,
+    batch_id: u64,
+    record_index: u32,
+    payload: &[u8],
+    mut attribution: Option<(&mut WalEncodeAttribution, WalFrameClass)>,
+) -> Result<Vec<u8>> {
     if payload.len() > WAL_MAX_PAYLOAD_SIZE {
         return Err(Error::invalid_input("WAL payload exceeds maximum size"));
     }
@@ -952,13 +1105,18 @@ fn encode_frame(
     header[16..24].copy_from_slice(&record_lsn.get().to_le_bytes());
     header[24..32].copy_from_slice(&batch_id.to_le_bytes());
     header[32..36].copy_from_slice(&record_index.to_le_bytes());
+    let payload_crc_started = attribution.as_ref().map(|_| Instant::now());
     let payload_checksum = crc32c::crc32c(payload);
+    let payload_crc_nanos = payload_crc_started.map(elapsed_nanos).transpose()?;
     header[PAYLOAD_CHECKSUM_OFFSET..PAYLOAD_CHECKSUM_OFFSET + 4]
         .copy_from_slice(&payload_checksum.to_le_bytes());
+    let header_crc_started = attribution.as_ref().map(|_| Instant::now());
     let header_checksum = header_checksum(&header);
+    let header_crc_nanos = header_crc_started.map(elapsed_nanos).transpose()?;
     header[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_OFFSET + 4]
         .copy_from_slice(&header_checksum.to_le_bytes());
 
+    let frame_materialize_started = attribution.as_ref().map(|_| Instant::now());
     let mut frame = Vec::with_capacity(frame_length);
     frame.extend_from_slice(&header);
     frame.extend_from_slice(payload);
@@ -967,6 +1125,23 @@ fn encode_frame(
             .map_err(|_| Error::invalid_input("WAL frame length does not fit u32"))?
             .to_le_bytes(),
     );
+    let frame_materialize_nanos = frame_materialize_started.map(elapsed_nanos).transpose()?;
+    if let Some((attribution, frame_class)) = attribution.take() {
+        match frame_class {
+            WalFrameClass::Page => {
+                attribution.group_page_payload_crc_nanos += payload_crc_nanos.unwrap_or_default();
+                attribution.group_page_header_crc_nanos += header_crc_nanos.unwrap_or_default();
+                attribution.group_page_frame_materialize_nanos +=
+                    frame_materialize_nanos.unwrap_or_default();
+            }
+            WalFrameClass::Commit => {
+                attribution.group_commit_payload_crc_nanos += payload_crc_nanos.unwrap_or_default();
+                attribution.group_commit_header_crc_nanos += header_crc_nanos.unwrap_or_default();
+                attribution.group_commit_frame_materialize_nanos +=
+                    frame_materialize_nanos.unwrap_or_default();
+            }
+        }
+    }
     Ok(frame)
 }
 
@@ -1236,6 +1411,23 @@ fn encode_page_image(
     payload.extend_from_slice(&page.page_id.get().to_le_bytes());
     payload.extend_from_slice(&page.image);
     validate_page_image(page, page_image_format)?;
+    Ok(payload)
+}
+
+fn encode_page_image_attributed(
+    page: &WalPageImage,
+    page_image_format: WalPageImageFormat,
+    attribution: &mut WalEncodeAttribution,
+) -> Result<Vec<u8>> {
+    let materialize_started = Instant::now();
+    let mut payload = Vec::with_capacity(PAGE_IMAGE_PAYLOAD_SIZE);
+    payload.extend_from_slice(&page.page_id.get().to_le_bytes());
+    payload.extend_from_slice(&page.image);
+    attribution.group_page_image_materialize_nanos += elapsed_nanos(materialize_started)?;
+    let validation_started = Instant::now();
+    validate_page_image(page, page_image_format)?;
+    attribution.group_page_image_validate_nanos += elapsed_nanos(validation_started)?;
+    attribution.group_page_validations += 1;
     Ok(payload)
 }
 
@@ -1572,14 +1764,27 @@ mod tests {
     fn group_fast_path_is_byte_identical_to_fault_injectable_path() {
         let commits = wal_commits(4, 2);
         let mut fast_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
-        fast_wal.append_group(&commits, None).unwrap();
+        let fast_reports = fast_wal.append_group(&commits, None).unwrap();
+        let fast_metrics = fast_wal.metrics().unwrap();
+        let fast_next_lsn = fast_wal.next_lsn();
+        let fast_next_batch_id = fast_wal.next_batch_id;
+        assert_eq!(fast_metrics.group_page_frames, 8);
+        assert_eq!(fast_metrics.group_commit_frames, 4);
+        assert_eq!(fast_metrics.group_page_validations, 8);
+        assert!(fast_metrics.group_page_lsn_validate_nanos > 0);
+        assert!(fast_metrics.group_page_image_materialize_nanos > 0);
+        assert!(fast_metrics.group_page_image_validate_nanos > 0);
+        assert!(fast_metrics.group_digest_copy_nanos > 0);
         let fast_bytes = fast_wal.into_file().0;
 
         let mut injected_wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
         let mut injector = NoopInjector;
-        injected_wal
+        let injected_reports = injected_wal
             .append_group(&commits, Some(&mut injector))
             .unwrap();
+        assert_eq!(fast_reports, injected_reports);
+        assert_eq!(fast_next_lsn, injected_wal.next_lsn());
+        assert_eq!(fast_next_batch_id, injected_wal.next_batch_id);
         let injected_bytes = injected_wal.into_file().0;
         assert_eq!(fast_bytes, injected_bytes);
     }
