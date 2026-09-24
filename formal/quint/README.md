@@ -1,5 +1,8 @@
 # Transaction semantics model
 
+Correctness gate and current dodb v1 coverage: [FINAL_CORRECTNESS.md](FINAL_CORRECTNESS.md).
+Contract-to-code mapping and remaining correspondence gaps: [CORRESPONDENCE.md](CORRESPONDENCE.md).
+
 This directory contains the first dodb formal model. It covers only the
 logical transaction contract. Coordinator, WAL, recovery, checkpoint,
 publication, end-to-end, and B-link models are outside this phase.
