@@ -4802,8 +4802,114 @@ fn ensure_non_overlapping(ranges: &mut [(usize, usize)]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageBodyLayout {
+    slot_end: usize,
+    records_start: usize,
+    records_end: usize,
+}
+
+fn leaf_record_encoded_len(entry: &LeafEntry) -> Result<usize> {
+    let inline_value_len = match &entry.value {
+        None | Some(BlinkValueRef::Overflow { .. }) => 0,
+        Some(BlinkValueRef::Inline(value)) => value.len(),
+    };
+    LEAF_RECORD_HEADER_SIZE
+        .checked_add(entry.key.len())
+        .and_then(|length| length.checked_add(inline_value_len))
+        .ok_or_else(|| Error::invalid_input("Blink leaf record size overflow"))
+}
+
+fn leaf_body_layout(entries: &[LeafEntry], high_key: Option<&[u8]>) -> Result<PageBodyLayout> {
+    ensure_sorted_leaf(entries)?;
+    let slot_end = LEAF_HEADER_SIZE
+        .checked_add(
+            entries
+                .len()
+                .checked_mul(SLOT_SIZE)
+                .ok_or_else(|| Error::invalid_input("Blink leaf slot overflow"))?,
+        )
+        .ok_or_else(|| Error::invalid_input("Blink leaf slot overflow"))?;
+    let records_start = slot_end
+        .checked_add(high_key.map_or(0, <[u8]>::len))
+        .ok_or_else(|| Error::invalid_input("Blink leaf fence overflow"))?;
+    if entries.len() > u16::MAX as usize || records_start > BODY_SIZE {
+        return Err(Error::invalid_input("Blink leaf header exceeds page"));
+    }
+    if let Some(high_key) = high_key {
+        validate_encoded_key(high_key)?;
+    }
+
+    let mut records_end = BODY_SIZE;
+    for entry in entries.iter().rev() {
+        records_end = records_end
+            .checked_sub(leaf_record_encoded_len(entry)?)
+            .ok_or_else(|| Error::invalid_input("Blink leaf records exceed page"))?;
+        if records_end < records_start {
+            return Err(Error::invalid_input("Blink leaf records exceed page"));
+        }
+    }
+    Ok(PageBodyLayout {
+        slot_end,
+        records_start,
+        records_end,
+    })
+}
+
+fn internal_body_layout(
+    leftmost_child: PageId,
+    entries: &[InternalEntry],
+    high_key: Option<&[u8]>,
+) -> Result<PageBodyLayout> {
+    if leftmost_child.get() < FIRST_DATA_PAGE {
+        return Err(Error::invalid_input(
+            "Blink internal leftmost child is invalid",
+        ));
+    }
+    ensure_sorted_internal(entries)?;
+    let slot_end = INTERNAL_HEADER_SIZE
+        .checked_add(
+            entries
+                .len()
+                .checked_mul(SLOT_SIZE)
+                .ok_or_else(|| Error::invalid_input("Blink internal slot overflow"))?,
+        )
+        .ok_or_else(|| Error::invalid_input("Blink internal slot overflow"))?;
+    let records_start = slot_end
+        .checked_add(high_key.map_or(0, <[u8]>::len))
+        .ok_or_else(|| Error::invalid_input("Blink internal fence overflow"))?;
+    if entries.len() > u16::MAX as usize || records_start > BODY_SIZE {
+        return Err(Error::invalid_input("Blink internal header exceeds page"));
+    }
+    if let Some(high_key) = high_key {
+        validate_encoded_key(high_key)?;
+    }
+
+    let mut records_end = BODY_SIZE;
+    for entry in entries.iter().rev() {
+        if entry.key.len() > u16::MAX as usize {
+            return Err(Error::invalid_input("Blink separator is too large"));
+        }
+        let record_len = INTERNAL_RECORD_HEADER_SIZE
+            .checked_add(entry.key.len())
+            .ok_or_else(|| Error::invalid_input("Blink internal record size overflow"))?;
+        records_end = records_end
+            .checked_sub(record_len)
+            .ok_or_else(|| Error::invalid_input("Blink internal records exceed page"))?;
+        if records_end < records_start {
+            return Err(Error::invalid_input("Blink internal records exceed page"));
+        }
+    }
+    Ok(PageBodyLayout {
+        slot_end,
+        records_start,
+        records_end,
+    })
+}
+
 fn leaf_fits(entries: &[LeafEntry], high_key: Option<&[u8]>, right: Option<PageId>) -> bool {
-    encode_leaf_body(high_key, right, entries).is_ok()
+    let _ = right;
+    leaf_body_layout(entries, high_key).is_ok()
 }
 
 fn internal_fits(
@@ -4813,7 +4919,8 @@ fn internal_fits(
     right: Option<PageId>,
     level: u16,
 ) -> bool {
-    encode_internal_body(level, high_key, right, leftmost, entries).is_ok()
+    let _ = (right, level);
+    internal_body_layout(leftmost, entries, high_key).is_ok()
 }
 
 fn choose_leaf_split(
@@ -5340,6 +5447,252 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout_test_leaf_entry(index: u64, inline_value_len: usize) -> LeafEntry {
+        LeafEntry {
+            key: DocumentKey::new(b"layout".to_vec(), index.to_be_bytes().to_vec()).encode(),
+            revision: Revision::new(index + 1),
+            value: Some(BlinkValueRef::Inline(vec![0x5a; inline_value_len])),
+        }
+    }
+
+    fn layout_test_internal_entry(index: u64) -> InternalEntry {
+        InternalEntry {
+            key: DocumentKey::new(b"layout".to_vec(), index.to_be_bytes().to_vec()).encode(),
+            right_child: PageId::new(FIRST_DATA_PAGE + index + 1),
+        }
+    }
+
+    fn assert_leaf_layout_matches_encoder(entries: &[LeafEntry], high_key: Option<&[u8]>) {
+        let layout = leaf_body_layout(entries, high_key);
+        let encoded = encode_leaf_body(high_key, None, entries);
+        assert_eq!(layout.is_ok(), encoded.is_ok());
+        if let (Ok(layout), Ok(encoded)) = (layout, encoded) {
+            assert_eq!(
+                layout.slot_end,
+                u16::from_le_bytes(encoded[10..12].try_into().unwrap()) as usize
+            );
+            assert_eq!(
+                layout.records_start,
+                u16::from_le_bytes(encoded[12..14].try_into().unwrap()) as usize
+            );
+            assert_eq!(
+                layout.records_end,
+                u16::from_le_bytes(encoded[18..20].try_into().unwrap()) as usize
+            );
+        }
+    }
+
+    fn assert_internal_layout_matches_encoder(
+        leftmost_child: PageId,
+        entries: &[InternalEntry],
+        high_key: Option<&[u8]>,
+    ) {
+        let layout = internal_body_layout(leftmost_child, entries, high_key);
+        let encoded = encode_internal_body(1, high_key, None, leftmost_child, entries);
+        assert_eq!(layout.is_ok(), encoded.is_ok());
+        if let (Ok(layout), Ok(encoded)) = (layout, encoded) {
+            assert_eq!(
+                layout.slot_end,
+                u16::from_le_bytes(encoded[12..14].try_into().unwrap()) as usize
+            );
+            assert_eq!(
+                layout.records_start,
+                u16::from_le_bytes(encoded[14..16].try_into().unwrap()) as usize
+            );
+            assert_eq!(
+                layout.records_end,
+                u16::from_le_bytes(encoded[36..38].try_into().unwrap()) as usize
+            );
+        }
+    }
+
+    fn next_layout_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    #[test]
+    fn leaf_layout_matches_encoder_acceptance() {
+        let empty = Vec::new();
+        assert_leaf_layout_matches_encoder(&empty, None);
+
+        let single = vec![layout_test_leaf_entry(0, 8)];
+        assert_leaf_layout_matches_encoder(&single, None);
+
+        let mut inline_entries = (0..40)
+            .map(|index| layout_test_leaf_entry(index, index as usize % 97))
+            .collect::<Vec<_>>();
+        assert_leaf_layout_matches_encoder(&inline_entries, None);
+        assert_leaf_layout_matches_encoder(
+            &inline_entries,
+            Some(&layout_test_leaf_entry(41, 0).key),
+        );
+
+        inline_entries[3].value = None;
+        inline_entries[7].value = Some(BlinkValueRef::Overflow {
+            head: PageId::new(FIRST_DATA_PAGE + 20),
+            length: 10_000,
+        });
+        assert_leaf_layout_matches_encoder(&inline_entries, None);
+
+        let mut invalid_order = inline_entries.clone();
+        invalid_order.swap(1, 2);
+        assert_leaf_layout_matches_encoder(&invalid_order, None);
+        assert_leaf_layout_matches_encoder(&inline_entries, Some(&[0xff]));
+
+        let mut boundary_entry = layout_test_leaf_entry(0, 0);
+        let high_key = DocumentKey::new(b"layout".to_vec(), 1u64.to_be_bytes().to_vec()).encode();
+        let fixed_size = LEAF_HEADER_SIZE
+            + SLOT_SIZE
+            + high_key.len()
+            + LEAF_RECORD_HEADER_SIZE
+            + boundary_entry.key.len();
+        let exact_value_len = BODY_SIZE - fixed_size;
+        boundary_entry.value = Some(BlinkValueRef::Inline(vec![0x33; exact_value_len]));
+        assert_leaf_layout_matches_encoder(std::slice::from_ref(&boundary_entry), Some(&high_key));
+        assert!(leaf_body_layout(std::slice::from_ref(&boundary_entry), Some(&high_key)).is_ok());
+        if let Some(BlinkValueRef::Inline(value)) = &mut boundary_entry.value {
+            value.push(0x33);
+        }
+        assert_leaf_layout_matches_encoder(std::slice::from_ref(&boundary_entry), Some(&high_key));
+        assert!(leaf_body_layout(std::slice::from_ref(&boundary_entry), Some(&high_key)).is_err());
+    }
+
+    #[test]
+    fn internal_layout_matches_encoder_acceptance() {
+        let leftmost_child = PageId::new(FIRST_DATA_PAGE);
+        let single = vec![layout_test_internal_entry(0)];
+        assert_internal_layout_matches_encoder(leftmost_child, &single, None);
+
+        let many = (0..40).map(layout_test_internal_entry).collect::<Vec<_>>();
+        let high_key = layout_test_internal_entry(41).key;
+        assert_internal_layout_matches_encoder(leftmost_child, &many, Some(&high_key));
+
+        let mut invalid_order = many.clone();
+        invalid_order.swap(2, 3);
+        assert_internal_layout_matches_encoder(leftmost_child, &invalid_order, None);
+        assert_internal_layout_matches_encoder(PageId::new(1), &single, None);
+        assert_internal_layout_matches_encoder(leftmost_child, &many, Some(&[0xff]));
+
+        let mut boundary_entries = Vec::new();
+        for index in 0..u64::MAX {
+            let candidate = layout_test_internal_entry(index);
+            boundary_entries.push(candidate);
+            if internal_body_layout(leftmost_child, &boundary_entries, None).is_err() {
+                boundary_entries.pop();
+                break;
+            }
+        }
+        assert!(!boundary_entries.is_empty());
+        assert_internal_layout_matches_encoder(leftmost_child, &boundary_entries, None);
+        assert!(internal_body_layout(leftmost_child, &boundary_entries, None).is_ok());
+        boundary_entries.push(layout_test_internal_entry(boundary_entries.len() as u64));
+        assert_internal_layout_matches_encoder(leftmost_child, &boundary_entries, None);
+        assert!(internal_body_layout(leftmost_child, &boundary_entries, None).is_err());
+    }
+
+    #[test]
+    fn randomized_page_layouts_match_encoder_acceptance() {
+        let seed = 0x6f31_9a42_7c05_d8e1;
+        let mut random_state = seed;
+        for iteration in 0..500 {
+            let entry_count = (next_layout_random(&mut random_state) % 96) as usize;
+            let mut leaf_entries = (0..entry_count)
+                .map(|index| {
+                    let key_length = (next_layout_random(&mut random_state) % 96 + 1) as usize;
+                    let partition = vec![b'p'; key_length];
+                    let sort_key = ((index as u64) << 32
+                        | next_layout_random(&mut random_state) as u32 as u64)
+                        .to_be_bytes()
+                        .to_vec();
+                    let value_length = (next_layout_random(&mut random_state) % 5_500) as usize;
+                    LeafEntry {
+                        key: DocumentKey::new(partition, sort_key).encode(),
+                        revision: Revision::new(index as u64 + 1),
+                        value: match next_layout_random(&mut random_state) % 3 {
+                            0 => None,
+                            1 => Some(BlinkValueRef::Inline(vec![0x61; value_length])),
+                            _ => Some(BlinkValueRef::Overflow {
+                                head: PageId::new(FIRST_DATA_PAGE + index as u64),
+                                length: value_length as u64 + 1,
+                            }),
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            leaf_entries.sort_by(|left, right| left.key.cmp(&right.key));
+            if iteration % 7 == 0 && leaf_entries.len() > 1 {
+                leaf_entries.swap(0, 1);
+            }
+            let high_key = (iteration % 2 == 0).then(|| {
+                DocumentKey::new(
+                    b"layout-high".to_vec(),
+                    (iteration as u64).to_be_bytes().to_vec(),
+                )
+                .encode()
+            });
+            let leaf_layout = leaf_body_layout(&leaf_entries, high_key.as_deref());
+            let leaf_encoded = encode_leaf_body(high_key.as_deref(), None, &leaf_entries);
+            assert_eq!(
+                leaf_layout.is_ok(),
+                leaf_encoded.is_ok(),
+                "leaf seed={seed:#x} iteration={iteration} entry_count={}",
+                leaf_entries.len()
+            );
+
+            let mut internal_entries = (0..entry_count)
+                .map(|index| {
+                    let key_length = (next_layout_random(&mut random_state) % 96 + 1) as usize;
+                    let partition = vec![b'q'; key_length];
+                    let sort_key = ((index as u64) << 32
+                        | next_layout_random(&mut random_state) as u32 as u64)
+                        .to_be_bytes()
+                        .to_vec();
+                    InternalEntry {
+                        key: DocumentKey::new(partition, sort_key).encode(),
+                        right_child: PageId::new(FIRST_DATA_PAGE + index as u64 + 1),
+                    }
+                })
+                .collect::<Vec<_>>();
+            internal_entries.sort_by(|left, right| left.key.cmp(&right.key));
+            if iteration % 9 == 0 && internal_entries.len() > 1 {
+                internal_entries.swap(0, 1);
+            }
+            let internal_high_key = (iteration % 2 == 1).then(|| {
+                DocumentKey::new(
+                    b"internal-high".to_vec(),
+                    (iteration as u64).to_be_bytes().to_vec(),
+                )
+                .encode()
+            });
+            let leftmost_child = if iteration % 11 == 0 {
+                PageId::new(1)
+            } else {
+                PageId::new(FIRST_DATA_PAGE)
+            };
+            let internal_layout = internal_body_layout(
+                leftmost_child,
+                &internal_entries,
+                internal_high_key.as_deref(),
+            );
+            let internal_encoded = encode_internal_body(
+                1,
+                internal_high_key.as_deref(),
+                None,
+                leftmost_child,
+                &internal_entries,
+            );
+            assert_eq!(
+                internal_layout.is_ok(),
+                internal_encoded.is_ok(),
+                "internal seed={seed:#x} iteration={iteration} entry_count={}",
+                internal_entries.len()
+            );
+        }
+    }
 
     #[derive(Default)]
     struct MemoryFile(Vec<u8>);
