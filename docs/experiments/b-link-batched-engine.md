@@ -42,9 +42,11 @@ Planned serial leaf ownership and clone elimination are recorded in
 keeps one batch-local owning page copy in `WorkingBlinkState`, while
 `CachedLeaf` retains only a `PageId`. Committed Blink state remains immutable
 until WAL success. Page format, split semantics, WAL semantics, transaction
-ordering, and publication semantics are unchanged. Local correctness and
-clone-elimination smoke passed; OCI performance validation remains incomplete
-because the requested SSH identity was rejected.
+ordering, and publication semantics are unchanged. The OCI sync-disabled
+width-1 diagnostic is a structural success, and the width-16 control is 4.05%
+above its prior median. Both runs used the mounted 30 GB root filesystem; they
+are CPU and engine diagnostics, not durability measurements or results from
+the unmounted 200 GB block volume.
 
 Baseline branch: `main`
 
