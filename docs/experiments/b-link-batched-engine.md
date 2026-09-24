@@ -18,6 +18,17 @@ WAL group encoding costs are attributed in
 [`wal-group-encoding-attribution.md`](wal-group-encoding-attribution.md). WAL
 format and semantics are unchanged.
 
+The direct WAL group-buffer implementation and OCI result are recorded in
+[`direct-wal-buffer-results.md`](direct-wal-buffer-results.md). The default
+width-1 result is a structural success: temporary payload, digest, and frame
+buffers and their copies are removed, group encode is 24.23% lower per
+mutation, and throughput is 6.69% higher. The separate `+crc` control is 5.91%
+faster than the default direct-buffer build. WAL byte format, commit digest
+semantics, fault-injection path and hook order, strict/trusted validation
+semantics, and recovery format are unchanged. Target-specific AArch64 CRC
+codegen is the next engineering investigation; shared descent and arenas remain
+later candidates.
+
 The trusted internal WAL page-image validation fast path and OCI result are
 recorded in [`trusted-wal-image-results.md`](trusted-wal-image-results.md).
 WAL format is unchanged. Public WAL append validation remains strict.
