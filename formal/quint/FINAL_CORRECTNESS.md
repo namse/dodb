@@ -121,4 +121,4 @@ scripts/verify-correctness.sh full
 
 `fast` runs formatting, the Rust workspace, all eight Quint Rust-backend tests, and all eight typechecks. `full` runs fast plus explicit correspondence and durability DST tests, all eight TLC checks, all eight Apalache checks, and a final `git diff --check`.
 
-Measured wall-clock runtime on the audit machine was 95.59 seconds for `fast` and 751.50 seconds for `full` (including the full model checks).
+Measured wall-clock runtime for this audit run was 89 seconds for `fast` and 935 seconds for `full` (including all eight TLC and eight Apalache checks).
