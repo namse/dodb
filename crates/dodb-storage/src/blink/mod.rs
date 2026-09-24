@@ -2371,11 +2371,11 @@ fn plan_batch(
             let mut route_corrections = 0;
             let mut route_page_visits = 0;
             let route_started = Instant::now();
-            let leaf_id = find_leaf_with_metrics(
+            let leaf_id = find_leaf_in_blink_state_borrowed(
                 state,
                 &encoded_key,
                 &mut route_corrections,
-                Some(&mut route_page_visits),
+                &mut route_page_visits,
             )?;
             metrics.planner_route_nanos = metrics
                 .planner_route_nanos
@@ -3737,6 +3737,63 @@ fn find_entry_with_metrics<S: ReadPageSource>(
         return Err(Error::corruption("Blink route ended at non-leaf"));
     };
     Ok(entries.iter().find(|entry| entry.key == key).cloned())
+}
+
+fn find_leaf_in_blink_state_borrowed(
+    state: &BlinkState,
+    key: &[u8],
+    right_link_corrections: &mut u64,
+    page_visits: &mut u64,
+) -> Result<PageId> {
+    let mut page_id = state.root_page_id;
+    let mut guard = HashSet::new();
+    loop {
+        if !guard.insert(page_id) {
+            return Err(Error::corruption("Blink tree route contains a cycle"));
+        }
+        let page = state
+            .pages
+            .get(&page_id)
+            .ok_or_else(|| Error::corruption("Blink page is missing"))?;
+        *page_visits = page_visits.saturating_add(1);
+        let (high_key, right_sibling) = match page {
+            BlinkPage::Leaf {
+                high_key,
+                right_sibling,
+                ..
+            }
+            | BlinkPage::Internal {
+                high_key,
+                right_sibling,
+                ..
+            } => (high_key, right_sibling),
+            _ => return Err(Error::corruption("Blink route reached non-tree page")),
+        };
+        if high_key.as_ref().is_some_and(|high| key >= high.as_slice()) {
+            let Some(next) = *right_sibling else {
+                return Err(Error::corruption("Blink finite fence has no right sibling"));
+            };
+            *right_link_corrections = right_link_corrections.saturating_add(1);
+            page_id = next;
+            continue;
+        }
+        match page {
+            BlinkPage::Leaf { .. } => return Ok(page_id),
+            BlinkPage::Internal {
+                leftmost_child,
+                entries,
+                ..
+            } => {
+                let index = entries.partition_point(|entry| key >= entry.key.as_slice());
+                page_id = if index == 0 {
+                    *leftmost_child
+                } else {
+                    entries[index - 1].right_child
+                };
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 fn find_leaf_with_metrics<S: ReadPageSource>(
@@ -6537,10 +6594,271 @@ mod tests {
             high_water_page_id: right,
             allow_page_reuse: true,
         };
+        let mut generic_corrections = 0;
+        let mut generic_visits = 0;
+        let generic_leaf = find_leaf_with_metrics(
+            &state,
+            &key.encode(),
+            &mut generic_corrections,
+            Some(&mut generic_visits),
+        )
+        .unwrap();
+        let mut borrowed_corrections = 0;
+        let mut borrowed_visits = 0;
+        let borrowed_leaf = find_leaf_in_blink_state_borrowed(
+            &state,
+            &key.encode(),
+            &mut borrowed_corrections,
+            &mut borrowed_visits,
+        )
+        .unwrap();
+        assert_eq!(borrowed_leaf, generic_leaf);
+        assert_eq!(borrowed_corrections, generic_corrections);
+        assert_eq!(borrowed_visits, generic_visits);
+        assert_eq!(borrowed_corrections, 1);
+        assert_eq!(borrowed_visits, 2);
         let mut corrections = 0;
         let value = read_state(&state, &key, &mut corrections).unwrap();
         assert_eq!(value.value(), Some(&[2][..]));
         assert_eq!(corrections, 1);
+    }
+
+    #[test]
+    fn borrowed_planner_routing_matches_generic_routing() {
+        let page_id = |value| PageId::new(value);
+        let single_leaf_id = page_id(2);
+        let single_leaf_state = BlinkState {
+            pages: BTreeMap::from([(
+                single_leaf_id,
+                BlinkPage::Leaf {
+                    lsn: Lsn::ZERO,
+                    high_key: None,
+                    right_sibling: None,
+                    entries: Vec::new(),
+                },
+            )]),
+            root_page_id: single_leaf_id,
+            free_list_head: None,
+            high_water_page_id: single_leaf_id,
+            allow_page_reuse: true,
+        };
+        let single_leaf_key = DocumentKey::new(b"single".to_vec(), b"leaf".to_vec()).encode();
+        let mut generic_corrections = 0;
+        let mut generic_visits = 0;
+        let generic_leaf = find_leaf_with_metrics(
+            &single_leaf_state,
+            &single_leaf_key,
+            &mut generic_corrections,
+            Some(&mut generic_visits),
+        )
+        .unwrap();
+        let mut borrowed_corrections = 0;
+        let mut borrowed_visits = 0;
+        let borrowed_leaf = find_leaf_in_blink_state_borrowed(
+            &single_leaf_state,
+            &single_leaf_key,
+            &mut borrowed_corrections,
+            &mut borrowed_visits,
+        )
+        .unwrap();
+        assert_eq!(borrowed_leaf, generic_leaf);
+        assert_eq!(borrowed_leaf, single_leaf_id);
+        assert_eq!(borrowed_corrections, generic_corrections);
+        assert_eq!(borrowed_visits, generic_visits);
+
+        let leaf_ids = [page_id(2), page_id(3), page_id(4), page_id(5)];
+        let left_internal_id = page_id(6);
+        let right_internal_id = page_id(7);
+        let root_id = page_id(8);
+        let keys = [b"a".as_slice(), b"b", b"c", b"d"]
+            .into_iter()
+            .map(|sk| DocumentKey::new(b"p".to_vec(), sk.to_vec()).encode())
+            .collect::<Vec<_>>();
+        let make_leaf =
+            |high_key: Option<Vec<u8>>, right_sibling: Option<PageId>| BlinkPage::Leaf {
+                lsn: Lsn::ZERO,
+                high_key,
+                right_sibling,
+                entries: Vec::new(),
+            };
+        let state = BlinkState {
+            pages: BTreeMap::from([
+                (
+                    leaf_ids[0],
+                    make_leaf(Some(keys[1].clone()), Some(leaf_ids[1])),
+                ),
+                (
+                    leaf_ids[1],
+                    make_leaf(Some(keys[2].clone()), Some(leaf_ids[2])),
+                ),
+                (
+                    leaf_ids[2],
+                    make_leaf(Some(keys[3].clone()), Some(leaf_ids[3])),
+                ),
+                (leaf_ids[3], make_leaf(None, None)),
+                (
+                    left_internal_id,
+                    BlinkPage::Internal {
+                        lsn: Lsn::ZERO,
+                        level: 1,
+                        high_key: Some(keys[2].clone()),
+                        right_sibling: Some(right_internal_id),
+                        leftmost_child: leaf_ids[0],
+                        entries: vec![InternalEntry {
+                            key: keys[1].clone(),
+                            right_child: leaf_ids[1],
+                        }],
+                    },
+                ),
+                (
+                    right_internal_id,
+                    BlinkPage::Internal {
+                        lsn: Lsn::ZERO,
+                        level: 1,
+                        high_key: None,
+                        right_sibling: None,
+                        leftmost_child: leaf_ids[2],
+                        entries: vec![InternalEntry {
+                            key: keys[3].clone(),
+                            right_child: leaf_ids[3],
+                        }],
+                    },
+                ),
+                (
+                    root_id,
+                    BlinkPage::Internal {
+                        lsn: Lsn::ZERO,
+                        level: 2,
+                        high_key: None,
+                        right_sibling: None,
+                        leftmost_child: left_internal_id,
+                        entries: vec![InternalEntry {
+                            key: keys[2].clone(),
+                            right_child: right_internal_id,
+                        }],
+                    },
+                ),
+            ]),
+            root_page_id: root_id,
+            free_list_head: None,
+            high_water_page_id: root_id,
+            allow_page_reuse: true,
+        };
+
+        for (key, expected_leaf) in keys.iter().zip(leaf_ids) {
+            let mut generic_corrections = 0;
+            let mut generic_visits = 0;
+            let generic_leaf = find_leaf_with_metrics(
+                &state,
+                key,
+                &mut generic_corrections,
+                Some(&mut generic_visits),
+            )
+            .unwrap();
+            let mut borrowed_corrections = 0;
+            let mut borrowed_visits = 0;
+            let borrowed_leaf = find_leaf_in_blink_state_borrowed(
+                &state,
+                key,
+                &mut borrowed_corrections,
+                &mut borrowed_visits,
+            )
+            .unwrap();
+            assert_eq!(generic_leaf, expected_leaf);
+            assert_eq!(borrowed_leaf, generic_leaf);
+            assert_eq!(borrowed_corrections, generic_corrections);
+            assert_eq!(borrowed_visits, generic_visits);
+        }
+
+        let mut missing_state = state.clone();
+        missing_state.pages.remove(&root_id);
+        let mut generic_corrections = 0;
+        let mut generic_visits = 0;
+        let generic_error = find_leaf_with_metrics(
+            &missing_state,
+            &keys[0],
+            &mut generic_corrections,
+            Some(&mut generic_visits),
+        )
+        .unwrap_err();
+        let mut borrowed_corrections = 0;
+        let mut borrowed_visits = 0;
+        let borrowed_error = find_leaf_in_blink_state_borrowed(
+            &missing_state,
+            &keys[0],
+            &mut borrowed_corrections,
+            &mut borrowed_visits,
+        )
+        .unwrap_err();
+        assert_eq!(generic_error.to_string(), borrowed_error.to_string());
+
+        let cyclic_page_id = page_id(9);
+        let cyclic_state = BlinkState {
+            pages: BTreeMap::from([(
+                cyclic_page_id,
+                BlinkPage::Leaf {
+                    lsn: Lsn::ZERO,
+                    high_key: Some(keys[1].clone()),
+                    right_sibling: Some(cyclic_page_id),
+                    entries: Vec::new(),
+                },
+            )]),
+            root_page_id: cyclic_page_id,
+            free_list_head: None,
+            high_water_page_id: cyclic_page_id,
+            allow_page_reuse: true,
+        };
+        let mut generic_corrections = 0;
+        let mut generic_visits = 0;
+        let generic_error = find_leaf_with_metrics(
+            &cyclic_state,
+            &keys[1],
+            &mut generic_corrections,
+            Some(&mut generic_visits),
+        )
+        .unwrap_err();
+        let mut borrowed_corrections = 0;
+        let mut borrowed_visits = 0;
+        let borrowed_error = find_leaf_in_blink_state_borrowed(
+            &cyclic_state,
+            &keys[1],
+            &mut borrowed_corrections,
+            &mut borrowed_visits,
+        )
+        .unwrap_err();
+        assert_eq!(generic_error.to_string(), borrowed_error.to_string());
+        assert_eq!(borrowed_corrections, generic_corrections);
+        assert_eq!(borrowed_visits, generic_visits);
+
+        let mut corrupt_state = state;
+        corrupt_state.pages.insert(
+            root_id,
+            BlinkPage::Overflow {
+                lsn: Lsn::ZERO,
+                next: None,
+                total_length: 0,
+                chunk: Vec::new(),
+            },
+        );
+        let mut generic_corrections = 0;
+        let mut generic_visits = 0;
+        let generic_error = find_leaf_with_metrics(
+            &corrupt_state,
+            &keys[0],
+            &mut generic_corrections,
+            Some(&mut generic_visits),
+        )
+        .unwrap_err();
+        let mut borrowed_corrections = 0;
+        let mut borrowed_visits = 0;
+        let borrowed_error = find_leaf_in_blink_state_borrowed(
+            &corrupt_state,
+            &keys[0],
+            &mut borrowed_corrections,
+            &mut borrowed_visits,
+        )
+        .unwrap_err();
+        assert_eq!(generic_error.to_string(), borrowed_error.to_string());
     }
 
     #[test]
