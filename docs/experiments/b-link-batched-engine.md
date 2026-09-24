@@ -1350,9 +1350,9 @@ record the experimental result as rejected/inconclusive.
 - **Version retention and page reuse:** optimistic readers require safe object
   lifetime and deferred free-page reuse. Memory growth may erase throughput
   gains.
-- **Full-page WAL amplification:** same-leaf coalescing may reduce CPU work but
-  cannot remove required per-transaction after-images under the fixed WAL
-  contract.
+- **Full-page WAL amplification:** same-leaf coalescing may reduce CPU work.
+  Metadata-stable transactions can omit the superblock image while retaining
+  their data-page after-image and transaction boundary.
 - **Revision/LSN allocation:** final WAL LSNs depend on image counts, while
   logical conditions need earlier committed revisions. Provisional tokens and
   ordered restamping must be exact.
@@ -1408,3 +1408,12 @@ record the experimental result as rejected/inconclusive.
     establishes real-device sync cost, or should the project revise them before
     the final run? Any revision must be made before looking at final engine
     results.
+
+## 21. Superblock WAL Elision
+
+The metadata-stable superblock image elision passed its correctness gates and
+met the strong-success thresholds on the OCI A1 width-1 workload. Page images
+fell from 2.00 to 1.00 per mutation, WAL bytes fell 49.59%, and throughput
+improved 16.98% for default release and 16.68% for the separate `+crc` build.
+The crash-recovery audit, normalized costs, and raw artifacts are recorded in
+[`superblock-wal-elision-results.md`](superblock-wal-elision-results.md).
