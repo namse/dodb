@@ -47,6 +47,8 @@ index; no slot vector is created. Internal encoding reuses
 existing magic, version, type, ID, LSN, flags, and checksum fields. Public
 `encode_page(header, body)` remains available and now copies the body into a
 zeroed fixed page before calling the same finalizer.
+The public helper retains its existing validation order when both the header
+version and body length are invalid.
 
 ### Checksum without encode-side scratch copy
 
@@ -96,7 +98,7 @@ subsequent runs.
 ## OCI Method
 
 The release benchmark ran at implementation commit
-`8782790cd5344f47b28e62399f8716b02f107ad2` on the 2-OCPU OCI A1 host. Width 1
+`bd500f5d90d716001ce8613e85fb67f760044995` on the 2-OCPU OCI A1 host. Width 1
 used 16 writers, transaction width 1, different-leaf-heavy distribution,
 working set 100,000, cache 4,096, 16-byte keys, 64-byte values, group limit
 64, group byte limit 4 MiB, queue 256, zero collection delay, disabled sync,
@@ -117,24 +119,24 @@ are milliseconds unless the metric is throughput.
 
 | metric | before | after | change |
 |---|---:|---:|---:|
-| throughput (mut/s) | 17,683.23 | 17,629.63 | -0.30% |
-| processing | 1,891.908 | 1,889.516 | -0.13% |
-| physical execution | 490.236 | 431.832 | -11.91% |
-| physical mutation | 214.466 | 211.257 | -1.50% |
-| mutation residual | 86.661 | 85.303 | -1.57% |
-| physical restamp | 3.791 | 3.684 | -2.83% |
-| physical page encode | 142.722 | 82.583 | -42.14% |
-| physical superblock encode | 35.565 | 41.264 | +16.03% |
-| planning | 398.405 | 395.312 | -0.78% |
-| WAL append | 576.668 | 619.449 | +7.42% |
-| WAL group encode | 442.159 | 493.217 | +11.55% |
-| catalog construction | 99.825 | 100.931 | +1.11% |
-| generation publication | 77.636 | 80.032 | +3.09% |
+| throughput (mut/s) | 17,683.23 | 17,964.27 | +1.59% |
+| processing | 1,891.908 | 1,891.099 | -0.04% |
+| physical execution | 490.236 | 431.334 | -12.02% |
+| physical mutation | 214.466 | 217.881 | +1.59% |
+| mutation residual | 86.661 | 89.449 | +3.22% |
+| physical restamp | 3.791 | 3.857 | +1.74% |
+| physical page encode | 142.722 | 79.592 | -44.23% |
+| physical superblock encode | 35.565 | 36.580 | +2.85% |
+| planning | 398.405 | 397.507 | -0.23% |
+| WAL append | 576.668 | 606.015 | +5.09% |
+| WAL group encode | 442.159 | 475.750 | +7.60% |
+| catalog construction | 99.825 | 103.312 | +3.49% |
+| generation publication | 77.636 | 81.850 | +5.43% |
 
 Mutation residual is physical mutation minus the three leaf clone medians,
-floored at zero. Page encode reduction is `1 - 82.583 / 142.722 = 42.14%`.
-Width-1 throughput speedup is `17,629.63 / 17,683.23 = 0.997x`. Physical
-execution fell by 11.91%.
+floored at zero. Page encode reduction is `1 - 79.592 / 142.722 = 44.23%`.
+Width-1 throughput speedup is `17,964.27 / 17,683.23 = 1.016x`. Physical
+execution fell by 12.02%.
 
 ## Physical Breakdown
 
@@ -144,42 +146,39 @@ medians need not sum exactly to physical execution.
 
 | component | before (ms) | after (ms) | change |
 |---|---:|---:|---:|
-| physical mutation | 214.466 | 211.257 | -1.50% |
-| └ leaf load clone | 28.995 | 27.470 | -5.26% |
-| └ leaf entries clone | 42.035 | 40.547 | -3.54% |
-| └ leaf install clone | 56.775 | 57.937 | +2.05% |
-| mutation residual | 86.661 | 85.303 | -1.57% |
-| physical restamp | 3.791 | 3.684 | -2.83% |
-| physical cached refresh | 46.775 | 46.524 | -0.54% |
-| physical page encode | 142.722 | 82.583 | -42.14% |
-| physical superblock encode | 35.565 | 41.264 | +16.03% |
-| physical residual | 46.918 | 46.520 | -0.85% |
+| physical mutation | 214.466 | 217.881 | +1.59% |
+| └ leaf load clone | 28.995 | 28.236 | -2.62% |
+| └ leaf entries clone | 42.035 | 40.149 | -4.49% |
+| └ leaf install clone | 56.775 | 60.047 | +5.76% |
+| mutation residual | 86.661 | 89.449 | +3.22% |
+| physical restamp | 3.791 | 3.857 | +1.74% |
+| physical cached refresh | 46.775 | 48.297 | +3.25% |
+| physical page encode | 142.722 | 79.592 | -44.23% |
+| physical superblock encode | 35.565 | 36.580 | +2.85% |
+| physical residual | 46.918 | 45.128 | -3.82% |
 
 Leaf load clone, leaf entries clone, leaf install clone, and cached refresh
-total 172.478 ms after the change, or 39.94% of physical execution. The
-largest top-level physical category remains physical mutation at 211.257 ms.
+total 176.729 ms after the change, or 40.97% of physical execution. The
+largest top-level physical category remains physical mutation at 217.881 ms.
 
 ## Width-16 Check
 
 | metric | before | after | change |
 |---|---:|---:|---:|
-| throughput (mut/s) | 16,902.53 | 17,425.13 | +3.09% |
+| throughput (mut/s) | 16,902.53 | 18,016.82 | +6.59% |
 
 The width-16 regression gate passed. All three records reported zero errors,
 overloads, full-state clones, and state-clone nanoseconds.
 
 ## Interpretation
 
-The page-encoding target fell by 42.14%, exceeding the 15% measurable
-improvement threshold. Throughput was 0.30% below the baseline, so the result
-does not meet the structural-success throughput threshold. Classification:
-**partial**.
+The page-encoding target fell by 44.23%, exceeding the 30% structural
+threshold. Width-1 throughput also exceeded its baseline. Classification:
+**structural success**.
 
-Physical mutation changed by -1.50%. Leaf load and entry clone timers decreased
-by 5.26% and 3.54%; leaf install clone increased 2.05%; cached refresh
-decreased 0.54%. The largest unrelated movement above 15% was superblock
-encoding at +16.03%, recorded as run variance. WAL group encode changed
-+11.55%, below that variance threshold.
+Physical mutation changed by +1.59%. Leaf load and entry clone timers decreased
+by 2.62% and 4.49%; leaf install clone increased 5.76%; cached refresh
+increased 3.25%. All listed unrelated components moved less than 15%.
 
 ## Next Bottleneck
 
@@ -187,23 +186,23 @@ For physical execution, the clone and cached-refresh total is 39.94%, above the
 30% threshold. The next engineering priority is leaf ownership and clone
 elimination. This experiment did not change leaf ownership.
 
-Among top-level processing categories, WAL append is largest at 619.449 ms;
-WAL group encode is 493.217 ms and is an attribution within WAL append. WAL
+Among top-level processing categories, WAL append is largest at 606.015 ms;
+WAL group encode is 475.750 ms and is an attribution within WAL append. WAL
 encoding was not changed.
 
 ## Experiment Status
 
-Implementation commit: `8782790cd5344f47b28e62399f8716b02f107ad2`.
-Classification: partial. The page format is unchanged. Direct encoding
+Implementation commit: `bd500f5d90d716001ce8613e85fb67f760044995`.
+Classification: structural success. The page format is unchanged. Direct encoding
 produces byte-identical 4096-byte page images. B-link split policy, batching
 semantics, WAL semantics, and recovery format are unchanged. Existing Phase 4
 status is unchanged; this work did not continue Phase 4 or start Phase 5.
 
 ## Artifacts
 
-- Width 1: [`planned-direct-encoding-width1.jsonl`](results/oci-a1-2ocpu-12g-200g/direct-encoding/planned-direct-encoding-width1.jsonl), SHA256 `8a88f34f67fa75a047d78cedd7d8c494a0df0b663027ccc602ca1be29966e1e8`
-- Width 16: [`planned-direct-encoding-width16.jsonl`](results/oci-a1-2ocpu-12g-200g/direct-encoding/planned-direct-encoding-width16.jsonl), SHA256 `60ac47b0af2413a94b1b0c477af4ff21e08ac4743189a1912e6ad4d5c6d27945`
+- Width 1: [`planned-direct-encoding-width1.jsonl`](results/oci-a1-2ocpu-12g-200g/direct-encoding/planned-direct-encoding-width1.jsonl), SHA256 `b201214455bf5472ea177a2315c0da12820971ae962ad425ffec25f41e5c1d11`
+- Width 16: [`planned-direct-encoding-width16.jsonl`](results/oci-a1-2ocpu-12g-200g/direct-encoding/planned-direct-encoding-width16.jsonl), SHA256 `5549c633df8143bce27fc3734380394f9c9697f98d0762d5ddd28343702f8546`
 
 Each artifact contains three validated records at the implementation SHA.
 Their local SHA256 values match the OCI files. The OCI raw files were moved to
-`/home/opc/dodb-oci-artifacts-direct-encoding-8782790/` after copying.
+`/home/opc/dodb-oci-artifacts-direct-encoding-bd500f5/` after copying.
