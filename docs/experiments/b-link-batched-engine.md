@@ -37,6 +37,15 @@ format is unchanged. Direct encoding produces byte-identical 4096-byte page
 images. B-link split policy, batching semantics, WAL semantics, and recovery
 format are unchanged.
 
+Planned serial leaf ownership and clone elimination are recorded in
+[`leaf-ownership-results.md`](leaf-ownership-results.md). The planned path now
+keeps one batch-local owning page copy in `WorkingBlinkState`, while
+`CachedLeaf` retains only a `PageId`. Committed Blink state remains immutable
+until WAL success. Page format, split semantics, WAL semantics, transaction
+ordering, and publication semantics are unchanged. Local correctness and
+clone-elimination smoke passed; OCI performance validation remains incomplete
+because the requested SSH identity was rejected.
+
 Baseline branch: `main`
 
 Baseline commit: `1ff96e1` (`storage: rely on crash-consistent storage snapshots`)
