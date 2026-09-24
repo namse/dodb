@@ -144,6 +144,10 @@ pub struct BlinkBatchMetrics {
     pub rejected_transactions: u64,
     pub logical_admission_nanos: u64,
     pub planning_nanos: u64,
+    pub planner_route_nanos: u64,
+    pub planner_route_calls: u64,
+    pub planner_route_page_visits: u64,
+    pub planner_route_right_link_hops: u64,
     pub state_clone_nanos: u64,
     pub physical_execution_nanos: u64,
     pub physical_mutation_nanos: u64,
@@ -2365,7 +2369,24 @@ fn plan_batch(
             let encoded_key = mutation.key().encode();
             validate_encoded_key(&encoded_key)?;
             let mut route_corrections = 0;
-            let leaf_id = find_leaf_with_metrics(state, &encoded_key, &mut route_corrections)?;
+            let mut route_page_visits = 0;
+            let route_started = Instant::now();
+            let leaf_id = find_leaf_with_metrics(
+                state,
+                &encoded_key,
+                &mut route_corrections,
+                Some(&mut route_page_visits),
+            )?;
+            metrics.planner_route_nanos = metrics
+                .planner_route_nanos
+                .saturating_add(elapsed_nanos(route_started));
+            metrics.planner_route_calls = metrics.planner_route_calls.saturating_add(1);
+            metrics.planner_route_page_visits = metrics
+                .planner_route_page_visits
+                .saturating_add(route_page_visits);
+            metrics.planner_route_right_link_hops = metrics
+                .planner_route_right_link_hops
+                .saturating_add(route_corrections);
             let route_hint = RouteHint {
                 encoded_key: encoded_key.clone(),
                 leaf_id,
@@ -3597,7 +3618,7 @@ fn query_state<S: ReadPageSource>(
     let start = DocumentKey::new(pk.as_bytes().to_vec(), Vec::new());
     let cursor = exclusive_after_sk
         .map(|sk| DocumentKey::new(pk.as_bytes().to_vec(), sk.as_bytes().to_vec()));
-    let mut leaf_id = find_leaf_with_metrics(state, &start.encode(), right_link_corrections)?;
+    let mut leaf_id = find_leaf_with_metrics(state, &start.encode(), right_link_corrections, None)?;
     let mut first = true;
     let mut visited = HashSet::new();
     let mut output = Vec::new();
@@ -3658,7 +3679,7 @@ fn scan_state<S: ReadPageSource>(
         return Ok(Vec::new());
     }
     let mut leaf_id = match cursor {
-        Some(key) => find_leaf_with_metrics(state, &key.encode(), right_link_corrections)?,
+        Some(key) => find_leaf_with_metrics(state, &key.encode(), right_link_corrections, None)?,
         None => leftmost_leaf(state)?,
     };
     let cursor = cursor.map(DocumentKey::encode);
@@ -3710,7 +3731,7 @@ fn find_entry_with_metrics<S: ReadPageSource>(
     key: &[u8],
     right_link_corrections: &mut u64,
 ) -> Result<Option<LeafEntry>> {
-    let leaf_id = find_leaf_with_metrics(state, key, right_link_corrections)?;
+    let leaf_id = find_leaf_with_metrics(state, key, right_link_corrections, None)?;
     let page = state.page(leaf_id)?;
     let BlinkPage::Leaf { entries, .. } = page.as_ref() else {
         return Err(Error::corruption("Blink route ended at non-leaf"));
@@ -3722,6 +3743,7 @@ fn find_leaf_with_metrics<S: ReadPageSource>(
     state: &S,
     key: &[u8],
     right_link_corrections: &mut u64,
+    mut page_visits: Option<&mut u64>,
 ) -> Result<PageId> {
     let mut page_id = state.root_page_id();
     let mut guard = HashSet::new();
@@ -3730,6 +3752,9 @@ fn find_leaf_with_metrics<S: ReadPageSource>(
             return Err(Error::corruption("Blink tree route contains a cycle"));
         }
         let page = state.page(page_id)?;
+        if let Some(page_visits) = page_visits.as_deref_mut() {
+            *page_visits = page_visits.saturating_add(1);
+        }
         let (high_key, right_sibling) = match page.as_ref() {
             BlinkPage::Leaf {
                 high_key,

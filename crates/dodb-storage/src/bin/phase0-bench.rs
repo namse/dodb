@@ -1458,6 +1458,10 @@ struct MetricDelta {
     rejected_transactions: u64,
     logical_admission_nanos: u64,
     planning_nanos: u64,
+    planner_route_nanos: u64,
+    planner_route_calls: u64,
+    planner_route_page_visits: u64,
+    planner_route_right_link_hops: u64,
     state_clone_nanos: u64,
     physical_execution_nanos: u64,
     physical_mutation_nanos: u64,
@@ -1709,6 +1713,22 @@ impl MetricDelta {
                 batch_before.logical_admission_nanos,
             ),
             planning_nanos: subtraction(batch_after.planning_nanos, batch_before.planning_nanos),
+            planner_route_nanos: subtraction(
+                batch_after.planner_route_nanos,
+                batch_before.planner_route_nanos,
+            ),
+            planner_route_calls: subtraction(
+                batch_after.planner_route_calls,
+                batch_before.planner_route_calls,
+            ),
+            planner_route_page_visits: subtraction(
+                batch_after.planner_route_page_visits,
+                batch_before.planner_route_page_visits,
+            ),
+            planner_route_right_link_hops: subtraction(
+                batch_after.planner_route_right_link_hops,
+                batch_before.planner_route_right_link_hops,
+            ),
             state_clone_nanos: subtraction(
                 batch_after.state_clone_nanos,
                 batch_before.state_clone_nanos,
@@ -2782,6 +2802,13 @@ fn build_record(
     json.u64("rejected_transactions", delta.rejected_transactions);
     json.u64("logical_admission_nanos", delta.logical_admission_nanos);
     json.u64("planning_nanos", delta.planning_nanos);
+    json.u64("planner_route_nanos", delta.planner_route_nanos);
+    json.u64("planner_route_calls", delta.planner_route_calls);
+    json.u64("planner_route_page_visits", delta.planner_route_page_visits);
+    json.u64(
+        "planner_route_right_link_hops",
+        delta.planner_route_right_link_hops,
+    );
     json.u64("state_clone_nanos_total", delta.state_clone_nanos);
     json.u64("physical_execution_nanos", delta.physical_execution_nanos);
     json.u64(
