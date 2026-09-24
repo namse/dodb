@@ -1422,11 +1422,13 @@ struct MetricDelta {
     wal_group_page_header_crc_nanos: u64,
     wal_group_page_frame_materialize_nanos: u64,
     wal_group_page_frame_append_nanos: u64,
+    wal_group_page_direct_encode_nanos: u64,
     wal_group_commit_digest_crc_nanos: u64,
     wal_group_commit_payload_crc_nanos: u64,
     wal_group_commit_header_crc_nanos: u64,
     wal_group_commit_frame_materialize_nanos: u64,
     wal_group_commit_frame_append_nanos: u64,
+    wal_group_commit_direct_encode_nanos: u64,
     wal_group_page_frames: u64,
     wal_group_commit_frames: u64,
     wal_group_page_validations: u64,
@@ -1617,6 +1619,10 @@ impl MetricDelta {
                 wal_after.group_page_frame_append_nanos,
                 wal_before.group_page_frame_append_nanos,
             ),
+            wal_group_page_direct_encode_nanos: subtraction(
+                wal_after.group_page_direct_encode_nanos,
+                wal_before.group_page_direct_encode_nanos,
+            ),
             wal_group_commit_digest_crc_nanos: subtraction(
                 wal_after.group_commit_digest_crc_nanos,
                 wal_before.group_commit_digest_crc_nanos,
@@ -1636,6 +1642,10 @@ impl MetricDelta {
             wal_group_commit_frame_append_nanos: subtraction(
                 wal_after.group_commit_frame_append_nanos,
                 wal_before.group_commit_frame_append_nanos,
+            ),
+            wal_group_commit_direct_encode_nanos: subtraction(
+                wal_after.group_commit_direct_encode_nanos,
+                wal_before.group_commit_direct_encode_nanos,
             ),
             wal_group_page_frames: subtraction(
                 wal_after.group_page_frames,
@@ -2735,6 +2745,10 @@ fn build_record(
         delta.wal_group_page_frame_append_nanos,
     );
     json.u64(
+        "wal_group_page_direct_encode_nanos_total",
+        delta.wal_group_page_direct_encode_nanos,
+    );
+    json.u64(
         "wal_group_commit_digest_crc_nanos_total",
         delta.wal_group_commit_digest_crc_nanos,
     );
@@ -2753,6 +2767,10 @@ fn build_record(
     json.u64(
         "wal_group_commit_frame_append_nanos_total",
         delta.wal_group_commit_frame_append_nanos,
+    );
+    json.u64(
+        "wal_group_commit_direct_encode_nanos_total",
+        delta.wal_group_commit_direct_encode_nanos,
     );
     json.u64("wal_group_page_frames_delta", delta.wal_group_page_frames);
     json.u64(
