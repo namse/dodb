@@ -25,6 +25,11 @@ still allocates decoded key components. The sync-disabled OCI width-1 result is
 a structural success, and the width-16 control passed its regression gate.
 These are CPU and engine diagnostics from the 30 GB root filesystem, not
 durability results or measurements on the unmounted 200 GB block volume.
+The allocation-free canonical key validation follow-up is recorded in
+[`key-validation-results.md`](key-validation-results.md). No page format, split
+policy, batch semantics, WAL semantics, or encoder format changed; only
+canonical encoded-key validation changed from allocating decode to
+allocation-free scanning.
 
 Baseline branch: `main`
 
