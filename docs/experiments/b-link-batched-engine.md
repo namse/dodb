@@ -18,6 +18,12 @@ WAL group encoding costs are attributed in
 [`wal-group-encoding-attribution.md`](wal-group-encoding-attribution.md). WAL
 format and semantics are unchanged.
 
+The trusted internal WAL page-image validation fast path and OCI result are
+recorded in [`trusted-wal-image-results.md`](trusted-wal-image-results.md).
+WAL format is unchanged. Public WAL append validation remains strict.
+Fault-injection and recovery paths remain strict. Only the release fast path
+for internally generated Blink WAL images skips redundant full page decoding.
+
 Physical execution costs are attributed in
 [`physical-execution-attribution.md`](physical-execution-attribution.md). No
 physical execution optimization was implemented in this task.
