@@ -24,6 +24,15 @@ WAL format is unchanged. Public WAL append validation remains strict.
 Fault-injection and recovery paths remain strict. Only the release fast path
 for internally generated Blink WAL images skips redundant full page decoding.
 
+Planner routing attribution and borrowed-page routing are recorded in
+[`planner-borrowed-routing-results.md`](planner-borrowed-routing-results.md).
+Only planner routing ownership changed: planner routing now borrows
+`BlinkPage` values from `BlinkState`, removing route-time page clones and
+`Arc` allocations. B-link structure, transaction ordering, dependency
+semantics, WAL semantics, publication, and recovery are unchanged. The OCI
+width-1 sync-disabled comparison meets the strong-success criteria; WAL
+append is now the largest measured top-level component.
+
 Physical execution costs are attributed in
 [`physical-execution-attribution.md`](physical-execution-attribution.md). No
 physical execution optimization was implemented in this task.
