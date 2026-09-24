@@ -18,13 +18,13 @@ Physical execution costs are attributed in
 [`physical-execution-attribution.md`](physical-execution-attribution.md). No
 physical execution optimization was implemented in this task.
 
-The allocation-free Blink page fit-check implementation and its current
-measurement status are recorded in
-[`fit-check-results.md`](fit-check-results.md). Fit checks now calculate exact
-body layout without serializing a page. OCI performance measurement is pending:
-SSH public-key authentication to the benchmark host was rejected, so the
-remote worktree and filesystem prechecks could not be completed. No performance
-conclusion is drawn.
+The exact-layout Blink page fit-check implementation and its measurements are
+recorded in [`fit-check-results.md`](fit-check-results.md). Fit checks no
+longer serialize a page to calculate fit, though canonical-key validation
+still allocates decoded key components. The sync-disabled OCI width-1 result is
+a structural success, and the width-16 control passed its regression gate.
+These are CPU and engine diagnostics from the 30 GB root filesystem, not
+durability results or measurements on the unmounted 200 GB block volume.
 
 Baseline branch: `main`
 
