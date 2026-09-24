@@ -29,6 +29,12 @@ semantics, and recovery format are unchanged. Target-specific AArch64 CRC
 codegen is the next engineering investigation; shared descent and arenas remain
 later candidates.
 
+The AArch64 CRC caller-specialization diagnostic is recorded in
+[`aarch64-crc-specialization-results.md`](aarch64-crc-specialization-results.md).
+The local Apple AArch64 prototype did not recover the global build gain; no
+production WAL code changed, and the OCI A/B/C comparison remains unmeasured
+because target SSH access was unavailable.
+
 The trusted internal WAL page-image validation fast path and OCI result are
 recorded in [`trusted-wal-image-results.md`](trusted-wal-image-results.md).
 WAL format is unchanged. Public WAL append validation remains strict.
