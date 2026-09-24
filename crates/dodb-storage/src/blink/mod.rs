@@ -2178,8 +2178,7 @@ fn validate_encoded_key(key: &[u8]) -> Result<()> {
     if key.len() > crate::MAX_ENCODED_KEY_SIZE {
         return Err(Error::invalid_input("encoded document key is too large"));
     }
-    DocumentKey::decode(key)
-        .map(|_| ())
+    DocumentKey::validate_encoded(key)
         .map_err(|error| Error::invalid_input(format!("document key is not canonical: {error}")))
 }
 
