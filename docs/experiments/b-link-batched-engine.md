@@ -1468,3 +1468,14 @@ forensic rebuild and rerun corrected the classification to structural/useful
 success, and the validated candidate source has been restored to this branch.
 Provenance evidence, corrected metrics, restore commits, and artifact hashes are in
 [`admitted-key-reuse-results.md`](admitted-key-reuse-results.md).
+
+## 25. Dual Main vs Planned Rebaseline
+
+The OCI A1 sync-disabled dual rebaseline measured 3.04x same-source `main-btree`
+vs planned and 3.59x exact-current-main vs planned across the 12-scenario
+multiwriter geometric means. Both exceed the Very strong development-checkpoint
+threshold; writer scaling from 16 to 64 remained effectively flat. These are
+CPU/engine diagnostics on the root XFS filesystem, not a durability or adoption
+result. The full scenario table, single-writer controls, source/harness proofs,
+build provenance, and raw artifacts are in
+[`dual-main-vs-planned-results.md`](dual-main-vs-planned-results.md).
