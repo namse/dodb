@@ -101,7 +101,6 @@ pub struct DependencyMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteHint {
-    pub encoded_key: Vec<u8>,
     pub leaf_id: PageId,
 }
 
@@ -117,7 +116,6 @@ pub struct PhysicalTransactionPlan {
     pub fifo_position: usize,
     pub provisional_revision: ProvisionalRevisionToken,
     pub mutations: Vec<PlannedMutation>,
-    pub encoded_keys: Vec<Vec<u8>>,
     pub mutated_key_set: BTreeSet<Vec<u8>>,
     pub dependency_metadata: DependencyMetadata,
 }
@@ -2401,10 +2399,7 @@ fn plan_batch(
             metrics.planner_route_right_link_hops = metrics
                 .planner_route_right_link_hops
                 .saturating_add(route_corrections);
-            let route_hint = RouteHint {
-                encoded_key: encoded_key.clone(),
-                leaf_id,
-            };
+            let route_hint = RouteHint { leaf_id };
             mutations.push(PlannedMutation {
                 mutation: mutation.clone(),
                 encoded_key: encoded_key.clone(),
@@ -2460,16 +2455,14 @@ fn plan_batch(
         } else {
             Vec::new()
         };
-        let encoded_keys = mutations
+        let mutated_key_set = mutations
             .iter()
             .map(|mutation| mutation.encoded_key.clone())
-            .collect::<Vec<_>>();
-        let mutated_key_set = encoded_keys.iter().cloned().collect::<BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         plan.transactions.push(PhysicalTransactionPlan {
             fifo_position: transaction.fifo_position,
             provisional_revision: transaction.provisional_revision,
             mutations,
-            encoded_keys,
             mutated_key_set,
             dependency_metadata: DependencyMetadata {
                 same_transaction_positions,
@@ -8267,7 +8260,6 @@ mod tests {
                         ordinal: fifo_position as u64 + 1,
                     },
                     mutations: Vec::new(),
-                    encoded_keys: Vec::new(),
                     mutated_key_set: BTreeSet::new(),
                     dependency_metadata: DependencyMetadata::default(),
                 })
