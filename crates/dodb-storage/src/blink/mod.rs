@@ -351,13 +351,13 @@ fn encode_blink_superblock(sb: &BlinkSuperblock) -> Result<[u8; PAGE_SIZE]> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BlinkValueRef {
-    Inline(Vec<u8>),
+    Inline(Arc<[u8]>),
     Overflow { head: PageId, length: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LeafEntry {
-    key: Vec<u8>,
+    key: Arc<[u8]>,
     revision: Revision,
     value: Option<BlinkValueRef>,
 }
@@ -420,7 +420,7 @@ impl BlinkPage {
             Self::Leaf { lsn, entries, .. } => {
                 *lsn = committed;
                 for entry in entries {
-                    if entry.revision == provisional && mutated_keys.contains(&entry.key) {
+                    if entry.revision == provisional && mutated_keys.contains(entry.key.as_ref()) {
                         entry.revision = Revision::from(committed);
                     }
                 }
@@ -2990,7 +2990,7 @@ fn apply_parallel_leaf_mutation(
     }
     let value = match &planned_mutation.mutation {
         TransactionMutation::Put { value, .. } if value.len() <= INLINE_VALUE_LIMIT => {
-            Some(BlinkValueRef::Inline(value.clone()))
+            Some(BlinkValueRef::Inline(Arc::from(value.as_slice())))
         }
         TransactionMutation::Put { .. } => {
             return Ok(Some(ParallelFallbackReason::OverflowOrAllocator));
@@ -2998,7 +2998,12 @@ fn apply_parallel_leaf_mutation(
         TransactionMutation::Delete { .. } => None,
     };
     let mut next_entries = entries.clone();
-    match next_entries.binary_search_by(|entry| entry.key.cmp(&planned_mutation.encoded_key)) {
+    match next_entries.binary_search_by(|entry| {
+        entry
+            .key
+            .as_ref()
+            .cmp(planned_mutation.encoded_key.as_slice())
+    }) {
         Ok(entry_index) => {
             if matches!(
                 next_entries[entry_index].value,
@@ -3007,7 +3012,7 @@ fn apply_parallel_leaf_mutation(
                 return Ok(Some(ParallelFallbackReason::OverflowOrAllocator));
             }
             next_entries[entry_index] = LeafEntry {
-                key: planned_mutation.encoded_key.clone(),
+                key: Arc::from(planned_mutation.encoded_key.as_slice()),
                 revision: Revision::from(commit_lsn),
                 value,
             };
@@ -3015,7 +3020,7 @@ fn apply_parallel_leaf_mutation(
         Err(entry_index) => next_entries.insert(
             entry_index,
             LeafEntry {
-                key: planned_mutation.encoded_key.clone(),
+                key: Arc::from(planned_mutation.encoded_key.as_slice()),
                 revision: Revision::from(commit_lsn),
                 value,
             },
@@ -3369,7 +3374,7 @@ fn cached_leaf_contains(
     }
     entries
         .first()
-        .is_none_or(|entry| encoded_key >= entry.key.as_slice())
+        .is_none_or(|entry| encoded_key >= entry.key.as_ref())
 }
 
 fn apply_cached_leaf_mutation(
@@ -3405,13 +3410,13 @@ fn apply_cached_leaf_mutation(
         else {
             return Err(Error::corruption("cached Blink page is not a leaf"));
         };
-        match entries.binary_search_by(|entry| entry.key.cmp(encoded)) {
+        match entries.binary_search_by(|entry| entry.key.as_ref().cmp(encoded.as_slice())) {
             Ok(entry_index) => {
                 old_value = Some(
                     std::mem::replace(
                         &mut entries[entry_index],
                         LeafEntry {
-                            key: encoded.clone(),
+                            key: Arc::from(encoded.as_slice()),
                             revision,
                             value: value_ref,
                         },
@@ -3429,7 +3434,7 @@ fn apply_cached_leaf_mutation(
                 entries.insert(
                     entry_index,
                     LeafEntry {
-                        key: encoded.clone(),
+                        key: Arc::from(encoded.as_slice()),
                         revision,
                         value: value_ref,
                     },
@@ -3519,7 +3524,7 @@ fn find_leaf_from_hint<S: BlinkMutationState>(
         };
         if entries
             .first()
-            .is_some_and(|entry| key < entry.key.as_slice())
+            .is_some_and(|entry| key < entry.key.as_ref())
         {
             return find_mutation_leaf_with_metrics(state, key, right_link_corrections);
         }
@@ -3580,7 +3585,7 @@ fn find_mutation_leaf_with_metrics<S: BlinkMutationState>(
                 entries,
                 ..
             } => {
-                let index = entries.partition_point(|entry| key >= entry.key.as_slice());
+                let index = entries.partition_point(|entry| key >= entry.key.as_ref());
                 page_id = if index == 0 {
                     *leftmost_child
                 } else {
@@ -3713,7 +3718,10 @@ fn scan_state<S: ReadPageSource>(
             return Err(Error::corruption("Blink scan reached non-leaf page"));
         };
         for entry in entries {
-            if cursor.as_ref().is_some_and(|cursor| entry.key <= *cursor) {
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| entry.key.as_ref() <= cursor.as_slice())
+            {
                 continue;
             }
             let key = DocumentKey::decode(&entry.key)
@@ -3750,7 +3758,10 @@ fn find_entry_with_metrics<S: ReadPageSource>(
     let BlinkPage::Leaf { entries, .. } = page.as_ref() else {
         return Err(Error::corruption("Blink route ended at non-leaf"));
     };
-    Ok(entries.iter().find(|entry| entry.key == key).cloned())
+    Ok(entries
+        .iter()
+        .find(|entry| entry.key.as_ref() == key)
+        .cloned())
 }
 
 fn find_leaf_in_blink_state_borrowed(
@@ -3798,7 +3809,7 @@ fn find_leaf_in_blink_state_borrowed(
                 entries,
                 ..
             } => {
-                let index = entries.partition_point(|entry| key >= entry.key.as_slice());
+                let index = entries.partition_point(|entry| key >= entry.key.as_ref());
                 page_id = if index == 0 {
                     *leftmost_child
                 } else {
@@ -3854,7 +3865,7 @@ fn find_leaf_with_metrics<S: ReadPageSource>(
                 entries,
                 ..
             } => {
-                let index = entries.partition_point(|entry| key >= entry.key.as_slice());
+                let index = entries.partition_point(|entry| key >= entry.key.as_ref());
                 page_id = if index == 0 {
                     *leftmost_child
                 } else {
@@ -3879,7 +3890,7 @@ fn leftmost_leaf<S: ReadPageSource>(state: &S) -> Result<PageId> {
 
 fn materialize_value<S: ReadPageSource>(state: &S, value: &BlinkValueRef) -> Result<Vec<u8>> {
     match value {
-        BlinkValueRef::Inline(value) => Ok(value.clone()),
+        BlinkValueRef::Inline(value) => Ok(value.as_ref().to_vec()),
         BlinkValueRef::Overflow { head, length } => {
             let mut output = Vec::with_capacity(*length as usize);
             let mut page_id = Some(*head);
@@ -3933,7 +3944,7 @@ fn apply_mutation<S: BlinkMutationState>(
     else {
         return Err(Error::corruption("Blink mutation route ended at non-leaf"));
     };
-    let existing = entries.binary_search_by(|entry| entry.key.cmp(&encoded));
+    let existing = entries.binary_search_by(|entry| entry.key.as_ref().cmp(encoded.as_slice()));
     let value_ref = match value {
         Some(bytes) => Some(allocate_value(state, dirty, bytes)?),
         None => None,
@@ -3942,7 +3953,7 @@ fn apply_mutation<S: BlinkMutationState>(
         Ok(index) => {
             let old = entries[index].value.clone();
             entries[index] = LeafEntry {
-                key: encoded,
+                key: Arc::from(encoded),
                 revision,
                 value: value_ref,
             };
@@ -3967,7 +3978,7 @@ fn apply_mutation<S: BlinkMutationState>(
             entries.insert(
                 index,
                 LeafEntry {
-                    key: encoded,
+                    key: Arc::from(encoded),
                     revision,
                     value: value_ref,
                 },
@@ -4063,7 +4074,7 @@ fn allocate_value<S: BlinkMutationState>(
     bytes: &[u8],
 ) -> Result<BlinkValueRef> {
     if bytes.len() <= INLINE_VALUE_LIMIT {
-        return Ok(BlinkValueRef::Inline(bytes.to_vec()));
+        return Ok(BlinkValueRef::Inline(Arc::from(bytes)));
     }
     if bytes.len() > MAX_VALUE_SIZE {
         return Err(Error::invalid_input("value exceeds Blink maximum"));
@@ -4160,14 +4171,16 @@ fn split_leaf<S: BlinkMutationState>(
 ) -> Result<()> {
     let split = choose_leaf_split(&entries, old_high.as_deref(), old_right);
     let right_id = allocate_page(state, dirty);
-    let separator = entries[split].key.clone();
+    let separator = entries[split].key.as_ref().to_vec();
+    let mut left_entries = entries;
+    let right_entries = left_entries.split_off(split);
     state.insert_page(
         leaf_id,
         BlinkPage::Leaf {
             lsn: Lsn::new(revision.get()),
             high_key: Some(separator.clone()),
             right_sibling: Some(right_id),
-            entries: entries[..split].to_vec(),
+            entries: left_entries,
         },
     );
     state.insert_page(
@@ -4176,7 +4189,7 @@ fn split_leaf<S: BlinkMutationState>(
             lsn: Lsn::new(revision.get()),
             high_key: old_high,
             right_sibling: old_right,
-            entries: entries[split..].to_vec(),
+            entries: right_entries,
         },
     );
     dirty.insert(leaf_id);
@@ -4512,7 +4525,7 @@ fn encode_leaf_record_into(target: &mut [u8], entry: &LeafEntry) -> Result<()> {
     validate_encoded_key(&entry.key)?;
     let (flags, value_length, aux, inline) = match &entry.value {
         None => (0u8, 0u64, NULL_PAGE_ID, &[][..]),
-        Some(BlinkValueRef::Inline(value)) => (1u8, value.len() as u64, 0, value.as_slice()),
+        Some(BlinkValueRef::Inline(value)) => (1u8, value.len() as u64, 0, value.as_ref()),
         Some(BlinkValueRef::Overflow { head, length }) => (2u8, *length, head.get(), &[][..]),
     };
     let record_length = leaf_record_encoded_len(entry)?;
@@ -4693,7 +4706,7 @@ fn encode_leaf_record(entry: &LeafEntry) -> Result<Vec<u8>> {
     validate_encoded_key(&entry.key)?;
     let (flags, value_length, aux, inline) = match &entry.value {
         None => (0u8, 0u64, NULL_PAGE_ID, &[][..]),
-        Some(BlinkValueRef::Inline(value)) => (1u8, value.len() as u64, 0, value.as_slice()),
+        Some(BlinkValueRef::Inline(value)) => (1u8, value.len() as u64, 0, value.as_ref()),
         Some(BlinkValueRef::Overflow { head, length }) => (2u8, *length, head.get(), &[][..]),
     };
     let length = LEAF_RECORD_HEADER_SIZE
@@ -4896,7 +4909,7 @@ fn decode_leaf_record(bytes: &[u8], slot_key_length: usize) -> Result<LeafEntry>
     if key_end > bytes.len() {
         return Err(Error::corruption("Blink leaf key exceeds record"));
     }
-    let key = bytes[LEAF_RECORD_HEADER_SIZE..key_end].to_vec();
+    let key = Arc::<[u8]>::from(&bytes[LEAF_RECORD_HEADER_SIZE..key_end]);
     validate_encoded_key(&key).map_err(|_| Error::corruption("Blink leaf key is not canonical"))?;
     let value = match flags {
         0 if value_length == 0 && aux == NULL_PAGE_ID && bytes.len() == key_end => None,
@@ -4907,7 +4920,7 @@ fn decode_leaf_record(bytes: &[u8], slot_key_length: usize) -> Result<LeafEntry>
             if end != bytes.len() || aux != 0 {
                 return Err(Error::corruption("Blink inline value record is invalid"));
             }
-            Some(BlinkValueRef::Inline(bytes[key_end..end].to_vec()))
+            Some(BlinkValueRef::Inline(Arc::from(&bytes[key_end..end])))
         }
         2 if bytes.len() == key_end && aux != NULL_PAGE_ID && value_length > 0 => {
             Some(BlinkValueRef::Overflow {
@@ -5094,7 +5107,7 @@ fn decode_high_key(
 
 fn ensure_sorted_leaf(entries: &[LeafEntry]) -> Result<()> {
     for pair in entries.windows(2) {
-        if pair[0].key >= pair[1].key {
+        if pair[0].key.as_ref() >= pair[1].key.as_ref() {
             return Err(Error::corruption(
                 "Blink leaf entries are not strictly ordered",
             ));
@@ -5431,11 +5444,11 @@ fn walk_tree(
                 ));
             }
             for entry in entries {
-                if lower.is_some_and(|lower| entry.key.as_slice() < lower)
-                    || upper.is_some_and(|upper| entry.key.as_slice() >= upper)
+                if lower.is_some_and(|lower| entry.key.as_ref() < lower)
+                    || upper.is_some_and(|upper| entry.key.as_ref() >= upper)
                     || high_key
                         .as_ref()
-                        .is_some_and(|high| entry.key.as_slice() >= high.as_slice())
+                        .is_some_and(|high| entry.key.as_ref() >= high.as_slice())
                 {
                     return Err(Error::corruption(format!(
                         "Blink leaf key violates fence or parent range: key={:?} lower={:?} upper={:?} high={:?}",
@@ -5463,12 +5476,12 @@ fn walk_tree(
                     "Blink internal fence or level is invalid",
                 ));
             }
-            let mut child_lower = lower.map(ToOwned::to_owned);
+            let mut child_lower: Option<Vec<u8>> = lower.map(ToOwned::to_owned);
             walk_tree(
                 state,
                 *leftmost_child,
                 child_lower.as_deref(),
-                entries.first().map(|entry| entry.key.as_slice()).or(upper),
+                entries.first().map(|entry| entry.key.as_ref()).or(upper),
                 reachable,
                 leaves,
                 max_revision,
@@ -5550,10 +5563,11 @@ fn check_sibling_links(state: &BlinkState, leaves: &[PageId]) -> Result<()> {
             else {
                 unreachable!()
             };
-            if next_entries
-                .first()
-                .is_some_and(|next_key| entries.last().is_some_and(|last| next_key.key <= last.key))
-            {
+            if next_entries.first().is_some_and(|next_key| {
+                entries
+                    .last()
+                    .is_some_and(|last| next_key.key.as_ref() <= last.key.as_ref())
+            }) {
                 return Err(Error::corruption(
                     "Blink sibling key ranges are not increasing",
                 ));
@@ -5623,7 +5637,7 @@ fn subtree_min_key(state: &BlinkState, mut page_id: PageId) -> Result<Option<Vec
     loop {
         match BlinkMutationState::page(state, page_id) {
             Some(BlinkPage::Leaf { entries, .. }) => {
-                return Ok(entries.first().map(|entry| entry.key.clone()));
+                return Ok(entries.first().map(|entry| entry.key.as_ref().to_vec()));
             }
             Some(BlinkPage::Internal { leftmost_child, .. }) => page_id = *leftmost_child,
             _ => {
@@ -5781,11 +5795,159 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
 mod tests {
     use super::*;
 
+    fn payload_sharing_test_state() -> (BlinkState, PageId, Vec<u8>, Vec<u8>) {
+        let page_id = PageId::new(FIRST_DATA_PAGE);
+        let first_key = DocumentKey::new(b"shared".to_vec(), b"first".to_vec()).encode();
+        let second_key = DocumentKey::new(b"shared".to_vec(), b"second".to_vec()).encode();
+        let first_entry = LeafEntry {
+            key: Arc::from(first_key.as_slice()),
+            revision: Revision::new(11),
+            value: Some(BlinkValueRef::Inline(Arc::from(&b"first-value"[..]))),
+        };
+        let second_entry = LeafEntry {
+            key: Arc::from(second_key.as_slice()),
+            revision: Revision::new(12),
+            value: Some(BlinkValueRef::Inline(Arc::from(&b"second-value"[..]))),
+        };
+        let state = BlinkState {
+            pages: BTreeMap::from([(
+                page_id,
+                BlinkPage::Leaf {
+                    lsn: Lsn::new(12),
+                    high_key: None,
+                    right_sibling: None,
+                    entries: vec![first_entry, second_entry],
+                },
+            )]),
+            root_page_id: page_id,
+            free_list_head: None,
+            high_water_page_id: page_id,
+            allow_page_reuse: false,
+        };
+        (state, page_id, first_key, second_key)
+    }
+
+    #[test]
+    fn leaf_page_clone_shares_key_and_inline_value_payloads() {
+        let (state, page_id, _, _) = payload_sharing_test_state();
+        let base_page = state.pages.get(&page_id).unwrap();
+        let cloned_page = base_page.clone();
+        let BlinkPage::Leaf {
+            entries: base_entries,
+            ..
+        } = base_page
+        else {
+            unreachable!();
+        };
+        let BlinkPage::Leaf {
+            entries: cloned_entries,
+            ..
+        } = &cloned_page
+        else {
+            unreachable!();
+        };
+        assert_eq!(base_entries.len(), 2);
+        for (base_entry, cloned_entry) in base_entries.iter().zip(cloned_entries) {
+            assert!(Arc::ptr_eq(&base_entry.key, &cloned_entry.key));
+            assert_eq!(base_entry.revision, cloned_entry.revision);
+            match (&base_entry.value, &cloned_entry.value) {
+                (Some(BlinkValueRef::Inline(base)), Some(BlinkValueRef::Inline(cloned))) => {
+                    assert!(Arc::ptr_eq(base, cloned));
+                    assert_eq!(base.as_ref(), cloned.as_ref());
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn working_overlay_shares_untouched_payloads_and_isolates_restamps() {
+        let (base, page_id, first_key, second_key) = payload_sharing_test_state();
+        let BlinkPage::Leaf {
+            entries: base_entries,
+            ..
+        } = base.pages.get(&page_id).unwrap()
+        else {
+            unreachable!();
+        };
+        let mut working = WorkingBlinkState::new(&base, false);
+        assert!(working.ensure_overlay_page(page_id).unwrap());
+        let BlinkPage::Leaf {
+            entries: overlay_entries,
+            ..
+        } = working.pages.get(&page_id).unwrap()
+        else {
+            unreachable!();
+        };
+        assert!(Arc::ptr_eq(&base_entries[0].key, &overlay_entries[0].key));
+        let Some(BlinkValueRef::Inline(base_first_value)) = &base_entries[0].value else {
+            unreachable!();
+        };
+        let Some(BlinkValueRef::Inline(overlay_first_value)) = &overlay_entries[0].value else {
+            unreachable!();
+        };
+        assert!(Arc::ptr_eq(base_first_value, overlay_first_value));
+
+        let provisional = Revision::new(99);
+        let committed = Lsn::new(123);
+        let replacement_key: Arc<[u8]> = Arc::from(second_key.as_slice());
+        let replacement_value: Arc<[u8]> = Arc::from(&b"overlay-value"[..]);
+        let BlinkPage::Leaf { entries, .. } = working.pages.get_mut(&page_id).unwrap() else {
+            unreachable!();
+        };
+        entries[1] = LeafEntry {
+            key: replacement_key,
+            revision: provisional,
+            value: Some(BlinkValueRef::Inline(replacement_value)),
+        };
+        let mutated_keys = BTreeSet::from([second_key.clone()]);
+        working
+            .pages
+            .get_mut(&page_id)
+            .unwrap()
+            .restamp(provisional, committed, &mutated_keys);
+
+        let BlinkPage::Leaf {
+            entries: base_entries_after,
+            ..
+        } = base.pages.get(&page_id).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(base_entries_after[0].key.as_ref(), first_key.as_slice());
+        assert_eq!(base_entries_after[0].revision, Revision::new(11));
+        assert_eq!(base_first_value.as_ref(), b"first-value");
+        assert_eq!(base_entries_after[1].key.as_ref(), second_key.as_slice());
+        assert_eq!(base_entries_after[1].revision, Revision::new(12));
+        let Some(BlinkValueRef::Inline(base_second_value)) = &base_entries_after[1].value else {
+            unreachable!();
+        };
+        assert_eq!(base_second_value.as_ref(), b"second-value");
+
+        let BlinkPage::Leaf {
+            entries: overlay_entries_after,
+            ..
+        } = working.pages.get(&page_id).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(overlay_entries_after[1].revision, Revision::from(committed));
+        assert_eq!(overlay_entries_after[1].key.as_ref(), second_key.as_slice());
+        let Some(BlinkValueRef::Inline(overlay_second_value)) = &overlay_entries_after[1].value
+        else {
+            unreachable!();
+        };
+        assert_eq!(overlay_second_value.as_ref(), b"overlay-value");
+        assert!(!Arc::ptr_eq(base_second_value, overlay_second_value));
+    }
+
     fn layout_test_leaf_entry(index: u64, inline_value_len: usize) -> LeafEntry {
         LeafEntry {
-            key: DocumentKey::new(b"layout".to_vec(), index.to_be_bytes().to_vec()).encode(),
+            key: DocumentKey::new(b"layout".to_vec(), index.to_be_bytes().to_vec())
+                .encode()
+                .into(),
             revision: Revision::new(index + 1),
-            value: Some(BlinkValueRef::Inline(vec![0x5a; inline_value_len])),
+            value: Some(BlinkValueRef::Inline(vec![0x5a; inline_value_len].into())),
         }
     }
 
@@ -5926,7 +6088,7 @@ mod tests {
                 high_key: None,
                 right_sibling: None,
                 entries: vec![LeafEntry {
-                    key: differential_key(1),
+                    key: differential_key(1).into(),
                     revision: Revision::new(2),
                     value: None,
                 }],
@@ -5936,7 +6098,7 @@ mod tests {
                 high_key: None,
                 right_sibling: None,
                 entries: vec![LeafEntry {
-                    key: differential_key(1),
+                    key: differential_key(1).into(),
                     revision: Revision::new(3),
                     value: Some(BlinkValueRef::Overflow {
                         head: PageId::new(FIRST_DATA_PAGE + 9),
@@ -6009,15 +6171,13 @@ mod tests {
                         .map(|entry_index| {
                             let random_value = next_layout_random(&mut random_state);
                             LeafEntry {
-                                key: differential_key(entry_index as u64),
+                                key: differential_key(entry_index as u64).into(),
                                 revision: Revision::new(random_value.max(1)),
                                 value: match random_value % 3 {
                                     0 => None,
-                                    1 => Some(BlinkValueRef::Inline(vec![
-                                        random_value as u8;
-                                        random_value as usize
-                                            % 48
-                                    ])),
+                                    1 => Some(BlinkValueRef::Inline(
+                                        vec![random_value as u8; random_value as usize % 48].into(),
+                                    )),
                                     _ => Some(BlinkValueRef::Overflow {
                                         head: PageId::new(FIRST_DATA_PAGE + random_value % 200),
                                         length: random_value.max(1),
@@ -6113,12 +6273,12 @@ mod tests {
             + LEAF_RECORD_HEADER_SIZE
             + boundary_entry.key.len();
         let exact_value_len = BODY_SIZE - fixed_size;
-        boundary_entry.value = Some(BlinkValueRef::Inline(vec![0x33; exact_value_len]));
+        boundary_entry.value = Some(BlinkValueRef::Inline(vec![0x33; exact_value_len].into()));
         assert_leaf_layout_matches_encoder(std::slice::from_ref(&boundary_entry), Some(&high_key));
         assert!(leaf_body_layout(std::slice::from_ref(&boundary_entry), Some(&high_key)).is_ok());
-        if let Some(BlinkValueRef::Inline(value)) = &mut boundary_entry.value {
-            value.push(0x33);
-        }
+        boundary_entry.value = Some(BlinkValueRef::Inline(
+            vec![0x33; exact_value_len + 1].into(),
+        ));
         assert_leaf_layout_matches_encoder(std::slice::from_ref(&boundary_entry), Some(&high_key));
         assert!(leaf_body_layout(std::slice::from_ref(&boundary_entry), Some(&high_key)).is_err());
     }
@@ -6172,11 +6332,11 @@ mod tests {
                         .to_vec();
                     let value_length = (next_layout_random(&mut random_state) % 5_500) as usize;
                     LeafEntry {
-                        key: DocumentKey::new(partition, sort_key).encode(),
+                        key: DocumentKey::new(partition, sort_key).encode().into(),
                         revision: Revision::new(index as u64 + 1),
                         value: match next_layout_random(&mut random_state) % 3 {
                             0 => None,
-                            1 => Some(BlinkValueRef::Inline(vec![0x61; value_length])),
+                            1 => Some(BlinkValueRef::Inline(vec![0x61; value_length].into())),
                             _ => Some(BlinkValueRef::Overflow {
                                 head: PageId::new(FIRST_DATA_PAGE + index as u64),
                                 length: value_length as u64 + 1,
@@ -6583,9 +6743,9 @@ mod tests {
                         high_key: Some(right_key.clone()),
                         right_sibling: Some(right),
                         entries: vec![LeafEntry {
-                            key: left_key,
+                            key: left_key.into(),
                             revision: Revision::new(1),
-                            value: Some(BlinkValueRef::Inline(vec![1])),
+                            value: Some(BlinkValueRef::Inline(vec![1].into())),
                         }],
                     },
                 ),
@@ -6596,9 +6756,9 @@ mod tests {
                         high_key: None,
                         right_sibling: None,
                         entries: vec![LeafEntry {
-                            key: right_key,
+                            key: right_key.into(),
                             revision: Revision::new(2),
-                            value: Some(BlinkValueRef::Inline(vec![2])),
+                            value: Some(BlinkValueRef::Inline(vec![2].into())),
                         }],
                     },
                 ),
@@ -7446,21 +7606,32 @@ mod tests {
                 .filter_map(|image| decode_blink_page(&image.image, image.page_id).ok())
                 .find_map(|page| match page {
                     BlinkPage::Leaf { entries, .. }
-                        if entries.iter().any(|entry| entry.key == encoded_key) =>
+                        if entries
+                            .iter()
+                            .any(|entry| entry.key.as_ref() == encoded_key.as_slice()) =>
                     {
                         Some(entries)
                     }
                     _ => None,
                 })
                 .unwrap();
-            let entry = page.iter().find(|entry| entry.key == encoded_key).unwrap();
+            let entry = page
+                .iter()
+                .find(|entry| entry.key.as_ref() == encoded_key.as_slice())
+                .unwrap();
             assert_eq!(entry.revision, expected_revision.into());
             if transaction_index == 0 {
-                assert_eq!(entry.value, Some(BlinkValueRef::Inline(b"put".to_vec())));
+                assert_eq!(
+                    entry.value,
+                    Some(BlinkValueRef::Inline(Arc::from(&b"put"[..])))
+                );
             } else if transaction_index == 1 {
                 assert_eq!(entry.value, None);
             } else {
-                assert_eq!(entry.value, Some(BlinkValueRef::Inline(b"final".to_vec())));
+                assert_eq!(
+                    entry.value,
+                    Some(BlinkValueRef::Inline(Arc::from(&b"final"[..])))
+                );
             }
         }
         store.check_invariants().unwrap();
