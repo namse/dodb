@@ -1463,7 +1463,8 @@ are in [`planner-key-copy-results.md`](planner-key-copy-results.md).
 
 ## 24. Admitted Mutation Key Reuse
 
-The follow-up admission/planner reuse candidate passed local smoke but was
-rejected on the OCI A1 A/B and normally reverted. Its ownership audit, full
-front-end metrics, regression review, rollback commits, and raw artifact hashes
-are in [`admitted-key-reuse-results.md`](admitted-key-reuse-results.md).
+The first OCI rejection used a binary built from the wrong checkout. A clean
+forensic rebuild and rerun corrected the classification to structural/useful
+success; the candidate remains reverted. Provenance evidence, corrected
+metrics, rollback commits, and artifact hashes are in
+[`admitted-key-reuse-results.md`](admitted-key-reuse-results.md).

@@ -2,11 +2,12 @@
 
 ## Result
 
-The planned-path optimization was implemented and measured, then rejected. The
-candidate did not reduce normalized admission-plus-planning cost or improve
-throughput on the OCI A1 host. Both implementation commits were normally
-reverted; the branch ends on the good source plus this report and preserved raw
-artifacts.
+The planned-path optimization was implemented and measured. The initial OCI
+reject is retained below as historical evidence, but its candidate binary came
+from the wrong checkout and cannot be attributed to the measured source. A
+clean forensic rebuild and rerun corrected the result to **structural/useful
+success**. Both implementation commits remain reverted; this forensic task did
+not reapply candidate source.
 
 ## Duplicate-work audit and design
 
@@ -152,14 +153,16 @@ repeat were consistent. Candidate-to-repeat throughput ratios were 0.917x at
 width 1 and 0.875x at width 16. Repeat raw files are retained alongside the
 four required artifacts.
 
-## Classification and remaining duplication
+## Historical classification and remaining duplication
 
-**Reject.** The width-1 front-end non-route ratio was 1.153x and throughput
+The original **Reject** used an OCI binary with invalid candidate provenance.
+Its width-1 front-end non-route ratio was 1.153x and throughput
 ratio was 0.899x, beyond the reject thresholds. Width-16 throughput was 0.868x,
 below its 0.95x floor. Physical execution, page encoding, WAL append, and WAL
 group encoding each increased by at least 15% in the primary comparison. The
-base repeat confirms the throughput drop was not explained by a one-off high
-base run. These are measured regressions; no WAL changes or follow-up WAL work
+base repeat was consistent with the primary base. Those values remain
+historical raw measurements, not a valid candidate comparison. The corrected
+result is in the forensic section below. No WAL changes or follow-up WAL work
 were made.
 
 Remaining duplicate work included condition-key encoding in overlay observation
@@ -187,3 +190,117 @@ Implementation commits `f085e7b8d6e28761e31b55a4b4c0539c968c649f` and
 `4ac65c33437fdd224b947c3ddfd9a6f31613ee25` and
 `6fb9d7c2e0a475de110c6a875fa1cf17e6d92b5c`, respectively. No history rewrite
 was used.
+
+## Build provenance anomaly and forensic rerun
+
+### Why the original candidate SHA was invalid
+
+The original candidate SHA256 `3899baaff31950565f21eed0d832b29fe2f1df268299ac7a740aba57619aa53f`
+exactly matches the generic/default AArch64 binary recorded for source
+`9e82d9da4db9c1818ce725addf112281020dc6a7` in
+[`current-crc-reattribution-results.md`](current-crc-reattribution-results.md).
+That older source had no `.cargo/config.toml`; its repository `+crc` build had
+a different SHA256, `f1d8252ab249d94171412a3e989d5306ca541d05fac75a4ae783d01c58355e42`.
+
+The root cause was a working-directory error in the previous candidate build
+command. It checked out the candidate with `git -C
+/home/opc/dodb-admitted-key-reuse-candidate checkout ...`, but then ran Cargo
+without changing directory from `/home/opc/dodb`. That checkout was still at
+`b309b0fa9f187f7b8f14b1640bb55b9b892926d9`, whose parent is `9e82d9d`; it had
+no `.cargo/config.toml`. The target's saved
+`bin-phase0-bench.json` fingerprint records `"rustflags":[]`. The earlier
+verbose build log was not retained, but the command cwd, checkout lineage,
+missing config, fingerprint, and exact generic binary SHA identify the error.
+The `b309b0f` commit changes only experiment documentation and raw results
+relative to `9e82d9d`; Blink production source and Cargo build configuration are
+identical between those commits.
+
+### Fresh worktrees, build flags, and binary identity
+
+New detached worktrees were created at `/home/opc/dodb-forensic-base` and
+`/home/opc/dodb-forensic-candidate`. Their clean HEADs were respectively
+`ac181f5900ed46a83e616f3d28bcb85bac88ca48` and
+`1eaabbce8ec29948fe886008dd3e4548d1a8d748`. The candidate source proof records
+`encode_leaf_record_into_validated()` after layout validation,
+`RouteHint` without `encoded_key`, `PhysicalTransactionPlan` without
+`encoded_keys`, and `AdmittedTransaction<'a>` borrowing its request while
+holding `encoded_mutation_keys`.
+
+All builds used brand-new target directories and `env -u RUSTFLAGS`:
+
+```bash
+env -u RUSTFLAGS CARGO_TARGET_DIR=<fresh-target> \
+  cargo build --locked --release -p dodb-storage --bin phase0-bench -vv
+```
+
+The saved verbose invocations show `-C target-feature=+crc` for both
+`crc32c` and `dodb_storage` in base and both candidate builds. The repository
+`.cargo/config.toml` supplied the flag. Candidate builds A and B used distinct
+targets and produced byte-identical binaries.
+
+| Binary | SHA256 | Size |
+| --- | --- | ---: |
+| Base (`/home/opc/dodb-forensic-binaries/base-phase0-bench`) | `8f402d6b3660e8b16d8899b49830bc4b6bb93d70398aa66e56cdc3e7fff0baa3` | 2,427,072 |
+| Candidate A (`/home/opc/dodb-forensic-binaries/candidate-a-phase0-bench`) | `79122436e330be122059f8a4bf5908406e55b74596bfab2ee3cf745dd17fb6cb` | 2,427,600 |
+| Candidate B (`/home/opc/dodb-forensic-binaries/candidate-b-phase0-bench`) | `79122436e330be122059f8a4bf5908406e55b74596bfab2ee3cf745dd17fb6cb` | 2,427,600 |
+
+Candidate A/B hashes match each other and differ from both base and the old
+`3899ba...` generic binary. Read-only executable copies were hashed again
+after copying. `plan_batch` is present in both disassemblies: its symbol size
+is `0x20fc` bytes in base and `0x20c0` bytes in candidate. The archived
+disassembly diff and its SHA256 provide additional codegen evidence. The
+validated leaf-record writer and its call site are present in the candidate
+source proof; it is inlined in the final binary.
+
+### Corrected OCI results
+
+The verified immutable binary copies were used for the rerun. Each width used
+three measurements with paired seeds: width 1 seeds `973348902`–`973348904`
+(`0x3a042026` plus repetition), and width 16 seeds `973283366`–`973283368`
+(`0x3a032026` plus repetition). The first pass interleaved base/candidate per
+repetition and is retained separately. The canonical JSONL set was then run
+with `--repetitions 3`, preserving harness repetition indices 0–2. All
+repetitions had zero errors and overloads.
+
+| Width-1 metric | Base | Candidate | Candidate/base |
+| --- | ---: | ---: | ---: |
+| Throughput median (min–max), mutations/s | 47,609 (46,929–49,205) | 48,368 (47,150–49,410) | 1.016x |
+| Logical admission (ns/mutation) | 942.2 | 653.6 | 0.694x |
+| Planning | 2,302.7 | 2,254.2 | 0.979x |
+| Route | 1,098.2 | 1,053.4 | 0.959x |
+| Non-route planning | 1,204.5 | 1,163.7 | 0.966x |
+| Front-end total | 3,224.3 | 2,914.0 | 0.904x |
+| Front-end non-route | 2,146.2 | 1,815.2 | 0.846x |
+| Physical execution | 3,990.1 | 3,994.7 | 1.001x |
+| Page encode | 1,690.2 | 1,706.2 | 1.010x |
+| WAL append | 4,279.0 | 4,401.3 | 1.029x |
+| WAL group encode | 2,283.2 | 2,319.4 | 1.016x |
+
+| Width-16 metric | Base | Candidate | Candidate/base |
+| --- | ---: | ---: | ---: |
+| Throughput median (min–max), mutations/s | 42,144 (40,793–43,218) | 44,347 (42,898–44,423) | 1.052x |
+| Logical admission (ns/mutation) | 971.6 | 583.9 | 0.601x |
+| Planning | 3,729.1 | 3,607.7 | 0.968x |
+| Route | 1,614.6 | 1,632.9 | 1.011x |
+| Front-end total | 4,693.6 | 4,205.8 | 0.896x |
+| Front-end non-route | 3,079.0 | 2,584.8 | 0.839x |
+
+There were no unrelated timer regressions of 15% or more. Physical execution,
+page encode, WAL append, and WAL group encode were each within 3% of base in the
+width-1 primary.
+
+**Corrected classification: Structural/useful success.** Width-1 front-end
+non-route was `0.846x`, front-end total `0.904x`, throughput `1.016x`, and
+width-16 throughput `1.052x`. This meets all structural/useful thresholds but
+does not meet the strong thresholds (`0.80x` front-end non-route and `1.03x`
+throughput). The candidate remains reverted as requested; this finding does
+not reapply it to production HEAD.
+
+Forensic logs, source/binary proofs, interleaved and canonical raw JSONL, and a
+SHA256 manifest are in
+[`admitted-key-reuse-forensic`](results/oci-a1-2ocpu-12g-200g/admitted-key-reuse-forensic/).
+The manifest SHA256 is
+`e60f79a888794997a74cabaffde62cd84f5305bbb94bdf8ce1d40c27b0156032`.
+The OCI backup is
+`/home/opc/dodb-oci-artifacts-admitted-key-reuse-forensic-1eaabbc/`; local and
+remote checksums match.
