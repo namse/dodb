@@ -304,3 +304,16 @@ The manifest SHA256 is
 The OCI backup is
 `/home/opc/dodb-oci-artifacts-admitted-key-reuse-forensic-1eaabbc/`; local and
 remote checksums match.
+
+### Final disposition
+
+The corrected forensic rerun classified the candidate as a
+structural/useful success.
+
+The two earlier reverts were subsequently reverted, restoring the
+validated candidate source to the experimental branch. The restore commits
+are `2797d9f` (`Reapply "storage: reuse admitted Blink mutation keys"`) and
+`bda613f` (`Reapply "storage: keep serial Blink validation allocation stable"`).
+
+The restored production source is equivalent to candidate
+`1eaabbce8ec29948fe886008dd3e4548d1a8d748`.

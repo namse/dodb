@@ -1465,6 +1465,6 @@ are in [`planner-key-copy-results.md`](planner-key-copy-results.md).
 
 The first OCI rejection used a binary built from the wrong checkout. A clean
 forensic rebuild and rerun corrected the classification to structural/useful
-success; the candidate remains reverted. Provenance evidence, corrected
-metrics, rollback commits, and artifact hashes are in
+success, and the validated candidate source has been restored to this branch.
+Provenance evidence, corrected metrics, restore commits, and artifact hashes are in
 [`admitted-key-reuse-results.md`](admitted-key-reuse-results.md).
