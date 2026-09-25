@@ -122,3 +122,10 @@ There is no OCI artifact backup because no OCI artifacts were created.
 
 - Base: `ff16d09f4bfc19d92961cbe91172e4e7ed3731dc`
 - Implementation: `b874631b3dcca757f19ef950c046beb6ca01992e`
+
+The rejected implementation was subsequently reverted from the experimental
+branch. The result document and raw local artifacts are retained as historical
+evidence. Production WAL encoding continues to use the previous incremental
+CRC digest path.
+
+Revert commit: `dc7a776`
