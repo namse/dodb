@@ -43,6 +43,15 @@ diagnostic CRC high-priority gate; it is a known-hardware control, not a
 portable production implementation. Stable physical page encoding remains the
 follow-up candidate after the CRC backend investigation.
 
+The production AArch64 Linux CRC32 requirement and repository-default build
+policy are recorded in
+[`aarch64-crc-baseline-results.md`](aarch64-crc-baseline-results.md). Its
+same-source OCI comparison confirms that ordinary `aarch64-unknown-linux-gnu`
+release builds produce the same binary and equivalent results as an explicit
+global `+crc` build. This decision supersedes the earlier recommendation to
+investigate portable CRC runtime specialization; no later optimization was
+started in this task.
+
 The trusted internal WAL page-image validation fast path and OCI result are
 recorded in [`trusted-wal-image-results.md`](trusted-wal-image-results.md).
 WAL format is unchanged. Public WAL append validation remains strict.
