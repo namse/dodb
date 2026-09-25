@@ -1417,3 +1417,10 @@ fell from 2.00 to 1.00 per mutation, WAL bytes fell 49.59%, and throughput
 improved 16.98% for default release and 16.68% for the separate `+crc` build.
 The crash-recovery audit, normalized costs, and raw artifacts are recorded in
 [`superblock-wal-elision-results.md`](superblock-wal-elision-results.md).
+
+## 22. Leaf Payload Sharing
+
+The `Arc<[u8]>` leaf-payload COW experiment met the strong-success thresholds
+on the same-host OCI width-1 A/B and improved the width-16 control. Full
+normalized costs, raw artifact hashes, and the regression review are in
+[`leaf-payload-sharing-results.md`](leaf-payload-sharing-results.md).
