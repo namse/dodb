@@ -2205,16 +2205,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
 }
 
 fn validate_request_values(request: &TransactionRequest, limits: &StorageLimits) -> Result<()> {
-    for mutation in &request.mutations {
-        let key = mutation.key().encode();
-        validate_encoded_key(&key)?;
-        if let TransactionMutation::Put { value, .. } = mutation
-            && value.len() > limits.max_value_size
-        {
-            return Err(Error::invalid_input("value exceeds Blink maximum"));
-        }
-    }
-    Ok(())
+    validate_and_encode_mutation_keys(request, limits).map(|_| ())
 }
 
 fn validate_and_encode_mutation_keys(
