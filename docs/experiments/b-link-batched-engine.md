@@ -90,6 +90,13 @@ format is unchanged. Direct encoding produces byte-identical 4096-byte page
 images. B-link split policy, batching semantics, WAL semantics, and recovery
 format are unchanged.
 
+The redundant leaf encoded-key validation result is recorded in
+[`page-encode-validation-results.md`](page-encode-validation-results.md). The
+layout boundary retains ordering and canonical-key validation while the
+record writer reuses that validated precondition. OCI width-1 physical page
+encode cost is 0.784x the fresh base and throughput is 1.045x; the width-16
+control is 0.977x base. Page bytes and format are unchanged.
+
 Planned serial leaf ownership and clone elimination are recorded in
 [`leaf-ownership-results.md`](leaf-ownership-results.md). The planned path now
 keeps one batch-local owning page copy in `WorkingBlinkState`, while
