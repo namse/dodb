@@ -4508,7 +4508,7 @@ fn encode_leaf_body_into(
         if record_offset < layout.records_start {
             return Err(Error::invalid_input("Blink leaf records exceed page"));
         }
-        encode_leaf_record_into(
+        encode_leaf_record_into_validated(
             &mut body[record_offset..record_offset + record_length],
             entry,
         )?;
@@ -4521,8 +4521,7 @@ fn encode_leaf_body_into(
     Ok(())
 }
 
-fn encode_leaf_record_into(target: &mut [u8], entry: &LeafEntry) -> Result<()> {
-    validate_encoded_key(&entry.key)?;
+fn encode_leaf_record_into_validated(target: &mut [u8], entry: &LeafEntry) -> Result<()> {
     let (flags, value_length, aux, inline) = match &entry.value {
         None => (0u8, 0u64, NULL_PAGE_ID, &[][..]),
         Some(BlinkValueRef::Inline(value)) => (1u8, value.len() as u64, 0, value.as_ref()),
@@ -7053,6 +7052,24 @@ mod tests {
         let mut bad_checksum = image;
         bad_checksum[100] ^= 1;
         assert!(decode_blink_page(&bad_checksum, page_id).is_err());
+    }
+
+    #[test]
+    fn page_encoder_rejects_noncanonical_leaf_key() {
+        let page_id = PageId::new(FIRST_DATA_PAGE);
+        let page = BlinkPage::Leaf {
+            lsn: Lsn::ZERO,
+            high_key: None,
+            right_sibling: None,
+            entries: vec![LeafEntry {
+                key: Arc::from([0xff]),
+                revision: Revision::new(1),
+                value: None,
+            }],
+        };
+
+        assert!(encode_blink_page(page_id, &page).is_err());
+        assert!(encode_blink_page_reference(page_id, &page).is_err());
     }
 
     #[test]
