@@ -589,10 +589,9 @@ struct LogicalOverlay<'a> {
     entries: BTreeMap<Vec<u8>, LogicalEntry>,
 }
 
-struct AdmittedTransaction<'a> {
+struct AdmittedTransaction {
     fifo_position: usize,
-    request: &'a TransactionRequest,
-    encoded_mutation_keys: Vec<Vec<u8>>,
+    request: TransactionRequest,
     provisional_revision: ProvisionalRevisionToken,
 }
 
@@ -1837,16 +1836,12 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 }
                 return Err(error);
             }
-            let encoded_mutation_keys =
-                match validate_and_encode_mutation_keys(request, &self.config.limits) {
-                    Ok(encoded_mutation_keys) => encoded_mutation_keys,
-                    Err(error) => {
-                        self.batch_metrics.rejected_transactions =
-                            self.batch_metrics.rejected_transactions.saturating_add(1);
-                        results.push(Err(error));
-                        continue;
-                    }
-                };
+            if let Err(error) = validate_request_values(request, &self.config.limits) {
+                self.batch_metrics.rejected_transactions =
+                    self.batch_metrics.rejected_transactions.saturating_add(1);
+                results.push(Err(error));
+                continue;
+            }
             if let Err(error) = overlay.validate_conditions(&request.conditions) {
                 if matches!(error, Error::Conflict(_)) {
                     self.batch_metrics.conflicted_transactions =
@@ -1863,11 +1858,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 transaction_position: fifo_position,
                 ordinal,
             };
-            overlay.accept_preencoded(request, &encoded_mutation_keys, provisional_revision)?;
+            overlay.accept(request, provisional_revision);
             admitted.push(AdmittedTransaction {
                 fifo_position,
-                request,
-                encoded_mutation_keys,
+                request: request.clone(),
                 provisional_revision,
             });
             accepted_count = accepted_count.saturating_add(1);
@@ -2205,25 +2199,16 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
 }
 
 fn validate_request_values(request: &TransactionRequest, limits: &StorageLimits) -> Result<()> {
-    validate_and_encode_mutation_keys(request, limits).map(|_| ())
-}
-
-fn validate_and_encode_mutation_keys(
-    request: &TransactionRequest,
-    limits: &StorageLimits,
-) -> Result<Vec<Vec<u8>>> {
-    let mut encoded_keys = Vec::with_capacity(request.mutations.len());
     for mutation in &request.mutations {
-        let encoded_key = mutation.key().encode();
-        validate_encoded_key(&encoded_key)?;
+        let key = mutation.key().encode();
+        validate_encoded_key(&key)?;
         if let TransactionMutation::Put { value, .. } = mutation
             && value.len() > limits.max_value_size
         {
             return Err(Error::invalid_input("value exceeds Blink maximum"));
         }
-        encoded_keys.push(encoded_key);
     }
-    Ok(encoded_keys)
+    Ok(())
 }
 
 fn validate_encoded_key(key: &[u8]) -> Result<()> {
@@ -2321,24 +2306,14 @@ impl<'a> LogicalOverlay<'a> {
         Ok(())
     }
 
-    fn accept_preencoded(
-        &mut self,
-        request: &TransactionRequest,
-        encoded_mutation_keys: &[Vec<u8>],
-        token: ProvisionalRevisionToken,
-    ) -> Result<()> {
-        if request.mutations.len() != encoded_mutation_keys.len() {
-            return Err(Error::invariant(
-                "prepared mutation key count does not match request mutations",
-            ));
-        }
-        for (mutation, encoded_key) in request.mutations.iter().zip(encoded_mutation_keys) {
+    fn accept(&mut self, request: &TransactionRequest, token: ProvisionalRevisionToken) {
+        for mutation in &request.mutations {
             let (present, value) = match mutation {
                 TransactionMutation::Put { value, .. } => (true, Some(value.clone())),
                 TransactionMutation::Delete { .. } => (false, None),
             };
             self.entries.insert(
-                encoded_key.clone(),
+                mutation.key().encode(),
                 LogicalEntry {
                     present,
                     value,
@@ -2347,7 +2322,6 @@ impl<'a> LogicalOverlay<'a> {
                 },
             );
         }
-        Ok(())
     }
 }
 
@@ -2377,7 +2351,7 @@ fn validate_conditions<S: ReadPageSource>(
 
 fn plan_batch(
     state: &BlinkState,
-    admitted: &[AdmittedTransaction<'_>],
+    admitted: &[AdmittedTransaction],
     metrics: &mut BlinkBatchMetrics,
 ) -> Result<BatchPlan> {
     let mut plan = BatchPlan::default();
@@ -2403,18 +2377,9 @@ fn plan_batch(
                 });
             }
         }
-        if transaction.request.mutations.len() != transaction.encoded_mutation_keys.len() {
-            return Err(Error::invariant(
-                "prepared mutation key count does not match request mutations",
-            ));
-        }
-        for (mutation_index, (mutation, encoded_key)) in transaction
-            .request
-            .mutations
-            .iter()
-            .zip(&transaction.encoded_mutation_keys)
-            .enumerate()
-        {
+        for (mutation_index, mutation) in transaction.request.mutations.iter().enumerate() {
+            let encoded_key = mutation.key().encode();
+            validate_encoded_key(&encoded_key)?;
             let mut route_corrections = 0;
             let mut route_page_visits = 0;
             let route_started = Instant::now();
@@ -2441,7 +2406,7 @@ fn plan_batch(
                 route_hint,
             });
             metrics.routes_calculated = metrics.routes_calculated.saturating_add(1);
-            if let Some(predecessor) = last_key_writer.get(encoded_key).copied() {
+            if let Some(predecessor) = last_key_writer.get(&encoded_key).copied() {
                 dependency_metadata.same_key_predecessors.push(predecessor);
                 plan.dependencies.push(DependencyEdge {
                     predecessor,
@@ -2467,7 +2432,7 @@ fn plan_batch(
                     kind: DependencyKind::StructuralRoute,
                 });
             }
-            last_key_writer.insert(encoded_key.clone(), transaction.fifo_position);
+            last_key_writer.insert(encoded_key, transaction.fifo_position);
             last_leaf_writer.insert(leaf_id, transaction.fifo_position);
             let leaf_group_index = *leaf_group_indices.entry(leaf_id).or_insert_with(|| {
                 let index = plan.leaf_groups.len();
@@ -8055,60 +8020,64 @@ mod tests {
         assert_eq!(first_leaf, same_leaf);
         assert_ne!(first_leaf, different_leaf);
 
-        let requests = vec![
-            TransactionRequest::new(
-                Vec::new(),
-                vec![
-                    TransactionMutation::Put {
-                        key: first_key.clone(),
-                        value: b"first".to_vec(),
-                    },
-                    TransactionMutation::Put {
-                        key: same_leaf_key.clone(),
-                        value: b"same-leaf".to_vec(),
-                    },
-                    TransactionMutation::Put {
-                        key: first_key.clone(),
-                        value: b"duplicate".to_vec(),
-                    },
-                ],
-            ),
-            TransactionRequest::new(
-                vec![TransactionCondition::Exists {
-                    key: first_key.clone(),
-                }],
-                vec![TransactionMutation::Put {
-                    key: first_key.clone(),
-                    value: b"conditioned".to_vec(),
-                }],
-            ),
-            TransactionRequest::new(
-                vec![TransactionCondition::Exists {
-                    key: first_key.clone(),
-                }],
-                vec![TransactionMutation::Put {
-                    key: different_leaf_key.clone(),
-                    value: b"different-leaf".to_vec(),
-                }],
-            ),
-        ];
-        let admitted = requests
-            .iter()
-            .enumerate()
-            .map(|(fifo_position, request)| AdmittedTransaction {
-                fifo_position,
-                request,
-                encoded_mutation_keys: request
-                    .mutations
-                    .iter()
-                    .map(|mutation| mutation.key().encode())
-                    .collect(),
+        let admitted = vec![
+            AdmittedTransaction {
+                fifo_position: 0,
+                request: TransactionRequest::new(
+                    Vec::new(),
+                    vec![
+                        TransactionMutation::Put {
+                            key: first_key.clone(),
+                            value: b"first".to_vec(),
+                        },
+                        TransactionMutation::Put {
+                            key: same_leaf_key.clone(),
+                            value: b"same-leaf".to_vec(),
+                        },
+                        TransactionMutation::Put {
+                            key: first_key.clone(),
+                            value: b"duplicate".to_vec(),
+                        },
+                    ],
+                ),
                 provisional_revision: ProvisionalRevisionToken {
-                    transaction_position: fifo_position,
-                    ordinal: fifo_position as u64 + 1,
+                    transaction_position: 0,
+                    ordinal: 1,
                 },
-            })
-            .collect::<Vec<_>>();
+            },
+            AdmittedTransaction {
+                fifo_position: 1,
+                request: TransactionRequest::new(
+                    vec![TransactionCondition::Exists {
+                        key: first_key.clone(),
+                    }],
+                    vec![TransactionMutation::Put {
+                        key: first_key.clone(),
+                        value: b"conditioned".to_vec(),
+                    }],
+                ),
+                provisional_revision: ProvisionalRevisionToken {
+                    transaction_position: 1,
+                    ordinal: 2,
+                },
+            },
+            AdmittedTransaction {
+                fifo_position: 2,
+                request: TransactionRequest::new(
+                    vec![TransactionCondition::Exists {
+                        key: first_key.clone(),
+                    }],
+                    vec![TransactionMutation::Put {
+                        key: different_leaf_key.clone(),
+                        value: b"different-leaf".to_vec(),
+                    }],
+                ),
+                provisional_revision: ProvisionalRevisionToken {
+                    transaction_position: 2,
+                    ordinal: 3,
+                },
+            },
+        ];
         let mut metrics = BlinkBatchMetrics::default();
         let plan = plan_batch(&store.state, &admitted, &mut metrics).unwrap();
         let first_encoded = first_key.encode();
@@ -8176,60 +8145,6 @@ mod tests {
                 && edge.kind == DependencyKind::SameTargetPage
         }));
         assert_eq!(plan.transactions[1].provisional_revision.ordinal, 2);
-    }
-
-    #[test]
-    fn prepared_mutation_keys_match_existing_encoding_and_preserve_limits() {
-        let request = TransactionRequest::new(
-            Vec::new(),
-            vec![
-                TransactionMutation::Put {
-                    key: DocumentKey::new(vec![1, 0, 2], vec![3, 0]),
-                    value: b"value".to_vec(),
-                },
-                TransactionMutation::Delete {
-                    key: DocumentKey::new(Vec::new(), vec![4, 5]),
-                },
-            ],
-        );
-        let prepared =
-            validate_and_encode_mutation_keys(&request, &StorageLimits::default()).unwrap();
-        assert_eq!(prepared.len(), request.mutations.len());
-        assert_eq!(
-            prepared,
-            request
-                .mutations
-                .iter()
-                .map(|mutation| mutation.key().encode())
-                .collect::<Vec<_>>()
-        );
-
-        let oversized_key_request = TransactionRequest::new(
-            Vec::new(),
-            vec![TransactionMutation::Delete {
-                key: DocumentKey::new(vec![1; crate::MAX_ENCODED_KEY_SIZE], Vec::new()),
-            }],
-        );
-        assert!(matches!(
-            validate_and_encode_mutation_keys(&oversized_key_request, &StorageLimits::default()),
-            Err(Error::InvalidInput(_))
-        ));
-
-        let oversized_value_request = TransactionRequest::new(
-            Vec::new(),
-            vec![TransactionMutation::Put {
-                key: DocumentKey::new(b"key".to_vec(), Vec::new()),
-                value: vec![1, 2, 3],
-            }],
-        );
-        let limits = StorageLimits {
-            max_value_size: 2,
-            ..StorageLimits::default()
-        };
-        assert!(matches!(
-            validate_and_encode_mutation_keys(&oversized_value_request, &limits),
-            Err(Error::InvalidInput(_))
-        ));
     }
 
     #[test]
