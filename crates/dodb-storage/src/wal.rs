@@ -790,7 +790,8 @@ impl<F: DurableFile> WalLog<F> {
                 let payload_checksum = crc32c::crc32c_append(payload_checksum, &page.image);
                 attribution.group_page_payload_crc_nanos += elapsed_nanos(payload_crc_started)?;
                 let digest_started = Instant::now();
-                digest = crc32c::crc32c_combine(digest, payload_checksum, PAGE_IMAGE_PAYLOAD_SIZE);
+                digest = crc32c::crc32c_append(digest, &page_id_bytes);
+                digest = crc32c::crc32c_append(digest, &page.image);
                 attribution.group_commit_digest_crc_nanos += elapsed_nanos(digest_started)?;
                 let record_lsn = first_record_lsn
                     .get()
@@ -1926,102 +1927,6 @@ mod tests {
                 concatenated.extend_from_slice(&payload);
             }
             assert_eq!(digest, crc32c::crc32c(&concatenated));
-        }
-    }
-
-    #[test]
-    fn crc32c_combine_matches_randomized_byte_stream_concatenation() {
-        let mut state = 0x91e1_0da5_c79e_7b1d_u64;
-        for case_index in 0..2_048 {
-            let first_length = (case_index * 37) % 8_193;
-            let second_length = (case_index * 113 + 1) % 8_193;
-            let mut first = vec![0u8; first_length];
-            let mut second = vec![0u8; second_length];
-            for byte in first.iter_mut().chain(second.iter_mut()) {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                *byte = (state >> 32) as u8;
-            }
-            let mut concatenated = first.clone();
-            concatenated.extend_from_slice(&second);
-            let combined = crc32c::crc32c_combine(
-                crc32c::crc32c(&first),
-                crc32c::crc32c(&second),
-                second.len(),
-            );
-            assert_eq!(combined, crc32c::crc32c(&concatenated), "case {case_index}");
-        }
-    }
-
-    #[test]
-    fn crc32c_combine_matches_page_payload_digest_for_randomized_pages() {
-        let mut state = 0x4cf5_ad43_2745_937f_u64;
-        for case_index in 0..1_200 {
-            let mut image = [0u8; PAGE_SIZE];
-            for byte in &mut image {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1_442_695_040_888_963_407);
-                *byte = (state >> 32) as u8;
-            }
-            let page_id_bytes = state.rotate_left(23).wrapping_add(case_index).to_le_bytes();
-            let mut payload = Vec::with_capacity(PAGE_IMAGE_PAYLOAD_SIZE);
-            payload.extend_from_slice(&page_id_bytes);
-            payload.extend_from_slice(&image);
-            let payload_checksum = crc32c::crc32c(&page_id_bytes);
-            let payload_checksum = crc32c::crc32c_append(payload_checksum, &image);
-            let old_digest = crc32c::crc32c_append(0, &page_id_bytes);
-            let old_digest = crc32c::crc32c_append(old_digest, &image);
-            let combined_digest =
-                crc32c::crc32c_combine(0, payload_checksum, PAGE_IMAGE_PAYLOAD_SIZE);
-            assert_eq!(
-                payload_checksum,
-                crc32c::crc32c(&payload),
-                "payload {case_index}"
-            );
-            assert_eq!(old_digest, combined_digest, "digest {case_index}");
-        }
-    }
-
-    #[test]
-    fn crc32c_combine_matches_randomized_multi_page_commit_digest() {
-        let mut state = 0xa076_1d64_78bd_642f_u64;
-        for case_index in 0..1_200 {
-            let page_count = case_index % 64 + 1;
-            let mut old_digest = 0u32;
-            let mut combined_digest = 0u32;
-            let mut concatenated = Vec::with_capacity(page_count * PAGE_IMAGE_PAYLOAD_SIZE);
-            for page_index in 0..page_count {
-                let mut image = [0u8; PAGE_SIZE];
-                for byte in &mut image {
-                    state = state
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1_442_695_040_888_963_407);
-                    *byte = (state >> 32) as u8;
-                }
-                let page_id_bytes = state
-                    .rotate_left(17)
-                    .wrapping_add(page_index as u64 + case_index as u64)
-                    .to_le_bytes();
-                let payload_checksum = crc32c::crc32c(&page_id_bytes);
-                let payload_checksum = crc32c::crc32c_append(payload_checksum, &image);
-                old_digest = crc32c::crc32c_append(old_digest, &page_id_bytes);
-                old_digest = crc32c::crc32c_append(old_digest, &image);
-                combined_digest = crc32c::crc32c_combine(
-                    combined_digest,
-                    payload_checksum,
-                    PAGE_IMAGE_PAYLOAD_SIZE,
-                );
-                concatenated.extend_from_slice(&page_id_bytes);
-                concatenated.extend_from_slice(&image);
-            }
-            assert_eq!(old_digest, combined_digest, "commit {case_index}");
-            assert_eq!(
-                old_digest,
-                crc32c::crc32c(&concatenated),
-                "stream {case_index}"
-            );
         }
     }
 
