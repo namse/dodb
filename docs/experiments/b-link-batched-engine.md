@@ -35,6 +35,14 @@ The local Apple AArch64 prototype did not recover the global build gain; no
 production WAL code changed, and the OCI A/B/C comparison remains unmeasured
 because target SSH access was unavailable.
 
+The current-HEAD OCI default versus global `+crc` reattribution is recorded in
+[`current-crc-reattribution-results.md`](current-crc-reattribution-results.md).
+At source SHA `9e82d9d`, global `+crc` reduced WAL group encode by 25.4%, WAL
+append by 13.9%, and raised width-1 throughput by 3.9%. This passes the
+diagnostic CRC high-priority gate; it is a known-hardware control, not a
+portable production implementation. Stable physical page encoding remains the
+follow-up candidate after the CRC backend investigation.
+
 The trusted internal WAL page-image validation fast path and OCI result are
 recorded in [`trusted-wal-image-results.md`](trusted-wal-image-results.md).
 WAL format is unchanged. Public WAL append validation remains strict.
