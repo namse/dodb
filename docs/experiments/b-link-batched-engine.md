@@ -29,6 +29,11 @@ semantics, and recovery format are unchanged. Target-specific AArch64 CRC
 codegen is the next engineering investigation; shared descent and arenas remain
 later candidates.
 
+The page-CRC reuse experiment is recorded in
+[`wal-crc-combine-results.md`](wal-crc-combine-results.md). Combine preserved
+WAL bytes, but local digest-combine cost increased sharply, so the candidate
+was rejected and the OCI run was skipped.
+
 The AArch64 CRC caller-specialization diagnostic is recorded in
 [`aarch64-crc-specialization-results.md`](aarch64-crc-specialization-results.md).
 The local Apple AArch64 prototype did not recover the global build gain; no
