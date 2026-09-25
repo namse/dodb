@@ -1460,3 +1460,10 @@ The planner key-copy cleanup removed two unused encoded-key duplicates and
 showed lower planning cost on OCI, with inconclusive overall classification.
 The usage audit, correctness evidence, A/B metrics, and raw artifact hashes
 are in [`planner-key-copy-results.md`](planner-key-copy-results.md).
+
+## 24. Admitted Mutation Key Reuse
+
+The follow-up admission/planner reuse candidate passed local smoke but was
+rejected on the OCI A1 A/B and normally reverted. Its ownership audit, full
+front-end metrics, regression review, rollback commits, and raw artifact hashes
+are in [`admitted-key-reuse-results.md`](admitted-key-reuse-results.md).
