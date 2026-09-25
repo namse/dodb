@@ -1453,3 +1453,10 @@ The `Arc<[u8]>` leaf-payload COW experiment met the strong-success thresholds
 on the same-host OCI width-1 A/B and improved the width-16 control. Full
 normalized costs, raw artifact hashes, and the regression review are in
 [`leaf-payload-sharing-results.md`](leaf-payload-sharing-results.md).
+
+## 23. Planner Key Copy Cleanup
+
+The planner key-copy cleanup removed two unused encoded-key duplicates and
+showed lower planning cost on OCI, with inconclusive overall classification.
+The usage audit, correctness evidence, A/B metrics, and raw artifact hashes
+are in [`planner-key-copy-results.md`](planner-key-copy-results.md).

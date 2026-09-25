@@ -7990,6 +7990,164 @@ mod tests {
     }
 
     #[test]
+    fn planned_key_copy_cleanup_preserves_routes_dependencies_and_key_set() {
+        let mut store = planned_store();
+        for key_index in 0..120u64 {
+            store
+                .put(wide_key(key_index), vec![key_index as u8; 8])
+                .unwrap();
+        }
+        let first_key = wide_key(0);
+        let same_leaf_key = wide_key(1);
+        let different_leaf_key = wide_key(10_000);
+        let first_leaf =
+            find_leaf_in_blink_state_borrowed(&store.state, &first_key.encode(), &mut 0, &mut 0)
+                .unwrap();
+        let same_leaf = find_leaf_in_blink_state_borrowed(
+            &store.state,
+            &same_leaf_key.encode(),
+            &mut 0,
+            &mut 0,
+        )
+        .unwrap();
+        let different_leaf = find_leaf_in_blink_state_borrowed(
+            &store.state,
+            &different_leaf_key.encode(),
+            &mut 0,
+            &mut 0,
+        )
+        .unwrap();
+        assert_eq!(first_leaf, same_leaf);
+        assert_ne!(first_leaf, different_leaf);
+
+        let admitted = vec![
+            AdmittedTransaction {
+                fifo_position: 0,
+                request: TransactionRequest::new(
+                    Vec::new(),
+                    vec![
+                        TransactionMutation::Put {
+                            key: first_key.clone(),
+                            value: b"first".to_vec(),
+                        },
+                        TransactionMutation::Put {
+                            key: same_leaf_key.clone(),
+                            value: b"same-leaf".to_vec(),
+                        },
+                        TransactionMutation::Put {
+                            key: first_key.clone(),
+                            value: b"duplicate".to_vec(),
+                        },
+                    ],
+                ),
+                provisional_revision: ProvisionalRevisionToken {
+                    transaction_position: 0,
+                    ordinal: 1,
+                },
+            },
+            AdmittedTransaction {
+                fifo_position: 1,
+                request: TransactionRequest::new(
+                    vec![TransactionCondition::Exists {
+                        key: first_key.clone(),
+                    }],
+                    vec![TransactionMutation::Put {
+                        key: first_key.clone(),
+                        value: b"conditioned".to_vec(),
+                    }],
+                ),
+                provisional_revision: ProvisionalRevisionToken {
+                    transaction_position: 1,
+                    ordinal: 2,
+                },
+            },
+            AdmittedTransaction {
+                fifo_position: 2,
+                request: TransactionRequest::new(
+                    vec![TransactionCondition::Exists {
+                        key: first_key.clone(),
+                    }],
+                    vec![TransactionMutation::Put {
+                        key: different_leaf_key.clone(),
+                        value: b"different-leaf".to_vec(),
+                    }],
+                ),
+                provisional_revision: ProvisionalRevisionToken {
+                    transaction_position: 2,
+                    ordinal: 3,
+                },
+            },
+        ];
+        let mut metrics = BlinkBatchMetrics::default();
+        let plan = plan_batch(&store.state, &admitted, &mut metrics).unwrap();
+        let first_encoded = first_key.encode();
+        let same_leaf_encoded = same_leaf_key.encode();
+        let different_leaf_encoded = different_leaf_key.encode();
+        let first_transaction = &plan.transactions[0];
+
+        assert_eq!(
+            first_transaction
+                .mutations
+                .iter()
+                .map(|mutation| mutation.route_hint.leaf_id)
+                .collect::<Vec<_>>(),
+            vec![first_leaf, same_leaf, first_leaf]
+        );
+        assert_eq!(
+            first_transaction.mutated_key_set,
+            BTreeSet::from([first_encoded.clone(), same_leaf_encoded])
+        );
+        assert_eq!(
+            plan.transactions[1].mutated_key_set,
+            BTreeSet::from([first_encoded.clone()])
+        );
+        assert_eq!(
+            plan.transactions[2].mutated_key_set,
+            BTreeSet::from([different_leaf_encoded])
+        );
+        assert_eq!(
+            plan.transactions[1]
+                .dependency_metadata
+                .condition_key_predecessors,
+            vec![0]
+        );
+        assert_eq!(
+            plan.transactions[1]
+                .dependency_metadata
+                .same_key_predecessors,
+            vec![0]
+        );
+        assert_eq!(
+            plan.transactions[1]
+                .dependency_metadata
+                .same_target_page_predecessors,
+            vec![0]
+        );
+        assert_eq!(
+            plan.transactions[1]
+                .dependency_metadata
+                .structural_route_predecessors,
+            vec![0]
+        );
+        assert!(plan.dependencies.iter().any(|edge| {
+            edge.predecessor == 0
+                && edge.successor == 1
+                && edge.kind == DependencyKind::ConditionKey
+        }));
+        assert!(plan.dependencies.iter().any(|edge| {
+            edge.predecessor == 0
+                && edge.successor == 1
+                && edge.kind == DependencyKind::SameTargetPage
+        }));
+        assert!(!plan.dependencies.iter().any(|edge| {
+            edge.predecessor == 1
+                && edge.successor == 2
+                && edge.kind == DependencyKind::SameTargetPage
+        }));
+        assert_eq!(plan.transactions[1].provisional_revision.ordinal, 2);
+    }
+
+    #[test]
     fn parallel_planned_executes_independent_leaf_jobs() {
         let mut serial = planned_store();
         let mut parallel = parallel_store();
