@@ -649,7 +649,6 @@ impl<F: DurableFile> WalLog<F> {
         self.recovery_batches = Vec::new();
         self.recovery_pages = BTreeMap::new();
         self.page_chain = HashMap::new();
-        self.redo_stats = WalRedoStats::default();
         self.scan_report = WalScanReport {
             records_scanned: 1,
             ..WalScanReport::default()
