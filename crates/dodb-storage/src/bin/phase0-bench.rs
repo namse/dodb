@@ -1585,6 +1585,11 @@ struct MetricDelta {
     parallel_fallback_overflow: u64,
     parallel_fallback_structural: u64,
     parallel_skipped_single_leaf: u64,
+    structural_transactions: u64,
+    transaction_mutation_histogram: Vec<u64>,
+    transaction_dirty_page_histogram: Vec<u64>,
+    transaction_leaf_page_histogram: Vec<u64>,
+    wal_redo_plan_nanos: u64,
 }
 
 impl MetricDelta {
@@ -1644,6 +1649,7 @@ impl MetricDelta {
             ),
             page_images: subtraction(wal_after.page_images as u64, wal_before.page_images as u64),
             wal_redo: redo_delta(&wal_after.redo, &wal_before.redo),
+            wal_redo_plan_nanos: subtraction(wal_after.redo_plan_nanos, wal_before.redo_plan_nanos),
             wal_append_nanos: subtraction(wal_after.append_nanos, wal_before.append_nanos),
             wal_sync_nanos: subtraction(wal_after.sync_nanos, wal_before.sync_nanos),
             wal_group_encode_nanos: subtraction(
@@ -2021,6 +2027,22 @@ impl MetricDelta {
             parallel_skipped_single_leaf: subtraction(
                 batch_after.parallel_skipped_single_leaf,
                 batch_before.parallel_skipped_single_leaf,
+            ),
+            structural_transactions: subtraction(
+                batch_after.structural_transactions,
+                batch_before.structural_transactions,
+            ),
+            transaction_mutation_histogram: histogram_delta(
+                &batch_after.transaction_mutation_histogram,
+                &batch_before.transaction_mutation_histogram,
+            ),
+            transaction_dirty_page_histogram: histogram_delta(
+                &batch_after.transaction_dirty_page_histogram,
+                &batch_before.transaction_dirty_page_histogram,
+            ),
+            transaction_leaf_page_histogram: histogram_delta(
+                &batch_after.transaction_leaf_page_histogram,
+                &batch_before.transaction_leaf_page_histogram,
             ),
         }
     }
@@ -2484,6 +2506,24 @@ impl ResourceSampler {
             .join()
             .expect("resource sampler thread should not panic")
     }
+}
+
+fn histogram_delta(after: &[u64], before: &[u64]) -> Vec<u64> {
+    after
+        .iter()
+        .enumerate()
+        .map(|(bucket, count)| count.saturating_sub(before.get(bucket).copied().unwrap_or(0)))
+        .collect()
+}
+
+fn histogram_text(histogram: &[u64]) -> String {
+    histogram
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(bucket, count)| format!("{bucket}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn redo_delta(after: &WalRedoStats, before: &WalRedoStats) -> WalRedoStats {
@@ -3226,6 +3266,23 @@ fn build_record(
     json.u64(
         "parallel_skipped_single_leaf_delta",
         delta.parallel_skipped_single_leaf,
+    );
+    json.u64(
+        "structural_transactions_delta",
+        delta.structural_transactions,
+    );
+    json.u64("wal_redo_plan_nanos_total", delta.wal_redo_plan_nanos);
+    json.string(
+        "tx_mutation_histogram",
+        &histogram_text(&delta.transaction_mutation_histogram),
+    );
+    json.string(
+        "tx_dirty_page_histogram",
+        &histogram_text(&delta.transaction_dirty_page_histogram),
+    );
+    json.string(
+        "tx_leaf_page_histogram",
+        &histogram_text(&delta.transaction_leaf_page_histogram),
     );
     json.string(
         "component_timing_scope",

@@ -209,6 +209,19 @@ pub struct BlinkBatchMetrics {
     pub parallel_fallback_overflow: u64,
     pub parallel_fallback_structural: u64,
     pub parallel_skipped_single_leaf: u64,
+    pub structural_transactions: u64,
+    pub transaction_mutation_histogram: Vec<u64>,
+    pub transaction_dirty_page_histogram: Vec<u64>,
+    pub transaction_leaf_page_histogram: Vec<u64>,
+}
+
+pub const BLINK_LOCALITY_HISTOGRAM_BUCKETS: usize = 65;
+
+fn record_histogram(histogram: &mut Vec<u64>, value: usize) {
+    if histogram.len() < BLINK_LOCALITY_HISTOGRAM_BUCKETS {
+        histogram.resize(BLINK_LOCALITY_HISTOGRAM_BUCKETS, 0);
+    }
+    histogram[value.min(BLINK_LOCALITY_HISTOGRAM_BUCKETS - 1)] += 1;
 }
 
 impl Default for BlinkSplitMetrics {
@@ -2094,6 +2107,32 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .batch_metrics
             .state_install_nanos
             .saturating_add(elapsed_nanos(state_install_started));
+        if admitted.len() == executed.len() {
+            for (admitted_transaction, transaction) in admitted.iter().zip(&executed) {
+                let leaf_pages = transaction
+                    .dirty
+                    .iter()
+                    .filter(|page_id| {
+                        matches!(self.state.pages.get(page_id), Some(BlinkPage::Leaf { .. }))
+                    })
+                    .count();
+                record_histogram(
+                    &mut self.batch_metrics.transaction_mutation_histogram,
+                    admitted_transaction.request.mutations.len(),
+                );
+                record_histogram(
+                    &mut self.batch_metrics.transaction_dirty_page_histogram,
+                    transaction.dirty.len(),
+                );
+                record_histogram(
+                    &mut self.batch_metrics.transaction_leaf_page_histogram,
+                    leaf_pages,
+                );
+                if transaction.superblock_image_emitted {
+                    self.batch_metrics.structural_transactions += 1;
+                }
+            }
+        }
         let publication_started = Instant::now();
         let publish_timing = self.publisher.publish(published_generation);
         self.batch_metrics.generation_publication_nanos = self

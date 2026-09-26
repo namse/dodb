@@ -215,6 +215,7 @@ pub struct WalMetrics {
     pub retained_recovery_page_images: usize,
     pub tracked_chain_pages: usize,
     pub redo: WalRedoStats,
+    pub redo_plan_nanos: u64,
     pub append_nanos: u64,
     pub sync_nanos: u64,
     pub group_encode_nanos: u64,
@@ -328,6 +329,7 @@ pub struct WalLog<F: DurableFile> {
     recovery_pages: BTreeMap<PageId, RecoveredWalPage>,
     page_chain: HashMap<PageId, PageChainEntry>,
     redo_stats: WalRedoStats,
+    redo_plan_nanos: u64,
     scan_report: WalScanReport,
     sync_count: u64,
     page_images: usize,
@@ -466,6 +468,7 @@ impl<F: DurableFile> WalLog<F> {
             recovery_pages: pages,
             page_chain,
             redo_stats: redo,
+            redo_plan_nanos: 0,
             scan_report: report,
             sync_count: 0,
             page_images,
@@ -502,6 +505,7 @@ impl<F: DurableFile> WalLog<F> {
             recovery_pages: BTreeMap::new(),
             page_chain: HashMap::new(),
             redo_stats: WalRedoStats::default(),
+            redo_plan_nanos: 0,
             scan_report: WalScanReport::default(),
             sync_count: 0,
             page_images: 0,
@@ -698,6 +702,7 @@ impl<F: DurableFile> WalLog<F> {
                 + self.recovery_pages.len(),
             tracked_chain_pages: self.page_chain.len(),
             redo: self.redo_stats,
+            redo_plan_nanos: self.redo_plan_nanos,
             append_nanos: self.append_nanos,
             sync_nanos: self.sync_nanos,
             group_encode_nanos: self.group_encode_nanos,
@@ -854,9 +859,11 @@ impl<F: DurableFile> WalLog<F> {
         hit(&mut injector, "before_wal_append")?;
         let plan_started = Instant::now();
         let plan = self.plan_redo(commits, delta)?;
+        let plan_nanos = elapsed_nanos(plan_started)?;
+        self.redo_plan_nanos = self.redo_plan_nanos.saturating_add(plan_nanos);
         self.group_encode_nanos = self
             .group_encode_nanos
-            .checked_add(elapsed_nanos(plan_started)?)
+            .checked_add(plan_nanos)
             .ok_or_else(|| Error::invariant("WAL group-encode timing overflow"))?;
         let (reports, next_lsn, next_batch_id) = if injector.is_some() {
             self.append_group_fault_injectable(commits, &plan, &mut injector)?
