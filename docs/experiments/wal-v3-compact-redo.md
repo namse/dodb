@@ -159,16 +159,148 @@ The 1:1 link between WAL history and RSS is gone. The process also starts the me
 
 `results/wal-v3-phase-a/`: `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, `short-progress.log`, `sustained-progress.log`, `sustained-control-progress.log`, `wal-byte-probe.txt`, `tables.md`, `raw/` (12 short rows and logs, 3 sustained rows, logs and once-per-second monitors), `scripts/run_phase_a.py`, `scripts/analyze_phase_a.py`, `scripts/wal_byte_probe.rs`, `SHA256SUMS`.
 
-## Phase B — compact PageDelta redo (in progress)
+## Phase B — compact PageDelta redo
 
-Code: `4ac3a2e` (WAL format 3, PageDelta record, v3 commit digest, streaming scan and per-page recovery), `6bcf8bb` (planned Blink producer, checkpoint fault points, tests), `11639db` (redo counters survive WAL reset), `def6f7e` (bench checkpoint control). Format, full-image-first rule and recovery: `results/wal-v3-phase-b/format-specification.md`. Raw results: `results/wal-v3-phase-b/`.
+Question: if ordinary existing-page updates log a compact byte delta instead of a 4 KiB page image, does durable throughput go up clearly? Answer: yes. Planned Blink multiwriter GM is 1.853× Phase A on the 14-scenario matrix. That is the ">1.50×" band of the plan, so full-page WAL was a major bottleneck.
 
-Done so far:
+Code (branch `experiment/wal-v3-compact-redo`, not merged):
 
-- B0 encoded-size probe (`b0-encoded-size-probe.jsonl`): existing-key width-1 update 4,224 → 226.9 B/tx (delta frame ~159 B, 4 spans, ~73 changed bytes); width-16 update 2,596 B/tx; delete/insert ~1,190 B/tx (record shifts); first touch after checkpoint is a full image.
-- BTree WAL and data file bytes unchanged (`byte-probe.txt`).
-- `cargo test --workspace --release --no-fail-fast`: 212 passed, 0 failed, 1 ignored (the B0 probe).
-- OCI first gate (4 scenarios × 3, interleaved): page-delta / Phase A GM 1.781.
-- Full 14-scenario matrix (× 3, interleaved): multiwriter GM page-delta / Phase A 1.853, / ExactMain 3.605 (reused), / RocksDB 0.704 (reused, not interleaved). Details in `tables.md`.
+| Commit | Content |
+|---|---|
+| `4ac3a2e` wal: add versioned page-delta redo records | WAL format 3, PageDelta record, v3 commit digest, full-image-first page chain, streaming scan, Blink recovery from rebuilt pages |
+| `6bcf8bb` blink: emit compact redo for existing pages | planned Blink producer, checkpoint fault points, store-level tests, B0 probe, bench metrics |
+| `11639db` wal: keep redo counters across WAL reset | counters only; no format or recovery change |
+| `def6f7e` bench: add WAL-size checkpoint control | `--checkpoint-wal-bytes` in `phase0-bench` |
 
-Not done yet: same-session RocksDB confirmation, 120 s sustained runs, checkpoint control (runner phases `confirm`, `sustained`, `checkpoint` exist in `scripts/run_phase_b.py`; the checkpoint binaries still need to be built on OCI).
+`BTreeStore` still writes format 2 page images; its WAL and data-file bytes are identical to Phase A (`results/wal-v3-phase-b/byte-probe.txt`).
+
+### Format and recovery rule
+
+Full specification: `results/wal-v3-phase-b/format-specification.md`. Summary:
+
+- PageDelta (record type 4, format 3 only) = page ID u64, base page LSN u64, span count u16 (1..=820), then spans of offset u16, length u16, bytes. Header 18 B, 4 B per span. It is always one redo record per dirty page, so `commit_lsn = first_record_lsn + record_count` is unchanged.
+- Spans are the maximal changed-byte runs between the previous committed image and the new canonical `encode_blink_page` image, merged left to right when the unchanged gap is at most 4 bytes. Decode and apply reject anything that is not exactly that encoding.
+- The v3 commit digest is CRC32C over each record's type, index, length and payload.
+- **Full image first:** after WAL initialization or reset, the first committed record for a data page is always a PageImage. Later changes of that page in the same WAL history may be deltas against the previous committed image. The WAL tracks page ID → (page LSN, CRC32C) of the latest committed image, O(unique pages since reset), rebuilt on open and cleared on reset. A delta base that does not match that entry is an invariant error; a page not in the chain is written as a full image.
+- **Recovery never uses data-file bytes as a delta base.** The scan keeps page ID → latest rebuilt image, applies a transaction's records only after its commit frame and digest check, and validates every rebuilt page with the full Blink page validator (checksum included) plus the commit LSN. `recover_data_file` then overwrites each page newer than the checkpoint with its rebuilt image. So a checkpoint that crashed after writing some pages, or tore a page, before the checkpoint superblock was durable, is repaired from the WAL.
+- The planned Blink producer marks a transaction eligible only if it emits no superblock image (no split, allocation, page reuse, free-list or overflow allocator change). The WAL still decides per page: superblock, first touch since reset, missing base, or a delta not smaller than an image all stay full images.
+
+### B0 — encoded size (deterministic probe, local)
+
+`results/wal-v3-phase-b/b0-encoded-size-probe.jsonl`, 20,000 rows (1,279 leaves), 16-byte keys, 64-byte values:
+
+| Case | tx | WAL B/tx mean (p50 / p95 / max) | delta frame B mean (p50 / p95 / max) | spans | changed B | fallback |
+|---|---|---|---|---|---|---|
+| existing-key width-1 update | 4,000 | 226.9 (227 / 228 / 228) | 158.9 (159 / 160 / 160) | 4.0 | 72.9 | 0 |
+| first touch after checkpoint (1 in 40 keys) | 500 | 1,584.7 (225 / 4,224 / 4,224) | 157.1 | 4.0 | 71.1 | 34% first touch |
+| delete existing key | 500 | 1,190.8 (1,165 / 2,056 / 3,586) | 1,122.8 | 15.2 | 992 | 0 |
+| insert new key (no split) | 500 | 1,189.4 (1,165 / 2,056 / 3,511) | 1,121.4 | 15.2 | 990 | 0 |
+| width-16 existing update | 500 | 2,596.1 (2,605 / 2,610 / 2,615) | 159.1 (max 309) | 4.0 | 73.1 | 0 |
+| 16 tx on one leaf per group | 3,200 | 224.8 | 156.8 | 4.0 | 70.8 | 0 |
+| 16 tx on different leaves per group | 3,200 | 226.4 | 158.4 | 4.0 | 72.4 | 0 |
+
+Width-1 update: **4,224 → 227 B/tx** (PageImage frame 4,156 B → delta frame ~159 B; commit frame 68 B). The four spans are the page LSN, the page checksum, the entry revision and the value. Delete and insert are about 1.2 KB because the canonical leaf encoding moves every record after the changed slot. The gate (<512 B/tx, stop above 1 KiB) passed.
+
+### Correctness
+
+`cargo test --workspace --release --no-fail-fast`: 212 passed, 0 failed, 1 ignored (the B0 probe). New tests:
+
+- codec: 3,000 random Blink leaf mutations (value same size, value resized, delete, insert, tombstone, revision only) and 2,000 random raw edits round-trip byte for byte, re-encode to the same delta, and the rebuilt Blink page validates; gap merge boundary; 18 malformed cases (bad base LSN, wrong page ID, zero-length, out-of-range, overlapping, unsorted, unmerged gap, truncated, trailing bytes, span count 0 / too high / too large, not starting on a changed byte, long unchanged gap, invalid rebuilt checksum).
+- WAL: first redo after reset is an image then deltas, and again an image after the next reset; base mismatch (wrong bytes or stale LSN) is an invariant error and writes nothing; four transactions on two pages in one group chain in FIFO order (base LSNs checked in the frames); superblocks, ineligible commits and a Blink WAL still at version 2 get images; 11 malformed delta records written into an otherwise valid WAL (with the digest recomputed so only the delta check can fail) are rejected as corruption; bad digest and a delta in a version-2 WAL are rejected; omission, duplication, reordering, type substitution, payload corruption and a spliced commit are rejected.
+- store: torn checkpoint (page set to the old checkpoint image, an intermediate committed image, the latest image, half old/half new, random bytes; another dirty page partially flushed) always recovers the latest committed page; delta-append fault matrix over 14 points (including during delta header, delta payload, after a delta record, before/after the commit record, before/during/after the WAL sync) at every occurrence, with reopen, atomicity check (a width-16 transaction is all-or-nothing and visible exactly when its commit frame was written), further writes and a second reopen; every byte cut of the WAL tail inside a width-16 delta transaction; checkpoint fault matrix over 18 points (page writes, data sync, superblock write and sync, WAL truncate, INIT rewrite, reset sync) with reopen, more writes, reopen, checkpoint, reopen; deltas after `flush()` and from the parallel executor.
+
+The known timing-only flake `group_fast_path_is_byte_identical_to_fault_injectable_path` did not fire in these runs.
+
+### First OCI gate
+
+OCI A1 2 OCPU, ZFS `/bench/zfs/db`, same host as the baseline. Baseline `phase-a` = `12ab044` (SHA256 `f9d5199f…`, byte-identical to the Phase A build), candidate `page-delta` = `6bcf8bb` (SHA256 `0dc74cc6…`). `--engine planned-blink --sync-mode real`, working set 100,000, 2 s warmup, 5 s measure, baseline seeds, 3 repetitions with the variant order swapped every repetition. Every row was checked for `engine`, `sync_mode`, WAL syncs and planner counters; every page-delta row wrote deltas.
+
+| Scenario | phase-a tx/s | page-delta tx/s | ratio | p99 µs | WAL B/tx | mean sync ms | tx/sync |
+|---|---|---|---|---|---|---|---|
+| 16w width 1 uniform | 4,597 | 8,298 | 1.805 | 6,077 → 3,343 | 4,224 → 227 | 1.42 → 0.74 | 7.9 → 8.3 |
+| 16w width 16 uniform | 1,088 | 1,829 | 1.681 | 33,601 → 27,017 | 66,506 → 2,622 | 7.17 → 2.34 | 14.7 → 14.7 |
+| 64w width 1 uniform | 12,655 | 24,111 | 1.905 | 9,752 → 5,154 | 4,224 → 227 | 3.03 → 0.89 | 59.8 → 58.8 |
+| 64w width 16 uniform | 1,169 | 2,033 | 1.739 | 143,131 → 54,228 | 66,490 → 2,612 | 24.69 → 3.23 | 61.5 → 62.3 |
+
+GM 1.781, far above the 1.10 stop line. Transactions per sync do not change; each sync gets much cheaper because it writes about 1/18 of the bytes, so the coordinator turns over faster. CPU per run went up (for example 22% → 32% at 16w width 1) because more transactions are processed. Peak RSS is about the same.
+
+### Full matrix
+
+14 scenarios × 3 repetitions × 2 variants, interleaved (84 rows). Per-scenario tables with p50/p95/p99, CPU, RSS, WAL bytes, image and delta records per transaction, span counts, fallback counts, tx/sync, sync count, sync latency and WAL MiB/s: `results/wal-v3-phase-b/tables.md`.
+
+| # | Scenario | page-delta tx/s | phase-a tx/s | PD / phase-a | p99 µs phase-a → PD |
+|---|---|---|---|---|---|
+| 0 | 16w w1 uniform | 8,211 | 4,477 | 1.834 | 6,308 → 3,240 |
+| 1 | 16w w1 compact | 9,474 | 4,900 | 1.933 | 6,315 → 2,827 |
+| 2 | 16w w1 spread | 8,524 | 4,712 | 1.809 | 6,855 → 3,052 |
+| 3 | 16w w16 uniform | 1,923 | 1,121 | 1.716 | 29,966 → 16,020 |
+| 4 | 16w w16 compact | 6,016 | 3,318 | 1.813 | 7,897 → 4,059 |
+| 5 | 16w w16 spread | 5,532 | 3,344 | 1.654 | 9,731 → 5,898 |
+| 6 | 64w w1 uniform | 24,234 | 12,066 | 2.009 | 14,461 → 5,058 |
+| 7 | 64w w1 compact | 32,897 | 11,426 | 2.879 | 9,673 → 3,772 |
+| 8 | 64w w1 spread | 26,522 | 12,481 | 2.125 | 9,238 → 5,312 |
+| 9 | 64w w16 uniform | 2,026 | 1,172 | 1.729 | 95,087 → 59,505 |
+| 10 | 64w w16 compact | 10,768 | 5,779 | 1.863 | 21,861 → 9,797 |
+| 11 | 64w w16 spread | 5,941 | 4,727 | 1.257 | 25,979 → 19,584 |
+| 12 | 1w w1 uniform | 1,389 | 1,318 | 1.053 | 1,300 → 1,073 |
+| 13 | 1w w16 uniform | 812 | 388 | 2.091 | 3,265 → 1,730 |
+
+Multiwriter geometric means (12 scenarios):
+
+| Category | PD / phase-a | PD / ExactMain | PD / RocksDB | phase-a / ExactMain | phase-a / RocksDB |
+|---|---|---|---|---|---|
+| overall | **1.853** | **3.605** | **0.704** | 1.945 | 0.380 |
+| writers 16 | 1.791 | 2.843 | 0.713 | 1.587 | 0.398 |
+| writers 64 | 1.918 | 4.572 | 0.695 | 2.384 | 0.362 |
+| width 1 | 2.071 | 3.618 | 0.925 | 1.747 | 0.447 |
+| width 16 | 1.659 | 3.593 | 0.536 | 2.166 | 0.323 |
+| uniform | 1.818 | 3.854 | 0.481 | 2.120 | 0.265 |
+| compact locality | 2.082 | 3.639 | 0.961 | 1.747 | 0.462 |
+| spread locality | 1.681 | 3.342 | 0.753 | 1.988 | 0.448 |
+
+ExactMain and RocksDB are the reused rows of the earlier runs (ExactMain: real-sync matrix; RocksDB v11.8.1: cross-DB matrix, 2026-09-25). They are **not interleaved** with this session. The phase-a row of this session gives 1.945× ExactMain against 1.861× in the baseline document, so this session ran about 4% faster for planned Blink than the day of the reused rows. Single-writer width 1 barely moves (1.053): with one writer every transaction waits for its own sync, and the sync itself is only a little cheaper for a 4 KiB write.
+
+### RocksDB confirmation (same session)
+
+Because the matrix GM gain is above 1.25×, RocksDB was re-run in this session on the four uniform scenarios, alternating order with page-delta, same binary (SHA256 `78f222f2…`), `write_options_sync=true`, WAL on, pipelined write off, verification passed on every row.
+
+| Scenario | page-delta tx/s | RocksDB tx/s | RocksDB reused tx/s | PD / RocksDB | p99 µs PD / RocksDB |
+|---|---|---|---|---|---|
+| 16w w1 | 8,256 | 10,103 | 10,034 | 0.817 | 3,272 / 2,358 |
+| 16w w16 | 1,923 | 6,147 | 5,723 | 0.313 | 16,147 / 5,135 |
+| 64w w1 | 24,071 | 26,802 | 26,254 | 0.898 | 5,125 / 4,154 |
+| 64w w16 | 2,054 | 9,852 | 9,573 | 0.208 | 50,106 / 14,375 |
+
+The same-session RocksDB numbers are within 1–7% of the reused ones, so the reused 0.704× matrix GM stands. On these four scenarios PD / RocksDB is 0.468 (reused: 0.467). Page-delta closes most of the width-1 gap (0.82–0.90×) but width 16 uniform stays at 0.2–0.3×: 16 random leaves per transaction still cost 16 records, 16 leaf re-encodes and 16 page validations in the single coordinator, where RocksDB appends one small WriteBatch.
+
+### 120-second sustained (no checkpoint)
+
+Candidate `6bcf8bb`, working set 1,000,000, width 1, uniform, 10 s warmup, 120 s measure, real sync, same seeds and monitor as Phase A (`results/wal-v3-phase-b/sustained-tables.md`).
+
+| Run | tx/s | p99 µs | WAL growth 120 s | RSS growth 120 s | peak RSS | Phase A tx/s / p99 / WAL growth |
+|---|---|---|---|---|---|---|
+| 16 writers | 8,704 | 3,380 | 227 MiB | 169 MiB | 1,374 MiB | 4,308 / 7,080 / 2,083 MiB |
+| 64 writers | 20,440 | 5,993 | 533 MiB | 371 MiB | 1,694 MiB | 10,166 / 13,633 / 4,915 MiB |
+
+About 2.0× Phase A throughput at both writer counts, with half the p99 and about 1/9 of the WAL growth. Every window wrote only deltas (delta ratio 1.000), dirty pages stayed at 68,448, mean WAL sync stayed at 0.75 ms (16w) and 0.91 ms (64w), and no window dropped. Seeding 1,000,000 rows now leaves a 3.6 GiB WAL instead of 4.6 GiB (seed transactions still write first-touch images). RSS grows by about 170 / 370 MiB, which is not tied to the WAL and has the same shape as in Phase A (the benchmark's 16-byte-per-transaction timeline is 17 / 39 MiB of it).
+
+### Checkpoint control
+
+Separate from the headline. Both variants get the same bench-only `--checkpoint-wal-bytes` patch: phase-a = `12ab044` + `scripts/checkpoint-control-on-12ab044.patch` (SHA256 of binary `fa8c8334…`), page-delta = `def6f7e` (`11953816…`). 16 writers, same sustained workload; a checkpoint right after seeding, then a synchronous checkpoint in the writer thread whenever the WAL reaches the threshold.
+
+| Threshold | Variant | tx/s | p99 µs | checkpoints in 120 s | checkpoint duration | WAL reclaimed | WAL B/tx written |
+|---|---|---|---|---|---|---|---|
+| 1 GiB | phase-a | 4,091 | 6,936 | 2 | 2.43 / 2.69 s | 2,048 MiB | 4,224 |
+| 1 GiB | page-delta | **8,707** (2.13×) | 3,636 | 0 | — | 0 | 355 |
+| 256 MiB | phase-a | 3,835 | 7,781 | 7 | 1.40–1.59 s | 1,792 MiB | 4,224 |
+| 256 MiB | page-delta | **5,600** (1.46×) | 6,713 | 5 | 2.17–2.36 s | 1,280 MiB | 1,777 |
+
+Post-checkpoint full-image tax (page-delta, 1 GiB, after the post-seed checkpoint): image share of redo records per 10 s window 30.8% → 10.1% → 3.0% → 0.9% → 0.2% → 0.1% → 0; estimated WAL bytes per transaction 1,457 → 629 → 348 → 261 → 237 → 229 → 227. Throughput rises from 7,098 to about 9,300 tx/s as the image share falls. After about 40 s every page is covered again and the run is back at the no-checkpoint steady state.
+
+With a 256 MiB threshold the WAL never reaches that steady state: covering 68k leaves once costs about 280 MiB of images, more than the threshold, so each checkpoint cycle is spent mostly on first-touch images (image share 18–77% per window, 1,777 B/tx overall). Page-delta still wins 1.46× because the delta part is cheap and it needs fewer checkpoints (5 vs 7), but each of its checkpoints is longer (about 2.2 s vs 1.5 s) because more transactions, and so more dirty pages, accumulate between them. Checkpoint windows show the stall in both variants (p99 up to about 8.9 ms). The PageDelta advantage survives periodic checkpoints, but how much of it survives depends on the WAL budget compared with the size of the dirty working set. A checkpoint policy should be sized to at least one full-image pass over the hot pages.
+
+The window after a checkpoint can show its WAL drop one window early, because the resource sampler waits for the store lock that the checkpoint holds.
+
+### Files
+
+`results/wal-v3-phase-b/`: `format-specification.md`, `b0-encoded-size-probe.jsonl`, `byte-probe.txt`, `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `tables.md`, `analysis.json`, `sustained-tables.md`, `raw/` (gate, matrix, confirmation, sustained and checkpoint rows, logs and monitors), `scripts/run_phase_b.py`, `scripts/analyze_phase_b.py`, `scripts/analyze_sustained.py`, `scripts/checkpoint-control-on-12ab044.patch`, `SHA256SUMS`.

@@ -146,3 +146,14 @@ Gate geometric mean page-delta / phase-a: **1.781**
 | compact locality | 2.082 | 3.639 | 0.961 | 1.747 | 0.462 |
 | spread locality | 1.681 | 3.342 | 0.753 | 1.988 | 0.448 |
 
+## RocksDB confirmation (same session, rotated with page-delta)
+
+| # | Writers | Width | Distribution | page-delta tx/s (confirm) | RocksDB tx/s (confirm) | RocksDB p99 µs | page-delta p99 µs | PD / RocksDB (confirm) | RocksDB reused tx/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 16 | 1 | uniform | 8,256 | 10,103 | 2,358 | 3,272 | 0.817 | 10,034 |
+| 3 | 16 | 16 | uniform | 1,923 | 6,147 | 5,135 | 16,147 | 0.313 | 5,723 |
+| 6 | 64 | 1 | uniform | 24,071 | 26,802 | 4,154 | 5,125 | 0.898 | 26,254 |
+| 9 | 64 | 16 | uniform | 2,054 | 9,852 | 14,375 | 50,106 | 0.208 | 9,573 |
+
+Geometric mean PD / RocksDB over the confirmed scenarios: **0.468**
+
