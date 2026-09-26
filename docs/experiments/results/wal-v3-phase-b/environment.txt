@@ -1,0 +1,16 @@
+Sat Sep 26 04:49:15 AM UTC 2026
+Linux instance-20260923-1013 6.12.0-206.104.4.4.el9uek.aarch64 #2 SMP Wed Sep 16 22:26:42 PDT 2026 aarch64 aarch64 aarch64 GNU/Linux
+dodbbench/db	sync	standard	local
+dodbbench/db	recordsize	4K	local
+dodbbench/db	compression	off	local
+dodbbench/db	atime	off	local
+dodbbench	ashift	12	local
+               total        used        free      shared  buff/cache   available
+Mem:           10898         755        9002          23        1455       10142
+Swap:           4095         203        3892
+2
+rustc 1.98.1 (48a229cea 2026-09-01)
+12ab0443b61f5dccd24668c2a5d089de47c8110f
+f9d5199f98ca9acff230186fa9fd2804b00057fa9b9b339fcf3107277605632b  /tmp/dodb-phase-b-base-target/release/phase0-bench
+6bcf8bb364149f3ae881a332cfcae62faf15d745
+0dc74cc6de8e2682a99b730f730da01059aa5c2c94db7a0c0d4fcdef6736119b  /tmp/dodb-phase-b-cand-target/release/phase0-bench

@@ -158,3 +158,17 @@ The 1:1 link between WAL history and RSS is gone. The process also starts the me
 ### Files
 
 `results/wal-v3-phase-a/`: `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, `short-progress.log`, `sustained-progress.log`, `sustained-control-progress.log`, `wal-byte-probe.txt`, `tables.md`, `raw/` (12 short rows and logs, 3 sustained rows, logs and once-per-second monitors), `scripts/run_phase_a.py`, `scripts/analyze_phase_a.py`, `scripts/wal_byte_probe.rs`, `SHA256SUMS`.
+
+## Phase B — compact PageDelta redo (in progress)
+
+Code: `4ac3a2e` (WAL format 3, PageDelta record, v3 commit digest, streaming scan and per-page recovery), `6bcf8bb` (planned Blink producer, checkpoint fault points, tests), `11639db` (redo counters survive WAL reset), `def6f7e` (bench checkpoint control). Format, full-image-first rule and recovery: `results/wal-v3-phase-b/format-specification.md`. Raw results: `results/wal-v3-phase-b/`.
+
+Done so far:
+
+- B0 encoded-size probe (`b0-encoded-size-probe.jsonl`): existing-key width-1 update 4,224 → 226.9 B/tx (delta frame ~159 B, 4 spans, ~73 changed bytes); width-16 update 2,596 B/tx; delete/insert ~1,190 B/tx (record shifts); first touch after checkpoint is a full image.
+- BTree WAL and data file bytes unchanged (`byte-probe.txt`).
+- `cargo test --workspace --release --no-fail-fast`: 212 passed, 0 failed, 1 ignored (the B0 probe).
+- OCI first gate (4 scenarios × 3, interleaved): page-delta / Phase A GM 1.781.
+- Full 14-scenario matrix (× 3, interleaved): multiwriter GM page-delta / Phase A 1.853, / ExactMain 3.605 (reused), / RocksDB 0.704 (reused, not interleaved). Details in `tables.md`.
+
+Not done yet: same-session RocksDB confirmation, 120 s sustained runs, checkpoint control (runner phases `confirm`, `sustained`, `checkpoint` exist in `scripts/run_phase_b.py`; the checkpoint binaries still need to be built on OCI).
