@@ -304,3 +304,128 @@ The window after a checkpoint can show its WAL drop one window early, because th
 ### Files
 
 `results/wal-v3-phase-b/`: `format-specification.md`, `b0-encoded-size-probe.jsonl`, `byte-probe.txt`, `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `tables.md`, `analysis.json`, `sustained-tables.md`, `raw/` (gate, matrix, confirmation, sustained and checkpoint rows, logs and monitors), `scripts/run_phase_b.py`, `scripts/analyze_phase_b.py`, `scripts/analyze_sustained.py`, `scripts/checkpoint-control-on-12ab044.patch`, `SHA256SUMS`.
+
+## Phase C — width-16 bottleneck attribution
+
+Question: why is width 1 close to RocksDB (0.92×) while width 16 uniform is still about 4.8× slower? Measurement only; no algorithm was changed. Instrumentation commit `cb7fb54` adds per-transaction locality histograms (mutations, dirty pages, dirty leaves, structural transactions) and a separate timer for WAL redo planning (page-delta diff and checks). Raw results, tables and perf data: `results/wal-v3-phase-c/`.
+
+### Method
+
+- OCI A1 2 OCPU, ZFS, same host. Binary `cb7fb54` (SHA256 `b6c74b1c…`), `--engine planned-blink`; every row was checked for `engine`, `sync_mode` and page deltas.
+- Six scenarios: 16w/64w × width 1/16 uniform, plus 64w width 16 compact and spread. Working set 100,000, 2 s warmup, 5 s measure, 3 repetitions, baseline seeds.
+- Each scenario ran with `--sync-mode real` and `--sync-mode disabled`, with the order swapped every repetition. **The `disabled` rows skip fsync. They separate CPU from storage and are not durable throughput.**
+- Times below are the coordinator's `apply_transaction_group` time (`processing_nanos`), split by the existing Blink batch timers and WAL timers. "physical other" is physical execution minus mutation, restamp and page encode; "WAL frame encode" is WAL group encode minus redo planning; "unattributed" is what the timers do not cover.
+- perf: a separate build of the same commit with frame pointers and line tables (`0db4bd76…`), `perf record -F 499 -g` on the running process for 15 s of the measurement, 64w width 1 and width 16 uniform (real sync).
+- RocksDB v11.8.1 (same binary as before) on 64w width 1 and width 16 uniform, 3 repetitions, alternating with dodb.
+
+### Throughput
+
+| Scenario | real tx/s | no-sync tx/s | no-sync / real | real p99 µs | coordinator busy (real) | tx per sync |
+|---|---|---|---|---|---|---|
+| 16w w1 uniform | 8,156 | 33,413 | 4.10 | 3,249 | 97.6% | 8.1 |
+| 16w w16 uniform | 1,913 | 2,606 | 1.36 | 16,251 | 92.9% | 14.5 |
+| 64w w1 uniform | 23,545 | 37,350 | 1.59 | 5,564 | 93.5% | 60.6 |
+| 64w w16 uniform | 2,063 | 2,270 | 1.10 | 58,977 | 92.3% | 61.5 |
+| 64w w16 compact | 10,788 | 14,245 | 1.32 | 9,306 | 87.0% | 43.0 |
+| 64w w16 spread | 5,860 | 7,904 | 1.35 | 20,250 | 84.1% | 61.3 |
+
+The single coordinator is busy about 90% of the wall time in every case. At 64w width 16 uniform, removing fsync entirely gives only 1.10×: that scenario is CPU-bound, not storage-bound.
+
+### Page locality per transaction
+
+| Scenario | mutations | dirty pages mean / p50 / p95 / max | dirty leaves mean / p50 / p95 | mutations sharing a leaf | structural tx |
+|---|---|---|---|---|---|
+| 64w w16 uniform | 16 | 15.98 / 16 / 16 / 18 | 15.98 / 16 / 16 | 0.02 | 4 of ~31k |
+| 16w w16 uniform | 16 | 15.98 / 16 / 16 / 18 | 15.98 / 16 / 16 | 0.02 | 6 |
+| 64w w16 compact | 16 | 2.00 / 2 / 2 / 2 | 2.00 / 2 / 2 | 14 | 0 |
+| 64w w16 spread | 16 | 2.00 / 2 / 2 / 2 | 2.00 / 2 / 2 | 14 | 0 |
+
+A uniform width-16 transaction touches 16 different leaves: every mutation is on its own page. Compact and spread touch 2 leaves (8 mutations each). There are no overflow values; splits are rare (4–6 transactions per scenario).
+
+### Coordinator time per transaction (real sync, ns)
+
+| Component | 64w w1 | 64w w16 uniform | per mutation (w16) | w16 / w1 | share (w16) | 64w w16 compact |
+|---|---|---|---|---|---|---|
+| admission | 750 | 11,788 | 737 | 15.7× | 2.6% | 7,032 |
+| planning | 3,259 | 82,974 | 5,186 | 25.5× | 18.6% | 19,941 |
+| physical mutation | 3,388 | 57,976 | 3,623 | 17.1× | 13.0% | 12,081 |
+| physical restamp | 150 | 2,963 | 185 | 19.7× | 0.7% | 919 |
+| page encode | 2,281 | 38,067 | 2,379 | 16.7× | 8.5% | 2,894 |
+| physical other | 326 | 1,345 | 84 | 4.1× | 0.3% | 333 |
+| dirty union | 89 | 837 | 52 | 9.4× | 0.2% | 98 |
+| catalog construction | 1,967 | 21,951 | 1,372 | 11.2× | 4.9% | 162 |
+| WAL assembly | 1,331 | 27,629 | 1,727 | 20.8× | 6.2% | 1,157 |
+| WAL redo plan (delta encode) | 3,773 | 56,341 | 3,521 | 14.9× | 12.6% | 5,798 |
+| WAL frame encode | 890 | 9,972 | 623 | 11.2× | 2.2% | 1,376 |
+| WAL write | 837 | 3,538 | 221 | 4.2× | 0.8% | 1,321 |
+| WAL sync | 15,136 | 51,150 | 3,197 | 3.4× | 11.4% | 22,810 |
+| state install | 1,218 | 17,718 | 1,107 | 14.5× | 4.0% | 98 |
+| generation publication | 1,536 | 18,569 | 1,161 | 12.1× | 4.2% | 264 |
+| dirty tracking | 839 | 16,535 | 1,033 | 19.7× | 3.7% | 83 |
+| unattributed | 1,955 | 27,878 | 1,742 | 14.3× | 6.2% | 4,294 |
+| **total** | **39,727** | **447,232** | **27,952** | **11.3×** | 100% | **80,661** |
+
+Per-mutation, per-scenario and no-sync versions, plus detail timers (planner route, leaf clone, catalog scan/clone, retired-generation drop), are in `results/wal-v3-phase-c/tables.md`. Work counts per transaction at 64w width 16 uniform: 16 mutations, 15.98 page encodes (0.999 per mutation), 15.98 page deltas, 0.002 page images, 1,703 delta payload bytes (106 per mutation), 63.9 spans (4.0 per mutation), 2,612 WAL bytes.
+
+What scales with what:
+
+- Every per-page stage grows 15–21× from width 1 to width 16 (physical mutation 17×, page encode 17×, delta encode 15×, WAL assembly 21×, state install 15×, dirty tracking 20×, catalog 11×, publication 12×) — in line with 16× dirty leaves.
+- Planning grows 25.5× at 64 writers (13.7× at 16): per mutation it costs 5.2 µs in 64-transaction groups against 3.4 µs in 16-transaction groups, so it grows faster than linearly with group size.
+- Only WAL sync (3.4×) and WAL write (4.2×) stay mostly per group.
+- **Cost follows touched leaves, not mutations.** With sync disabled, coordinator time per touched leaf is 23.9 µs at 64w width 1, 25.0 µs at 64w width 16 uniform and 28.9 µs at 64w width 16 compact (8 mutations per leaf). Compact width 16 is 5.2× faster than uniform width 16 because it touches 8× fewer leaves.
+
+### Real sync against sync disabled
+
+| Scenario | real ns/tx | no-sync ns/tx | WAL sync ns/tx | sync share |
+|---|---|---|---|---|
+| 16w w1 | 119,675 | 26,800 | 89,986 | 75.2% |
+| 64w w1 | 39,727 | 23,928 | 15,136 | 38.1% |
+| 16w w16 | 485,509 | 348,307 | 133,980 | 27.6% |
+| 64w w16 uniform | 447,232 | 399,921 | 51,150 | 11.4% |
+| 64w w16 compact | 80,661 | 57,782 | 22,810 | 28.3% |
+
+Width 1 is mostly waiting for the sync (38–75%); width 16 uniform at 64 writers is 89% CPU.
+
+### perf (64w width 16 uniform, real sync, frame-pointer build, 1,910 tx/s)
+
+Self time, top entries: `memcpy` 14.1%, `plan_batch` 11.4%, `_int_malloc` 7.1%, Arc refcount atomics (`ldadd8`) 10.0%, `memcmp` 5.5%, `free` 4.7%, `malloc_consolidate` 3.7%, CRC32C 4.3%, `DocumentKey::validate_encoded` 3.5%, `encode_page_delta` 3.4%, `prepare_planned_serial_execution` 3.2%, `_int_free` 2.8%, `memmove` 2.6%. Memory copy, allocation and refcounting together are about 45% of samples.
+
+Inclusive: `apply_transaction_group` 88%, `prepare_planned_serial_execution` 22.4%, `plan_batch` 18.4%, WAL `append_group_inner` 16.5%, `BTreeMap<PageId, [u8; 4096]>::insert` (dirty-page copies) 6.9%, `encode_blink_page` 6.5%, `leaf_body_layout` 5.1%, `ensure_sorted_leaf` 4.8%, `apply_cached_leaf_mutation` 4.7%, `prepare_delta` (catalog) 4.6%, `BlinkPage` / `Vec<LeafEntry>` clones about 4% (their Arc refcount increments are most of the `ldadd8_relax` samples), dropping the retired generation (`PublishedGeneration`/`PageCatalog`/`PageCell` drop) about 4%.
+
+The 64w width 1 profile has the same functions, with a larger share for publication drop (6.7%) and WAL append (24.7%), and a smaller share for `plan_batch` (10.3%). Of the areas the plan asked about: leaf lookup (`memcmp`, `ensure_sorted_leaf`), allocation/free, page encoding, PageDelta diff, CRC32C, catalog/generation publication and `Arc`/`BTreeMap` cloning are all visible; none is above 15% on its own. About 2.6–4.4% of samples are `Vec<TransactionMutation>` growth in the benchmark coordinator closure, outside the timed `apply_transaction_group`.
+
+Reports: `results/wal-v3-phase-c/perf/*.report-{top,inclusive,dso,hot-callers,callers,children,flat}.txt`, `*.inclusive-summary.md` (roughly demangled), and the `perf.data` files.
+
+### RocksDB same session
+
+| Scenario | dodb tx/s | RocksDB tx/s | dodb / RocksDB | p99 µs dodb / RocksDB | CPU % (one core) dodb / RocksDB |
+|---|---|---|---|---|---|
+| 64w w1 uniform | 23,986 | 26,208 | 0.915 | 5,148 / 3,927 | 68 / 64 |
+| 64w w16 uniform | 2,060 | 9,805 | 0.210 | 57,860 / 14,893 | 92 / 85 |
+
+RocksDB matches the Phase B session (26,802 / 9,852 tx/s), so storage did not drift. At width 16 RocksDB spends about 0.85 core for 9,805 tx/s (roughly 87 µs of CPU per transaction). dodb spends about 400 µs of coordinator CPU per transaction, all in one thread, which caps it near 2,300 tx/s even without fsync.
+
+### Attribution of the remaining RocksDB gap (64w width 16 uniform)
+
+| Plan category | Components | Share of coordinator time |
+|---|---|---|
+| A. physical execution per leaf | mutation, restamp, page encode, other | 22.5% |
+| B. planner | planning + admission | 21.2% |
+| D. WAL CPU | redo plan (delta encode) 12.6%, assembly 6.2%, frame encode 2.2%, write 0.8% | 21.8% |
+| C. catalog / publication / install | catalog 4.9%, publication 4.2%, state install 4.0%, dirty tracking 3.7%, dirty union 0.2% | 17.0% |
+| E. durability sync | WAL sync | 11.4% |
+| — | unattributed | 6.2% |
+
+There is no single dominant stage. The gap comes from about 25 µs of serial CPU per touched leaf, spread over the whole pipeline, times 16 leaves per transaction. Sync is 11%. Even infinitely fast storage would give only 1.10×.
+
+### Recommendation
+
+Primary direction: **A — transaction-internal parallel per-leaf execution.** Extend the existing parallel executor, which today falls back on multi-leaf transactions (`parallel_fallback_multi_leaf`), so that the independent per-leaf work of one non-structural transaction runs on workers: leaf mutation, restamp, page encode, and the page-delta diff for that leaf. That covers about 22.5% + 12.6% + part of 8.4% ≈ 40% of coordinator time, all of it independent across the 16 leaves. The coordinator then keeps planning, WAL framing and sync, and publication.
+
+Order of what follows, from the same data: B planner (21%, growing faster than linearly with group size) second, C catalog/publication (17%) third, E sync (11%) last. D (delta encode, 12.6%) should move into the per-leaf workers as part of A rather than be tuned on its own. Two caveats for A on this host:
+- Two OCPUs cap it near 2× on the parallel part.
+- The profile shows about 45% of cycles in memcpy, malloc/free and Arc refcounting spread across all stages, so per-leaf copy and allocation cost is the other lever if parallel speedup falls short.
+
+### Files
+
+`results/wal-v3-phase-c/`: `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `raw/` (36 attribution rows, 6 dodb and 6 RocksDB confirmation rows, 2 perf rows, logs), `tables.md`, `analysis.json`, `perf/`, `scripts/run_phase_c.py`, `scripts/analyze_phase_c.py`, `scripts/summarize_perf.py`, `SHA256SUMS`.
