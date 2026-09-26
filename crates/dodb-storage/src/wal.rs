@@ -788,7 +788,6 @@ impl<F: DurableFile> WalLog<F> {
         self.append_group_inner(commits, injector, PageImageValidationMode::Strict, None)
     }
 
-    #[cfg(test)]
     pub(crate) fn append_group_with_page_deltas(
         &mut self,
         commits: &[WalCommit],
@@ -803,10 +802,28 @@ impl<F: DurableFile> WalLog<F> {
         )
     }
 
+    pub(crate) fn append_group_trusted_internal_with_page_deltas(
+        &mut self,
+        commits: &[WalCommit],
+        delta: &mut WalDeltaRequest<'_, '_, '_>,
+        injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Vec<WalAppendReport>> {
+        if injector.is_some() {
+            return self.append_group_with_page_deltas(commits, delta, injector);
+        }
+        self.append_group_inner(
+            commits,
+            None,
+            PageImageValidationMode::TrustedInternal,
+            Some(delta),
+        )
+    }
+
     /// Appends page images produced moments earlier by this storage engine's
     /// internal Blink page and superblock encoders in the same process. Never
     /// use this path for caller-provided bytes. Fault-injected calls delegate
     /// to the strict public path.
+    #[cfg(test)]
     pub(crate) fn append_group_trusted_internal(
         &mut self,
         commits: &[WalCommit],

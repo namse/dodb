@@ -5,6 +5,7 @@
 //! pages already carry the fences and sibling links that later phases will
 //! use for optimistic reads and parallel execution.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
@@ -32,7 +33,8 @@ use crate::page::{
     PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageType, decode_page_at, finalize_encoded_page,
 };
 use crate::wal::{
-    RecoveredWalPage, WalCommit, WalIdentity, WalLog, WalMetrics, WalPageImage, WalPageImageFormat,
+    RecoveredWalPage, WalCommit, WalDeltaRequest, WalIdentity, WalLog, WalMetrics, WalPageImage,
+    WalPageImageFormat,
 };
 
 const FIRST_DATA_PAGE: u64 = 2;
@@ -2018,11 +2020,32 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .saturating_add(elapsed_nanos(wal_assembly_started));
         let delta = working.into_delta();
         if let Some(wal) = self.wal.as_mut() {
+            let eligible_commits = executed
+                .iter()
+                .map(|transaction| !transaction.superblock_image_emitted)
+                .collect::<Vec<_>>();
+            let dirty_pages = &self.dirty_pages;
+            let committed_pages = &self.state.pages;
+            let mut base_source = |page_id: PageId| -> Option<Cow<'_, [u8; PAGE_SIZE]>> {
+                if let Some(image) = dirty_pages.get(&page_id) {
+                    return Some(Cow::Borrowed(image));
+                }
+                committed_pages
+                    .get(&page_id)
+                    .and_then(|page| encode_blink_page(page_id, page).ok())
+                    .map(Cow::Owned)
+            };
+            let mut delta_request = WalDeltaRequest {
+                eligible_commits: &eligible_commits,
+                base_source: &mut base_source,
+            };
             // Each WAL image above comes from this execution's successful
             // encode_blink_page or encode_blink_superblock call in this process.
-            let reports = match wal
-                .append_group_trusted_internal(&wal_commits, self.fault_injector.as_deref_mut())
-            {
+            let reports = match wal.append_group_trusted_internal_with_page_deltas(
+                &wal_commits,
+                &mut delta_request,
+                self.fault_injector.as_deref_mut(),
+            ) {
                 Ok(reports) => reports,
                 Err(error) => {
                     self.broken = Some(error.to_string());
@@ -2132,11 +2155,24 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.flush_dirty(false)
+    }
+
+    fn hit_checkpoint_fault(&mut self, checkpoint: bool, point: &str) -> Result<()> {
+        if checkpoint && let Some(injector) = self.fault_injector.as_deref_mut() {
+            injector.hit(point)?;
+        }
+        Ok(())
+    }
+
+    fn flush_dirty(&mut self, checkpoint: bool) -> Result<()> {
         if self.wal.is_none() {
             return self.file.sync_data();
         }
+        self.hit_checkpoint_fault(checkpoint, "before_checkpoint_data_flush")?;
         let mut bytes = 0u64;
         for (page_id, image) in std::mem::take(&mut self.dirty_pages) {
+            self.hit_checkpoint_fault(checkpoint, "during_checkpoint_page_write")?;
             write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, &image)?;
             bytes = bytes.saturating_add(PAGE_SIZE as u64);
         }
@@ -2149,12 +2185,27 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             bytes = bytes.saturating_add(PAGE_SIZE as u64);
         }
         if bytes > 0 {
+            self.hit_checkpoint_fault(checkpoint, "before_checkpoint_data_sync")?;
             self.file.sync_data()?;
+            self.hit_checkpoint_fault(checkpoint, "after_checkpoint_data_sync")?;
         }
         Ok(())
     }
 
     pub fn checkpoint(&mut self) -> Result<BlinkCheckpointReport> {
+        if let Some(message) = &self.broken {
+            return Err(Error::checkpoint(format!(
+                "experimental storage shard is degraded: {message}"
+            )));
+        }
+        let result = self.checkpoint_inner();
+        if let Err(error) = &result {
+            self.broken = Some(error.to_string());
+        }
+        result
+    }
+
+    fn checkpoint_inner(&mut self) -> Result<BlinkCheckpointReport> {
         let started = Instant::now();
         let before = self.wal_metrics()?.map_or(0, |metrics| metrics.wal_bytes);
         let checkpoint_lsn = self
@@ -2162,7 +2213,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .as_ref()
             .and_then(WalLog::last_commit_lsn)
             .unwrap_or(self.current_superblock.checkpoint_lsn);
-        self.flush()?;
+        self.flush_dirty(true)?;
         if checkpoint_lsn > self.current_superblock.checkpoint_lsn {
             let sb = BlinkSuperblock {
                 generation: self.current_superblock.generation + 1,
@@ -2174,6 +2225,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 SuperblockSlot::B => SuperblockSlot::A,
             };
             let image = encode_blink_superblock(&sb)?;
+            self.hit_checkpoint_fault(true, "before_checkpoint_superblock_write")?;
             write_all_at(
                 &mut self.file,
                 match slot {
@@ -2182,7 +2234,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 },
                 &image,
             )?;
+            self.hit_checkpoint_fault(true, "after_checkpoint_superblock_write")?;
+            self.hit_checkpoint_fault(true, "before_checkpoint_metadata_sync")?;
             self.file.sync_data()?;
+            self.hit_checkpoint_fault(true, "after_checkpoint_metadata_sync")?;
             self.current_superblock = sb;
             self.active_slot = slot;
             if let Some(wal) = self.wal.as_mut() {
@@ -5833,8 +5888,6 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::WalDeltaRequest;
-    use std::borrow::Cow;
 
     fn payload_sharing_test_state() -> (BlinkState, PageId, Vec<u8>, Vec<u8>) {
         let page_id = PageId::new(FIRST_DATA_PAGE);
@@ -9841,6 +9894,234 @@ mod tests {
         again.check_invariants().unwrap();
     }
 
+    fn b0_key(index: u64) -> DocumentKey {
+        let mut primary = vec![0x51u8; 8];
+        primary[7] = (index % 128) as u8;
+        let mut secondary = vec![0x61u8; 8];
+        secondary.copy_from_slice(&index.to_be_bytes());
+        DocumentKey::new(primary, secondary)
+    }
+
+    fn b0_value(index: u64, round: u64) -> Vec<u8> {
+        let mut value = vec![0u8; 64];
+        for (position, byte) in value.iter_mut().enumerate() {
+            *byte = splitmix_for_test(index ^ (round << 32) ^ position as u64) as u8;
+        }
+        value
+    }
+
+    fn b0_percentile(values: &[u64], fraction: f64) -> u64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        sorted[((sorted.len() - 1) as f64 * fraction).round() as usize]
+    }
+
+    fn b0_distribution(values: &[u64]) -> String {
+        if values.is_empty() {
+            return "{\"count\":0}".to_string();
+        }
+        let sum: u64 = values.iter().sum();
+        format!(
+            "{{\"count\":{},\"mean\":{:.1},\"p50\":{},\"p95\":{},\"max\":{},\"min\":{}}}",
+            values.len(),
+            sum as f64 / values.len() as f64,
+            b0_percentile(values, 0.5),
+            b0_percentile(values, 0.95),
+            values.iter().max().unwrap(),
+            values.iter().min().unwrap()
+        )
+    }
+
+    fn b0_measure<Operation>(
+        store: &mut BlinkStore<MemoryFile, MemoryFile>,
+        scenario: &str,
+        mut operation: Operation,
+    ) where
+        Operation: FnMut(&mut BlinkStore<MemoryFile, MemoryFile>),
+    {
+        let start_offset = store.wal_metrics().unwrap().unwrap().wal_bytes;
+        let before = store.wal_metrics().unwrap().unwrap();
+        let split_before = store.split_metrics();
+        operation(store);
+        let after = store.wal_metrics().unwrap().unwrap();
+        let split_after = store.split_metrics();
+        let frames = store
+            .wal
+            .as_mut()
+            .unwrap()
+            .frame_summaries_from(start_offset);
+        let mut transaction_bytes: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut delta_frames = Vec::new();
+        for (record_type, batch_id, frame_length) in &frames {
+            *transaction_bytes.entry(*batch_id).or_default() += *frame_length as u64;
+            if *record_type == crate::wal::WalRecordType::PageDelta {
+                delta_frames.push(*frame_length as u64);
+            }
+        }
+        let transaction_bytes = transaction_bytes.into_values().collect::<Vec<_>>();
+        let redo = |metrics: &WalMetrics| metrics.redo;
+        let (before_redo, after_redo) = (redo(&before), redo(&after));
+        let delta_records = after_redo.page_delta_records - before_redo.page_delta_records;
+        let image_records = after_redo.page_image_records - before_redo.page_image_records;
+        let transactions = transaction_bytes.len() as u64;
+        let data_records = delta_records + image_records
+            - (after_redo.image_superblock - before_redo.image_superblock);
+        println!(
+            "B0 {{\"scenario\":\"{scenario}\",\"transactions\":{transactions},\"wal_bytes_per_tx\":{},\"page_delta_frame_bytes\":{},\"page_image_frame_bytes\":{},\"page_image_records\":{image_records},\"page_delta_records\":{delta_records},\"superblock_images\":{},\"delta_spans_mean\":{:.2},\"delta_changed_bytes_mean\":{:.1},\"delta_payload_bytes_mean\":{:.1},\"data_page_fallback_rate\":{:.4},\"fallback_ineligible_commit\":{},\"fallback_first_touch\":{},\"fallback_no_base\":{},\"fallback_not_smaller\":{},\"fallback_page_image_format\":{},\"leaf_splits\":{}}}",
+            b0_distribution(&transaction_bytes),
+            b0_distribution(&delta_frames),
+            crate::wal::WAL_HEADER_SIZE + 8 + PAGE_SIZE + 4,
+            after_redo.image_superblock - before_redo.image_superblock,
+            (after_redo.page_delta_spans - before_redo.page_delta_spans) as f64
+                / delta_records.max(1) as f64,
+            (after_redo.page_delta_changed_bytes - before_redo.page_delta_changed_bytes) as f64
+                / delta_records.max(1) as f64,
+            (after_redo.page_delta_payload_bytes - before_redo.page_delta_payload_bytes) as f64
+                / delta_records.max(1) as f64,
+            (data_records - delta_records) as f64 / data_records.max(1) as f64,
+            after_redo.image_ineligible_commit - before_redo.image_ineligible_commit,
+            after_redo.image_first_touch - before_redo.image_first_touch,
+            after_redo.image_no_base - before_redo.image_no_base,
+            after_redo.image_not_smaller - before_redo.image_not_smaller,
+            after_redo.image_page_image_format - before_redo.image_page_image_format,
+            split_after.leaf_splits - split_before.leaf_splits,
+        );
+    }
+
+    #[test]
+    #[ignore = "B0 encoded-size probe; run explicitly with --ignored --nocapture"]
+    fn phase_b0_encoded_size_probe() {
+        const KEYS: u64 = 20_000;
+        let mut store = planned_store();
+        for chunk_start in (0..KEYS).step_by(25) {
+            let requests = vec![TransactionRequest::new(
+                Vec::new(),
+                (chunk_start..(chunk_start + 25).min(KEYS))
+                    .map(|index| TransactionMutation::Put {
+                        key: b0_key(index),
+                        value: b0_value(index, 0),
+                    })
+                    .collect(),
+            )];
+            for result in store.apply_transaction_group(&requests).unwrap() {
+                result.unwrap();
+            }
+        }
+        store.checkpoint().unwrap();
+        let leaf_count = store
+            .state
+            .pages
+            .values()
+            .filter(|page| matches!(page, BlinkPage::Leaf { .. }))
+            .count();
+        println!("B0 {{\"setup_keys\":{KEYS},\"leaf_pages\":{leaf_count}}}");
+        let mut state = 0xb0b0u64;
+        let mut next_index = || {
+            state = splitmix_for_test(state);
+            state % KEYS
+        };
+
+        b0_measure(
+            &mut store,
+            "first_touch_after_checkpoint_width1_update",
+            |store| {
+                for index in (0..KEYS).step_by(40) {
+                    store.put(b0_key(index), b0_value(index, 1)).unwrap();
+                }
+            },
+        );
+        for index in 0..KEYS {
+            store.put(b0_key(index), b0_value(index, 2)).unwrap();
+        }
+        b0_measure(&mut store, "existing_key_width1_update_64b", |store| {
+            for round in 0..4_000u64 {
+                let index = next_index();
+                store
+                    .put(b0_key(index), b0_value(index, 10 + round))
+                    .unwrap();
+            }
+        });
+        b0_measure(&mut store, "delete_existing_key", |store| {
+            for index in (1..KEYS).step_by(37).take(500) {
+                store.delete(b0_key(index)).unwrap();
+            }
+        });
+        b0_measure(&mut store, "insert_new_key", |store| {
+            for index in (1..KEYS).step_by(37).take(500) {
+                store.put(b0_key(index), b0_value(index, 7)).unwrap();
+            }
+        });
+        b0_measure(&mut store, "existing_key_width16_update", |store| {
+            for round in 0..500u64 {
+                let mut indexes = BTreeSet::new();
+                while indexes.len() < 16 {
+                    indexes.insert(next_index());
+                }
+                let request = TransactionRequest::new(
+                    Vec::new(),
+                    indexes
+                        .into_iter()
+                        .map(|index| TransactionMutation::Put {
+                            key: b0_key(index),
+                            value: b0_value(index, 20_000 + round),
+                        })
+                        .collect(),
+                );
+                store.transact(request).unwrap();
+            }
+        });
+        b0_measure(&mut store, "same_leaf_16_transactions_per_group", |store| {
+            for round in 0..200u64 {
+                let base = next_index() / 128 * 128;
+                let requests = (0..16u64)
+                    .map(|slot| {
+                        let index = (base + slot * 128) % KEYS;
+                        TransactionRequest::new(
+                            Vec::new(),
+                            vec![TransactionMutation::Put {
+                                key: b0_key(index),
+                                value: b0_value(index, 40_000 + round * 16 + slot),
+                            }],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for result in store.apply_transaction_group(&requests).unwrap() {
+                    result.unwrap();
+                }
+            }
+        });
+        b0_measure(
+            &mut store,
+            "different_leaf_16_transactions_per_group",
+            |store| {
+                for round in 0..200u64 {
+                    let requests = (0..16u64)
+                        .map(|slot| {
+                            let index = next_index();
+                            TransactionRequest::new(
+                                Vec::new(),
+                                vec![TransactionMutation::Put {
+                                    key: b0_key(index),
+                                    value: b0_value(index, 80_000 + round * 16 + slot),
+                                }],
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    for result in store.apply_transaction_group(&requests).unwrap() {
+                        result.unwrap();
+                    }
+                }
+            },
+        );
+        let (data, wal) = store.into_files();
+        let reopened =
+            BlinkStore::open_with_wal(data, wal.unwrap(), DatabaseConfig::default()).unwrap();
+        reopened.check_invariants().unwrap();
+    }
+
     fn blink_wal_identity() -> WalIdentity {
         let config = DatabaseConfig::default();
         WalIdentity::new(
@@ -10632,6 +10913,441 @@ mod tests {
             open_test_frames(&spliced),
             Err(Error::Corruption(_))
         ));
+    }
+
+    fn page_delta_store(keys: u64) -> (BlinkStore<MemoryFile, MemoryFile>, BTreeMap<u64, Vec<u8>>) {
+        let mut store = planned_store();
+        let mut expected = BTreeMap::new();
+        for index in 0..keys {
+            store.put(b0_key(index), b0_value(index, 0)).unwrap();
+            expected.insert(index, b0_value(index, 0));
+        }
+        store.checkpoint().unwrap();
+        for index in 0..keys {
+            store.put(b0_key(index), b0_value(index, 1)).unwrap();
+            expected.insert(index, b0_value(index, 1));
+        }
+        (store, expected)
+    }
+
+    fn assert_store_values(
+        store: &mut BlinkStore<MemoryFile, MemoryFile>,
+        expected: &BTreeMap<u64, Vec<u8>>,
+    ) {
+        for (index, value) in expected {
+            assert_eq!(
+                store.get(&b0_key(*index)).unwrap().value(),
+                Some(value.as_slice()),
+                "key {index}"
+            );
+        }
+        store.check_invariants().unwrap();
+    }
+
+    fn reopen_memory_store(
+        data: MemoryFile,
+        wal: MemoryFile,
+    ) -> BlinkStore<MemoryFile, MemoryFile> {
+        let mut store = BlinkStore::open_with_wal(data, wal, DatabaseConfig::default()).unwrap();
+        store.enable_planned_execution();
+        store
+    }
+
+    fn leaf_of_key(store: &BlinkStore<MemoryFile, MemoryFile>, key: &DocumentKey) -> PageId {
+        let encoded = key.encode();
+        *store
+            .state
+            .pages
+            .iter()
+            .find(|(_, page)| match page {
+                BlinkPage::Leaf { entries, .. } => entries
+                    .iter()
+                    .any(|entry| entry.key.as_ref() == encoded.as_slice()),
+                _ => false,
+            })
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn torn_checkpoint_data_page_is_rebuilt_from_wal_image_and_deltas() {
+        let mut store = planned_store();
+        for index in 0..400u64 {
+            store.put(b0_key(index), b0_value(index, 0)).unwrap();
+        }
+        store.checkpoint().unwrap();
+        let key_index = 123u64;
+        let key = b0_key(key_index);
+        let page_id = leaf_of_key(&store, &key);
+        let checkpoint_image = {
+            let mut data = MemoryFile(Vec::new());
+            std::mem::swap(&mut data.0, &mut store.file.0);
+            let image: [u8; PAGE_SIZE] = data.0
+                [page_id.get() as usize * PAGE_SIZE..(page_id.get() as usize + 1) * PAGE_SIZE]
+                .try_into()
+                .unwrap();
+            std::mem::swap(&mut data.0, &mut store.file.0);
+            image
+        };
+        let mut committed_images = Vec::new();
+        for round in 1..=5u64 {
+            store.put(key.clone(), b0_value(key_index, round)).unwrap();
+            store
+                .put(
+                    b0_key(key_index + 1 + round),
+                    b0_value(key_index, round + 50),
+                )
+                .unwrap();
+            committed_images.push(store.dirty_pages[&page_id]);
+        }
+        let redo = store.wal_metrics().unwrap().unwrap().redo;
+        assert!(redo.page_delta_records >= 8, "{redo:?}");
+        let kinds = store
+            .wal
+            .as_mut()
+            .unwrap()
+            .committed_batches_on_disk()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .pages
+                    .iter()
+                    .zip(&batch.redo_kinds)
+                    .filter(|(page, _)| page.page_id == page_id)
+                    .map(|(_, kind)| *kind)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds[0], crate::wal::WalRedoKind::PageImage);
+        assert!(
+            kinds[1..]
+                .iter()
+                .all(|kind| *kind == crate::wal::WalRedoKind::PageDelta)
+        );
+        let latest = *committed_images.last().unwrap();
+        let other_dirty = store
+            .dirty_pages
+            .iter()
+            .filter(|(id, _)| **id != page_id)
+            .map(|(id, image)| (*id, *image))
+            .collect::<Vec<_>>();
+        let (data, wal) = store.into_files();
+        let wal = wal.unwrap();
+        let mut torn = latest;
+        torn[..PAGE_SIZE / 2].copy_from_slice(&checkpoint_image[..PAGE_SIZE / 2]);
+        let mut garbage = [0u8; PAGE_SIZE];
+        let mut state = 0x7042u64;
+        garbage.copy_from_slice(&random_test_bytes(&mut state, PAGE_SIZE));
+        for (name, variant) in [
+            ("old checkpoint image", checkpoint_image),
+            ("intermediate committed image", committed_images[1]),
+            ("latest image", latest),
+            ("torn image", torn),
+            ("garbage image", garbage),
+        ] {
+            let mut data = MemoryFile(data.0.clone());
+            for (other_id, other_image) in other_dirty.iter().take(1) {
+                let offset = other_id.get() as usize * PAGE_SIZE;
+                data.0[offset..offset + PAGE_SIZE].copy_from_slice(other_image);
+            }
+            let offset = page_id.get() as usize * PAGE_SIZE;
+            data.0[offset..offset + PAGE_SIZE].copy_from_slice(&variant);
+            let mut reopened = reopen_memory_store(data, MemoryFile(wal.0.clone()));
+            assert_eq!(
+                reopened.get(&key).unwrap().value(),
+                Some(b0_value(key_index, 5).as_slice()),
+                "{name}"
+            );
+            let (recovered_data, _) = reopened.into_files();
+            assert_eq!(
+                &recovered_data.0[offset..offset + PAGE_SIZE],
+                &latest[..],
+                "{name}"
+            );
+        }
+    }
+
+    struct FailAtOccurrence {
+        point: &'static str,
+        occurrence: usize,
+        seen: usize,
+        fired: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FaultInjector for FailAtOccurrence {
+        fn hit(&mut self, point: &str) -> Result<()> {
+            if point == self.point {
+                self.seen += 1;
+                if self.seen == self.occurrence {
+                    self.fired.store(true, Ordering::SeqCst);
+                    return Err(Error::recovery(format!(
+                        "injected failure at {point} #{}",
+                        self.occurrence
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn fail_at(
+        point: &'static str,
+        occurrence: usize,
+    ) -> (FailAtOccurrence, Arc<std::sync::atomic::AtomicBool>) {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            FailAtOccurrence {
+                point,
+                occurrence,
+                seen: 0,
+                fired: Arc::clone(&fired),
+            },
+            fired,
+        )
+    }
+
+    fn width_sixteen_request(round: u64) -> (TransactionRequest, Vec<(u64, Vec<u8>)>) {
+        let writes = (0..16u64)
+            .map(|slot| {
+                let index = (slot * 13 + round) % 200;
+                (index, b0_value(index, 1_000 + round))
+            })
+            .collect::<Vec<_>>();
+        (
+            TransactionRequest::new(
+                Vec::new(),
+                writes
+                    .iter()
+                    .map(|(index, value)| TransactionMutation::Put {
+                        key: b0_key(*index),
+                        value: value.clone(),
+                    })
+                    .collect(),
+            ),
+            writes,
+        )
+    }
+
+    #[test]
+    fn page_delta_append_fault_matrix_keeps_transactions_atomic() {
+        let points = [
+            "before_wal_append",
+            "during_wal_header_write",
+            "during_page_delta_header_write",
+            "during_wal_payload_write",
+            "during_page_delta_payload_write",
+            "during_wal_trailer_write",
+            "after_page_delta_record",
+            "after_page_images_written",
+            "before_commit_record",
+            "after_commit_record_write",
+            "after_group_records_written",
+            "before_wal_sync",
+            "during_wal_sync",
+            "after_wal_sync",
+        ];
+        let mut cases = 0;
+        for point in points {
+            for occurrence in 1..=40usize {
+                let (mut store, mut expected) = page_delta_store(200);
+                let before = store.wal_metrics().unwrap().unwrap().redo;
+                let (injector, fired) = fail_at(point, occurrence);
+                store.set_fault_injector(injector);
+                let (request, writes) = width_sixteen_request(occurrence as u64);
+                let result = store.apply_transaction_group(&[request]);
+                if !fired.load(Ordering::SeqCst) {
+                    assert!(occurrence > 1, "{point} never fired");
+                    let redo = store.wal_metrics().unwrap().unwrap().redo;
+                    assert!(
+                        redo.page_delta_records > before.page_delta_records,
+                        "{point}"
+                    );
+                    assert_eq!(
+                        redo.page_image_records, before.page_image_records,
+                        "{point}"
+                    );
+                    break;
+                }
+                assert!(result.is_err(), "{point} #{occurrence}");
+                cases += 1;
+                let (data, wal) = store.into_files();
+                let mut reopened = reopen_memory_store(data, wal.unwrap());
+                let applied = writes.iter().all(|(index, value)| {
+                    reopened.get(&b0_key(*index)).unwrap().value() == Some(value.as_slice())
+                });
+                let untouched = writes.iter().all(|(index, _)| {
+                    reopened.get(&b0_key(*index)).unwrap().value()
+                        == Some(expected[index].as_slice())
+                });
+                assert!(
+                    applied ^ untouched,
+                    "{point} #{occurrence}: partial transaction"
+                );
+                let commit_written = matches!(
+                    point,
+                    "after_commit_record_write"
+                        | "after_group_records_written"
+                        | "before_wal_sync"
+                        | "during_wal_sync"
+                        | "after_wal_sync"
+                );
+                assert_eq!(applied, commit_written, "{point} #{occurrence}");
+                if applied {
+                    for (index, value) in &writes {
+                        expected.insert(*index, value.clone());
+                    }
+                }
+                assert_store_values(&mut reopened, &expected);
+                let (request, writes) = width_sixteen_request(7_777);
+                reopened.transact(request).unwrap();
+                for (index, value) in writes {
+                    expected.insert(index, value);
+                }
+                let (data, wal) = reopened.into_files();
+                let mut again = reopen_memory_store(data, wal.unwrap());
+                assert_store_values(&mut again, &expected);
+            }
+        }
+        assert!(cases >= 40, "{cases}");
+    }
+
+    #[test]
+    fn page_delta_torn_wal_tail_never_exposes_partial_transactions() {
+        let (mut store, expected) = page_delta_store(200);
+        let start = store.wal_metrics().unwrap().unwrap().wal_bytes;
+        let (request, writes) = width_sixteen_request(3);
+        store.transact(request).unwrap();
+        let end = store.wal_metrics().unwrap().unwrap().wal_bytes;
+        assert!(end - start < 4_000, "{}", end - start);
+        let (data, wal) = store.into_files();
+        let wal = wal.unwrap();
+        for cut in start..=end {
+            let mut torn_wal = MemoryFile(wal.0.clone());
+            torn_wal.0.truncate(cut as usize);
+            let mut reopened = reopen_memory_store(MemoryFile(data.0.clone()), torn_wal);
+            let applied = writes.iter().all(|(index, value)| {
+                reopened.get(&b0_key(*index)).unwrap().value() == Some(value.as_slice())
+            });
+            let untouched = writes.iter().all(|(index, _)| {
+                reopened.get(&b0_key(*index)).unwrap().value() == Some(expected[index].as_slice())
+            });
+            assert!(applied ^ untouched, "cut {cut}");
+            assert_eq!(applied, cut == end, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn page_delta_checkpoint_fault_matrix_preserves_acknowledged_writes() {
+        let points = [
+            "before_checkpoint_data_flush",
+            "during_checkpoint_page_write",
+            "before_checkpoint_data_sync",
+            "after_checkpoint_data_sync",
+            "before_checkpoint_superblock_write",
+            "after_checkpoint_superblock_write",
+            "before_checkpoint_metadata_sync",
+            "after_checkpoint_metadata_sync",
+            "before_wal_reset",
+            "during_wal_truncate",
+            "after_wal_truncate",
+            "after_wal_reset_truncate_sync",
+            "before_wal_reinitialization",
+            "during_wal_reinitialization",
+            "during_wal_header_write",
+            "after_wal_reset_write",
+            "during_wal_reset_sync",
+            "after_wal_reset_sync",
+        ];
+        let mut cases = 0;
+        for point in points {
+            for occurrence in [1usize, 2, 7, 40] {
+                let (mut store, mut expected) = page_delta_store(200);
+                for round in 0..3u64 {
+                    let (request, writes) = width_sixteen_request(round);
+                    store.transact(request).unwrap();
+                    for (index, value) in writes {
+                        expected.insert(index, value);
+                    }
+                }
+                let (injector, fired) = fail_at(point, occurrence);
+                store.set_fault_injector(injector);
+                let result = store.checkpoint();
+                if !fired.load(Ordering::SeqCst) {
+                    result.unwrap();
+                    continue;
+                }
+                assert!(result.is_err(), "{point} #{occurrence}");
+                assert!(store.checkpoint().is_err());
+                cases += 1;
+                let (data, wal) = store.into_files();
+                let mut reopened = reopen_memory_store(data, wal.unwrap());
+                assert_store_values(&mut reopened, &expected);
+                for round in 10..13u64 {
+                    let (request, writes) = width_sixteen_request(round);
+                    reopened.transact(request).unwrap();
+                    for (index, value) in writes {
+                        expected.insert(index, value);
+                    }
+                }
+                let (data, wal) = reopened.into_files();
+                let mut again = reopen_memory_store(data, wal.unwrap());
+                assert_store_values(&mut again, &expected);
+                again.checkpoint().unwrap();
+                let (data, wal) = again.into_files();
+                let mut after_checkpoint = reopen_memory_store(data, wal.unwrap());
+                assert_store_values(&mut after_checkpoint, &expected);
+            }
+        }
+        assert!(cases >= 18, "{cases}");
+    }
+
+    #[test]
+    fn page_deltas_after_flush_and_from_parallel_execution_recover() {
+        for parallel in [false, true] {
+            let mut store = if parallel {
+                parallel_store()
+            } else {
+                planned_store()
+            };
+            let mut expected = BTreeMap::new();
+            for index in 0..300u64 {
+                store.put(b0_key(index), b0_value(index, 0)).unwrap();
+                expected.insert(index, b0_value(index, 0));
+            }
+            store.flush().unwrap();
+            assert!(store.dirty_pages.is_empty());
+            let before = store.wal_metrics().unwrap().unwrap().redo;
+            for round in 1..=3u64 {
+                let requests = (0..16u64)
+                    .map(|slot| {
+                        let index = (slot * 17 + round) % 300;
+                        expected.insert(index, b0_value(index, round + 10));
+                        TransactionRequest::new(
+                            Vec::new(),
+                            vec![TransactionMutation::Put {
+                                key: b0_key(index),
+                                value: b0_value(index, round + 10),
+                            }],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for result in store.apply_transaction_group(&requests).unwrap() {
+                    result.unwrap();
+                }
+            }
+            let after = store.wal_metrics().unwrap().unwrap().redo;
+            assert_eq!(
+                after.page_image_records, before.page_image_records,
+                "{parallel}"
+            );
+            assert!(
+                after.page_delta_records >= before.page_delta_records + 48,
+                "{parallel}"
+            );
+            let (data, wal) = store.into_files();
+            let mut reopened = reopen_memory_store(data, wal.unwrap());
+            assert_store_values(&mut reopened, &expected);
+        }
     }
 
     fn splitmix_for_test(mut state: u64) -> u64 {

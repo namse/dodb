@@ -23,7 +23,7 @@ use dodb_core::{
 use dodb_storage::{
     AsyncShard, BTreeStore, BatchRequest, BatchResponse, BlinkBatchMetrics, BlinkReadHandle,
     BlinkSplitMetrics, BlinkStore, BlinkVersionedReadMetrics, CoordinatorConfig, DatabaseConfig,
-    DurableFile, ProductionFile, StorageMetrics, WalMetrics,
+    DurableFile, ProductionFile, StorageMetrics, WalMetrics, WalRedoStats,
 };
 
 const BASELINE_COMMIT: &str = "1ff96e1b3d205074d4c1b820f5f2680bd3226a8b";
@@ -1425,6 +1425,7 @@ struct MetricDelta {
     wal_syncs: u64,
     wal_committed_batches: u64,
     page_images: u64,
+    wal_redo: WalRedoStats,
     wal_append_nanos: u64,
     wal_sync_nanos: u64,
     wal_group_encode_nanos: u64,
@@ -1597,6 +1598,7 @@ impl MetricDelta {
                 wal_before.committed_batches as u64,
             ),
             page_images: subtraction(wal_after.page_images as u64, wal_before.page_images as u64),
+            wal_redo: redo_delta(&wal_after.redo, &wal_before.redo),
             wal_append_nanos: subtraction(wal_after.append_nanos, wal_before.append_nanos),
             wal_sync_nanos: subtraction(wal_after.sync_nanos, wal_before.sync_nanos),
             wal_group_encode_nanos: subtraction(
@@ -2335,6 +2337,10 @@ struct ResourceSample {
     wal_page_images: u64,
     retained_recovery_batches: u64,
     retained_recovery_page_images: u64,
+    wal_page_image_records: u64,
+    wal_page_delta_records: u64,
+    wal_syncs: u64,
+    wal_sync_nanos: u64,
     dirty_pages: u64,
     logical_transactions: u64,
 }
@@ -2353,11 +2359,15 @@ impl ResourceSample {
             wal_page_images: wal.page_images as u64,
             retained_recovery_batches: wal.retained_recovery_batches as u64,
             retained_recovery_page_images: wal.retained_recovery_page_images as u64,
+            wal_page_image_records: wal.redo.page_image_records,
+            wal_page_delta_records: wal.redo.page_delta_records,
+            wal_syncs: wal.wal_syncs,
+            wal_sync_nanos: wal.sync_nanos,
             dirty_pages: snapshot.dirty_pages.unwrap_or_default() as u64,
             logical_transactions: snapshot.coordinator.logical_transactions,
         };
         println!(
-            "resource_sample label={} unix_ms={} rss_kib={} wal_bytes={} wal_committed_batches={} wal_page_images={} retained_recovery_batches={} retained_recovery_page_images={} dirty_pages={} logical_transactions={}",
+            "resource_sample label={} unix_ms={} rss_kib={} wal_bytes={} wal_committed_batches={} wal_page_images={} retained_recovery_batches={} retained_recovery_page_images={} wal_page_image_records={} wal_page_delta_records={} wal_syncs={} wal_sync_nanos={} dirty_pages={} logical_transactions={}",
             sample.label,
             sample.unix_ms,
             sample.rss_kib,
@@ -2366,6 +2376,10 @@ impl ResourceSample {
             sample.wal_page_images,
             sample.retained_recovery_batches,
             sample.retained_recovery_page_images,
+            sample.wal_page_image_records,
+            sample.wal_page_delta_records,
+            sample.wal_syncs,
+            sample.wal_sync_nanos,
             sample.dirty_pages,
             sample.logical_transactions,
         );
@@ -2424,6 +2438,44 @@ impl ResourceSampler {
         self.handle
             .join()
             .expect("resource sampler thread should not panic")
+    }
+}
+
+fn redo_delta(after: &WalRedoStats, before: &WalRedoStats) -> WalRedoStats {
+    WalRedoStats {
+        page_image_records: u64::saturating_sub(
+            after.page_image_records,
+            before.page_image_records,
+        ),
+        page_delta_records: u64::saturating_sub(
+            after.page_delta_records,
+            before.page_delta_records,
+        ),
+        page_delta_payload_bytes: u64::saturating_sub(
+            after.page_delta_payload_bytes,
+            before.page_delta_payload_bytes,
+        ),
+        page_delta_spans: u64::saturating_sub(after.page_delta_spans, before.page_delta_spans),
+        page_delta_changed_bytes: u64::saturating_sub(
+            after.page_delta_changed_bytes,
+            before.page_delta_changed_bytes,
+        ),
+        image_superblock: u64::saturating_sub(after.image_superblock, before.image_superblock),
+        image_not_requested: u64::saturating_sub(
+            after.image_not_requested,
+            before.image_not_requested,
+        ),
+        image_page_image_format: u64::saturating_sub(
+            after.image_page_image_format,
+            before.image_page_image_format,
+        ),
+        image_ineligible_commit: u64::saturating_sub(
+            after.image_ineligible_commit,
+            before.image_ineligible_commit,
+        ),
+        image_first_touch: u64::saturating_sub(after.image_first_touch, before.image_first_touch),
+        image_no_base: u64::saturating_sub(after.image_no_base, before.image_no_base),
+        image_not_smaller: u64::saturating_sub(after.image_not_smaller, before.image_not_smaller),
     }
 }
 
@@ -2848,6 +2900,31 @@ fn build_record(
     json.u64("wal_syncs_delta", delta.wal_syncs);
     json.u64("wal_committed_batches_delta", delta.wal_committed_batches);
     json.u64("page_images_delta", delta.page_images);
+    let redo = &delta.wal_redo;
+    json.u64("wal_page_image_records_delta", redo.page_image_records);
+    json.u64("wal_page_delta_records_delta", redo.page_delta_records);
+    json.u64(
+        "wal_page_delta_payload_bytes_delta",
+        redo.page_delta_payload_bytes,
+    );
+    json.u64("wal_page_delta_spans_delta", redo.page_delta_spans);
+    json.u64(
+        "wal_page_delta_changed_bytes_delta",
+        redo.page_delta_changed_bytes,
+    );
+    json.u64("wal_image_superblock_delta", redo.image_superblock);
+    json.u64("wal_image_not_requested_delta", redo.image_not_requested);
+    json.u64(
+        "wal_image_page_image_format_delta",
+        redo.image_page_image_format,
+    );
+    json.u64(
+        "wal_image_ineligible_commit_delta",
+        redo.image_ineligible_commit,
+    );
+    json.u64("wal_image_first_touch_delta", redo.image_first_touch);
+    json.u64("wal_image_no_base_delta", redo.image_no_base);
+    json.u64("wal_image_not_smaller_delta", redo.image_not_smaller);
     json.u64("wal_append_nanos_total", delta.wal_append_nanos);
     json.u64("wal_sync_nanos_total", delta.wal_sync_nanos);
     json.u64("wal_group_encode_nanos_total", delta.wal_group_encode_nanos);
@@ -3183,6 +3260,16 @@ fn build_record(
                 &format!("{prefix}_retained_recovery_page_images"),
                 sample.retained_recovery_page_images,
             );
+            json.u64(
+                &format!("{prefix}_wal_page_image_records"),
+                sample.wal_page_image_records,
+            );
+            json.u64(
+                &format!("{prefix}_wal_page_delta_records"),
+                sample.wal_page_delta_records,
+            );
+            json.u64(&format!("{prefix}_wal_syncs"), sample.wal_syncs);
+            json.u64(&format!("{prefix}_wal_sync_nanos"), sample.wal_sync_nanos);
             json.u64(&format!("{prefix}_dirty_pages"), sample.dirty_pages);
             json.u64(
                 &format!("{prefix}_logical_transactions"),
