@@ -1,10 +1,13 @@
 //! Versioned redo-only write-ahead logging.
 //!
 //! The WAL is deliberately independent from the data file.  It contains
-//! complete encoded after-images and an explicit commit marker.  A page image
-//! is never replayed unless the matching commit marker is complete and its
-//! metadata digest matches the image sequence.
+//! encoded after-images, byte deltas against an earlier after-image of the
+//! same WAL history, and an explicit commit marker.  A redo record is never
+//! replayed unless the matching commit marker is complete and its digest
+//! matches the record sequence.
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::time::Instant;
 
@@ -15,7 +18,8 @@ use crate::fault::FaultInjector;
 use crate::page::{PAGE_SIZE, decode_page_at};
 use crate::superblock::decode_superblock;
 
-pub const WAL_FORMAT_VERSION: u16 = 2;
+pub const WAL_FORMAT_VERSION: u16 = 3;
+pub const WAL_PAGE_IMAGE_FORMAT_VERSION: u16 = 2;
 pub const WAL_MAGIC: [u8; 4] = *b"DWAL";
 pub const WAL_HEADER_SIZE: usize = 48;
 pub const WAL_TRAILER_SIZE: usize = 4;
@@ -30,6 +34,11 @@ const INIT_PAYLOAD_SIZE: usize = 52;
 const INIT_FRAME_SIZE: usize = WAL_HEADER_SIZE + INIT_PAYLOAD_SIZE + WAL_TRAILER_SIZE;
 const PAGE_IMAGE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE;
 const COMMIT_PAYLOAD_SIZE: usize = 16;
+pub const PAGE_DELTA_HEADER_SIZE: usize = 18;
+pub const PAGE_DELTA_SPAN_HEADER_SIZE: usize = 4;
+pub const PAGE_DELTA_SPAN_MERGE_GAP: usize = PAGE_DELTA_SPAN_HEADER_SIZE;
+pub const PAGE_DELTA_MAX_SPANS: usize = PAGE_SIZE.div_ceil(PAGE_DELTA_SPAN_MERGE_GAP + 1);
+const PAGE_LSN_RANGE: std::ops::Range<usize> = 16..24;
 
 const SUPERBLOCK_A_PAGE: PageId = PageId::ZERO;
 const SUPERBLOCK_B_PAGE: PageId = PageId::new(1);
@@ -58,6 +67,7 @@ pub enum WalRecordType {
     Init = 1,
     PageImage = 2,
     Commit = 3,
+    PageDelta = 4,
 }
 
 impl WalRecordType {
@@ -66,6 +76,7 @@ impl WalRecordType {
             1 => Ok(Self::Init),
             2 => Ok(Self::PageImage),
             3 => Ok(Self::Commit),
+            4 => Ok(Self::PageDelta),
             other => Err(Error::unsupported_format(format!(
                 "unknown WAL record type {other}"
             ))),
@@ -111,11 +122,71 @@ pub struct WalCommit {
     pub pages: Vec<WalPageImage>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalRedoKind {
+    PageImage,
+    PageDelta,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedWalBatch {
     pub batch_id: u64,
     pub commit_lsn: Lsn,
     pub pages: Vec<WalPageImage>,
+    pub redo_kinds: Vec<WalRedoKind>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredWalPage {
+    pub commit_lsn: Lsn,
+    pub image: Box<[u8; PAGE_SIZE]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageChainEntry {
+    page_lsn: Lsn,
+    image_crc: u32,
+}
+
+pub(crate) type WalDeltaBaseSource<'source, 'base> =
+    dyn FnMut(PageId) -> Option<Cow<'base, [u8; PAGE_SIZE]>> + 'source;
+
+pub(crate) struct WalDeltaRequest<'request, 'source, 'base> {
+    pub eligible_commits: &'request [bool],
+    pub base_source: &'request mut WalDeltaBaseSource<'source, 'base>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalRedoStats {
+    pub page_image_records: u64,
+    pub page_delta_records: u64,
+    pub page_delta_payload_bytes: u64,
+    pub page_delta_spans: u64,
+    pub page_delta_changed_bytes: u64,
+    pub image_superblock: u64,
+    pub image_not_requested: u64,
+    pub image_page_image_format: u64,
+    pub image_ineligible_commit: u64,
+    pub image_first_touch: u64,
+    pub image_no_base: u64,
+    pub image_not_smaller: u64,
+}
+
+impl WalRedoStats {
+    fn add(&mut self, other: &Self) {
+        self.page_image_records += other.page_image_records;
+        self.page_delta_records += other.page_delta_records;
+        self.page_delta_payload_bytes += other.page_delta_payload_bytes;
+        self.page_delta_spans += other.page_delta_spans;
+        self.page_delta_changed_bytes += other.page_delta_changed_bytes;
+        self.image_superblock += other.image_superblock;
+        self.image_not_requested += other.image_not_requested;
+        self.image_page_image_format += other.image_page_image_format;
+        self.image_ineligible_commit += other.image_ineligible_commit;
+        self.image_first_touch += other.image_first_touch;
+        self.image_no_base += other.image_no_base;
+        self.image_not_smaller += other.image_not_smaller;
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -142,6 +213,8 @@ pub struct WalMetrics {
     pub page_images: usize,
     pub retained_recovery_batches: usize,
     pub retained_recovery_page_images: usize,
+    pub tracked_chain_pages: usize,
+    pub redo: WalRedoStats,
     pub append_nanos: u64,
     pub sync_nanos: u64,
     pub group_encode_nanos: u64,
@@ -168,21 +241,48 @@ pub struct WalMetrics {
 }
 
 #[derive(Clone, Debug)]
-struct Frame {
-    format_version: u16,
-    record_type: WalRecordType,
-    record_lsn: Lsn,
-    batch_id: u64,
-    record_index: u32,
-    payload: Vec<u8>,
+enum PendingRedo {
+    Image(Box<WalPageImage>),
+    Delta(Vec<u8>),
 }
 
 #[derive(Clone, Debug)]
 struct PendingBatch {
     batch_id: u64,
     first_record_lsn: Lsn,
-    pages: Vec<WalPageImage>,
-    digest_input: Vec<u8>,
+    records: Vec<PendingRedo>,
+    digest: u32,
+}
+
+#[derive(Clone, Debug)]
+enum PlannedRedo {
+    Image,
+    Delta(Vec<u8>),
+}
+
+struct RedoPlan {
+    records: Vec<Vec<PlannedRedo>>,
+    chain_updates: Vec<(PageId, PageChainEntry)>,
+    stats: WalRedoStats,
+}
+
+struct WalScanOutput {
+    next_lsn: Lsn,
+    next_batch_id: u64,
+    format_version: u16,
+    history_start_lsn: Lsn,
+    last_commit_lsn: Option<Lsn>,
+    batches: Vec<CommittedWalBatch>,
+    pages: BTreeMap<PageId, RecoveredWalPage>,
+    redo: WalRedoStats,
+    report: WalScanReport,
+    valid_length: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanMaterialization {
+    Recovery,
+    Batches,
 }
 
 struct EncodedWalGroup {
@@ -225,6 +325,9 @@ pub struct WalLog<F: DurableFile> {
     history_start_lsn: Lsn,
     last_commit_lsn: Option<Lsn>,
     recovery_batches: Vec<CommittedWalBatch>,
+    recovery_pages: BTreeMap<PageId, RecoveredWalPage>,
+    page_chain: HashMap<PageId, PageChainEntry>,
+    redo_stats: WalRedoStats,
     scan_report: WalScanReport,
     sync_count: u64,
     page_images: usize,
@@ -293,7 +396,13 @@ impl<F: DurableFile> WalLog<F> {
         if usize::try_from(length)
             .ok()
             .is_some_and(|length| length < INIT_FRAME_SIZE)
-            && is_torn_initialization_prefix(&mut file, &identity, start_after_lsn, length)?
+            && is_torn_initialization_prefix(
+                &mut file,
+                &identity,
+                start_after_lsn,
+                length,
+                page_image_format,
+            )?
         {
             file.set_len(0)
                 .map_err(|error| Error::recovery(format!("WAL torn INIT reset failed: {error}")))?;
@@ -303,15 +412,23 @@ impl<F: DurableFile> WalLog<F> {
             return Self::initialize_empty(file, identity, start_after_lsn, page_image_format);
         }
 
-        let (
+        let WalScanOutput {
             next_lsn,
             next_batch_id,
             format_version,
             history_start_lsn,
-            committed,
+            last_commit_lsn,
+            batches,
+            pages,
+            redo,
             mut report,
             valid_length,
-        ) = scan_wal(&mut file, &identity, page_image_format)?;
+        } = scan_wal(
+            &mut file,
+            &identity,
+            page_image_format,
+            ScanMaterialization::Recovery,
+        )?;
         if valid_length < length {
             hit(&mut injector, "before_wal_tail_truncate")?;
             file.set_len(valid_length)?;
@@ -322,8 +439,21 @@ impl<F: DurableFile> WalLog<F> {
         }
         report.torn_tail_bytes = usize::try_from(length - valid_length)
             .map_err(|_| Error::invariant("WAL tail length does not fit usize"))?;
-        let page_images = report.replayable_pages;
-        let last_commit_lsn = committed.last().map(|batch| batch.commit_lsn);
+        let page_images = usize::try_from(redo.page_image_records)
+            .map_err(|_| Error::invariant("WAL page-image count does not fit usize"))?;
+        let page_chain = pages
+            .iter()
+            .filter(|(page_id, _)| !is_superblock_page(**page_id))
+            .map(|(page_id, page)| {
+                (
+                    *page_id,
+                    PageChainEntry {
+                        page_lsn: page_lsn_of(&page.image),
+                        image_crc: crc32c::crc32c(&page.image[..]),
+                    },
+                )
+            })
+            .collect();
         Ok(Self {
             file,
             identity,
@@ -332,7 +462,10 @@ impl<F: DurableFile> WalLog<F> {
             next_batch_id,
             history_start_lsn,
             last_commit_lsn,
-            recovery_batches: committed,
+            recovery_batches: batches,
+            recovery_pages: pages,
+            page_chain,
+            redo_stats: redo,
             scan_report: report,
             sync_count: 0,
             page_images,
@@ -360,12 +493,15 @@ impl<F: DurableFile> WalLog<F> {
         let mut wal = Self {
             file,
             identity,
-            format_version: WAL_FORMAT_VERSION,
+            format_version: write_format_version(page_image_format),
             next_lsn,
             next_batch_id: 1,
             history_start_lsn: start_after_lsn,
             last_commit_lsn: None,
             recovery_batches: Vec::new(),
+            recovery_pages: BTreeMap::new(),
+            page_chain: HashMap::new(),
+            redo_stats: WalRedoStats::default(),
             scan_report: WalScanReport::default(),
             sync_count: 0,
             page_images: 0,
@@ -399,6 +535,23 @@ impl<F: DurableFile> WalLog<F> {
         std::mem::take(&mut self.recovery_batches)
     }
 
+    pub fn recovery_pages(&self) -> &BTreeMap<PageId, RecoveredWalPage> {
+        &self.recovery_pages
+    }
+
+    pub fn take_recovery_pages(&mut self) -> BTreeMap<PageId, RecoveredWalPage> {
+        std::mem::take(&mut self.recovery_pages)
+    }
+
+    pub fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
+    pub fn page_delta_enabled(&self) -> bool {
+        self.format_version >= WAL_FORMAT_VERSION
+            && self.page_image_format == WalPageImageFormat::ExperimentalBlink
+    }
+
     pub fn last_commit_lsn(&self) -> Option<Lsn> {
         self.last_commit_lsn
     }
@@ -409,9 +562,33 @@ impl<F: DurableFile> WalLog<F> {
 
     #[cfg(test)]
     pub(crate) fn committed_batches_on_disk(&mut self) -> Vec<CommittedWalBatch> {
-        scan_wal(&mut self.file, &self.identity, self.page_image_format)
-            .expect("WAL on disk scans")
-            .4
+        scan_wal(
+            &mut self.file,
+            &self.identity,
+            self.page_image_format,
+            ScanMaterialization::Batches,
+        )
+        .expect("WAL on disk scans")
+        .batches
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_summaries_from(
+        &mut self,
+        start_offset: u64,
+    ) -> Vec<(WalRecordType, u64, usize)> {
+        let length = self.file.len().expect("WAL length");
+        let mut offset = start_offset;
+        let mut summaries = Vec::new();
+        while offset + WAL_HEADER_SIZE as u64 <= length {
+            let header =
+                read_exact_at(&mut self.file, offset, WAL_HEADER_SIZE).expect("WAL header");
+            let (_, record_type, frame_length, _, _, batch_id, _) =
+                decode_header(&header).expect("WAL header decodes");
+            summaries.push((record_type, batch_id, frame_length));
+            offset += frame_length as u64;
+        }
+        summaries
     }
 
     pub fn next_lsn(&self) -> Lsn {
@@ -461,7 +638,7 @@ impl<F: DurableFile> WalLog<F> {
         hit(&mut injector, "after_wal_reset_truncate_sync")?;
 
         self.history_start_lsn = checkpoint_lsn;
-        self.format_version = WAL_FORMAT_VERSION;
+        self.format_version = write_format_version(self.page_image_format);
         self.next_lsn = checkpoint_lsn
             .get()
             .checked_add(1)
@@ -470,6 +647,9 @@ impl<F: DurableFile> WalLog<F> {
         self.next_batch_id = 1;
         self.last_commit_lsn = None;
         self.recovery_batches = Vec::new();
+        self.recovery_pages = BTreeMap::new();
+        self.page_chain = HashMap::new();
+        self.redo_stats = WalRedoStats::default();
         self.scan_report = WalScanReport {
             records_scanned: 1,
             ..WalScanReport::default()
@@ -515,7 +695,10 @@ impl<F: DurableFile> WalLog<F> {
                 .recovery_batches
                 .iter()
                 .map(|batch| batch.pages.len())
-                .sum(),
+                .sum::<usize>()
+                + self.recovery_pages.len(),
+            tracked_chain_pages: self.page_chain.len(),
+            redo: self.redo_stats,
             append_nanos: self.append_nanos,
             sync_nanos: self.sync_nanos,
             group_encode_nanos: self.group_encode_nanos,
@@ -602,7 +785,22 @@ impl<F: DurableFile> WalLog<F> {
         commits: &[WalCommit],
         injector: Option<&mut (dyn FaultInjector + Send + '_)>,
     ) -> Result<Vec<WalAppendReport>> {
-        self.append_group_inner(commits, injector, PageImageValidationMode::Strict)
+        self.append_group_inner(commits, injector, PageImageValidationMode::Strict, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_group_with_page_deltas(
+        &mut self,
+        commits: &[WalCommit],
+        delta: &mut WalDeltaRequest<'_, '_, '_>,
+        injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Vec<WalAppendReport>> {
+        self.append_group_inner(
+            commits,
+            injector,
+            PageImageValidationMode::Strict,
+            Some(delta),
+        )
     }
 
     /// Appends page images produced moments earlier by this storage engine's
@@ -617,7 +815,12 @@ impl<F: DurableFile> WalLog<F> {
         if injector.is_some() {
             return self.append_group(commits, injector);
         }
-        self.append_group_inner(commits, None, PageImageValidationMode::TrustedInternal)
+        self.append_group_inner(
+            commits,
+            None,
+            PageImageValidationMode::TrustedInternal,
+            None,
+        )
     }
 
     fn append_group_inner(
@@ -625,6 +828,7 @@ impl<F: DurableFile> WalLog<F> {
         commits: &[WalCommit],
         mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
         validation_mode: PageImageValidationMode,
+        delta: Option<&mut WalDeltaRequest<'_, '_, '_>>,
     ) -> Result<Vec<WalAppendReport>> {
         if commits.is_empty() {
             return Err(Error::invalid_input("a WAL group must contain a commit"));
@@ -632,11 +836,17 @@ impl<F: DurableFile> WalLog<F> {
 
         let append_started = Instant::now();
         hit(&mut injector, "before_wal_append")?;
+        let plan_started = Instant::now();
+        let plan = self.plan_redo(commits, delta)?;
+        self.group_encode_nanos = self
+            .group_encode_nanos
+            .checked_add(elapsed_nanos(plan_started)?)
+            .ok_or_else(|| Error::invariant("WAL group-encode timing overflow"))?;
         let (reports, next_lsn, next_batch_id) = if injector.is_some() {
-            self.append_group_fault_injectable(commits, &mut injector)?
+            self.append_group_fault_injectable(commits, &plan, &mut injector)?
         } else {
             let encode_started = Instant::now();
-            let encoded = self.encode_group(commits, validation_mode)?;
+            let encoded = self.encode_group(commits, validation_mode, &plan)?;
             self.group_encode_nanos = self
                 .group_encode_nanos
                 .checked_add(elapsed_nanos(encode_started)?)
@@ -705,22 +915,158 @@ impl<F: DurableFile> WalLog<F> {
             .sum::<usize>();
         self.page_images = self
             .page_images
-            .checked_add(commits.iter().map(|commit| commit.pages.len()).sum())
+            .checked_add(
+                usize::try_from(plan.stats.page_image_records)
+                    .map_err(|_| Error::invariant("WAL page-image count overflow"))?,
+            )
             .ok_or_else(|| Error::invariant("WAL page-image count overflow"))?;
+        for (page_id, entry) in plan.chain_updates {
+            self.page_chain.insert(page_id, entry);
+        }
+        self.redo_stats.add(&plan.stats);
 
         Ok(reports)
+    }
+
+    fn plan_redo(
+        &self,
+        commits: &[WalCommit],
+        mut delta: Option<&mut WalDeltaRequest<'_, '_, '_>>,
+    ) -> Result<RedoPlan> {
+        if let Some(request) = delta.as_deref()
+            && request.eligible_commits.len() != commits.len()
+        {
+            return Err(Error::invalid_input(
+                "WAL page-delta eligibility must name every commit",
+            ));
+        }
+        let track_chain = self.page_image_format == WalPageImageFormat::ExperimentalBlink;
+        let delta_format = self.page_delta_enabled();
+        let mut group_chain: HashMap<PageId, (PageChainEntry, &[u8; PAGE_SIZE])> = HashMap::new();
+        let mut records = Vec::with_capacity(commits.len());
+        let mut chain_updates = Vec::new();
+        let mut stats = WalRedoStats::default();
+        for (commit_index, commit) in commits.iter().enumerate() {
+            let mut commit_records = Vec::with_capacity(commit.pages.len());
+            for page in &commit.pages {
+                let superblock = is_superblock_page(page.page_id);
+                let planned = if superblock {
+                    stats.image_superblock += 1;
+                    PlannedRedo::Image
+                } else if let Some(request) = delta.as_deref_mut() {
+                    if !delta_format {
+                        stats.image_page_image_format += 1;
+                        PlannedRedo::Image
+                    } else if !request.eligible_commits[commit_index] {
+                        stats.image_ineligible_commit += 1;
+                        PlannedRedo::Image
+                    } else {
+                        let known = match group_chain.get(&page.page_id) {
+                            Some((entry, image)) => Some((*entry, Some(*image))),
+                            None => self
+                                .page_chain
+                                .get(&page.page_id)
+                                .map(|entry| (*entry, None)),
+                        };
+                        match known {
+                            None => {
+                                stats.image_first_touch += 1;
+                                PlannedRedo::Image
+                            }
+                            Some((entry, group_base)) => {
+                                let source_base;
+                                let base = match group_base {
+                                    Some(image) => Some(image),
+                                    None => {
+                                        source_base = (request.base_source)(page.page_id);
+                                        source_base.as_deref()
+                                    }
+                                };
+                                match base {
+                                    None => {
+                                        stats.image_no_base += 1;
+                                        PlannedRedo::Image
+                                    }
+                                    Some(base) => {
+                                        self.plan_page_delta(page, base, entry, &mut stats)?
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    stats.image_not_requested += 1;
+                    PlannedRedo::Image
+                };
+                if matches!(planned, PlannedRedo::Image) {
+                    stats.page_image_records += 1;
+                }
+                if track_chain && !superblock {
+                    let entry = PageChainEntry {
+                        page_lsn: page_lsn_of(&page.image),
+                        image_crc: crc32c::crc32c(&page.image[..]),
+                    };
+                    group_chain.insert(page.page_id, (entry, &page.image));
+                    chain_updates.push((page.page_id, entry));
+                }
+                commit_records.push(planned);
+            }
+            records.push(commit_records);
+        }
+        Ok(RedoPlan {
+            records,
+            chain_updates,
+            stats,
+        })
+    }
+
+    fn plan_page_delta(
+        &self,
+        page: &WalPageImage,
+        base: &[u8; PAGE_SIZE],
+        entry: PageChainEntry,
+        stats: &mut WalRedoStats,
+    ) -> Result<PlannedRedo> {
+        if page_lsn_of(base) != entry.page_lsn || crc32c::crc32c(&base[..]) != entry.image_crc {
+            return Err(Error::invariant(format!(
+                "page {} delta base does not match the WAL page chain (chain LSN {}, base LSN {})",
+                page.page_id,
+                entry.page_lsn,
+                page_lsn_of(base)
+            )));
+        }
+        let payload = encode_page_delta(page.page_id, base, &page.image)?;
+        if payload.len() >= PAGE_IMAGE_PAYLOAD_SIZE {
+            stats.image_not_smaller += 1;
+            return Ok(PlannedRedo::Image);
+        }
+        let view = decode_page_delta(&payload)?;
+        if apply_page_delta(base, &view)? != page.image {
+            return Err(Error::invariant(format!(
+                "page {} delta does not rebuild its after-image",
+                page.page_id
+            )));
+        }
+        stats.page_delta_records += 1;
+        stats.page_delta_payload_bytes += payload.len() as u64;
+        stats.page_delta_spans += view.spans.len() as u64;
+        stats.page_delta_changed_bytes += view.changed_bytes() as u64;
+        drop(view);
+        Ok(PlannedRedo::Delta(payload))
     }
 
     fn append_group_fault_injectable(
         &mut self,
         commits: &[WalCommit],
+        plan: &RedoPlan,
         injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
     ) -> Result<(Vec<WalAppendReport>, Lsn, u64)> {
         let mut next_lsn = self.next_lsn;
         let mut next_batch_id = self.next_batch_id;
         let mut reports = Vec::with_capacity(commits.len());
-        for commit in commits {
-            let report = self.append_group_commit(commit, next_lsn, next_batch_id, injector)?;
+        for (commit, records) in commits.iter().zip(&plan.records) {
+            let report =
+                self.append_group_commit(commit, records, next_lsn, next_batch_id, injector)?;
             next_lsn = Lsn::new(
                 report
                     .commit_lsn
@@ -740,19 +1086,24 @@ impl<F: DurableFile> WalLog<F> {
         &self,
         commits: &[WalCommit],
         validation_mode: PageImageValidationMode,
+        plan: &RedoPlan,
     ) -> Result<EncodedWalGroup> {
         let mut attribution = WalEncodeAttribution::default();
         let mut capacity = 0usize;
-        for commit in commits {
+        for (commit, records) in commits.iter().zip(&plan.records) {
             if commit.pages.is_empty() {
                 return Err(Error::invalid_input(
                     "a WAL commit must contain at least one page image",
                 ));
             }
-            let page_frames = commit
-                .pages
-                .len()
-                .checked_mul(WAL_HEADER_SIZE + PAGE_IMAGE_PAYLOAD_SIZE + WAL_TRAILER_SIZE)
+            let page_frames = records
+                .iter()
+                .map(|record| match record {
+                    PlannedRedo::Image => PAGE_IMAGE_PAYLOAD_SIZE,
+                    PlannedRedo::Delta(payload) => payload.len(),
+                } + WAL_HEADER_SIZE
+                    + WAL_TRAILER_SIZE)
+                .try_fold(0usize, |total, size| total.checked_add(size))
                 .ok_or_else(|| Error::invalid_input("WAL group size overflows"))?;
             let commit_frame = WAL_HEADER_SIZE
                 .checked_add(COMMIT_PAYLOAD_SIZE)
@@ -771,7 +1122,7 @@ impl<F: DurableFile> WalLog<F> {
         let mut next_lsn = self.next_lsn;
         let mut next_batch_id = self.next_batch_id;
 
-        for commit in commits {
+        for (commit, records) in commits.iter().zip(&plan.records) {
             let first_record_lsn = next_lsn;
             if commit.batch_id != next_batch_id {
                 return Err(Error::invariant(format!(
@@ -795,7 +1146,7 @@ impl<F: DurableFile> WalLog<F> {
 
             let mut bytes_written = 0usize;
             let mut digest = 0u32;
-            for (page_index, page) in commit.pages.iter().enumerate() {
+            for (page_index, (page, record)) in commit.pages.iter().zip(records).enumerate() {
                 let page_lsn_validation_started = Instant::now();
                 validate_page_image_lsn(page, commit.commit_lsn)?;
                 attribution.group_page_lsn_validate_nanos +=
@@ -808,13 +1159,24 @@ impl<F: DurableFile> WalLog<F> {
                     attribution.group_page_validations += 1;
                 }
                 let page_id_bytes = page.page_id.get().to_le_bytes();
+                let record_index = u32::try_from(page_index)
+                    .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
+                let (record_type, payload_parts): (WalRecordType, [&[u8]; 2]) = match record {
+                    PlannedRedo::Image => (WalRecordType::PageImage, [&page_id_bytes, &page.image]),
+                    PlannedRedo::Delta(payload) => (WalRecordType::PageDelta, [payload, &[]]),
+                };
                 let payload_crc_started = Instant::now();
-                let payload_checksum = crc32c::crc32c(&page_id_bytes);
-                let payload_checksum = crc32c::crc32c_append(payload_checksum, &page.image);
+                let payload_checksum = crc32c::crc32c(payload_parts[0]);
+                let payload_checksum = crc32c::crc32c_append(payload_checksum, payload_parts[1]);
                 attribution.group_page_payload_crc_nanos += elapsed_nanos(payload_crc_started)?;
                 let digest_started = Instant::now();
-                digest = crc32c::crc32c_append(digest, &page_id_bytes);
-                digest = crc32c::crc32c_append(digest, &page.image);
+                digest = update_record_digest(
+                    digest,
+                    self.format_version,
+                    record_type,
+                    record_index,
+                    &payload_parts,
+                );
                 attribution.group_commit_digest_crc_nanos += elapsed_nanos(digest_started)?;
                 let record_lsn = first_record_lsn
                     .get()
@@ -824,17 +1186,16 @@ impl<F: DurableFile> WalLog<F> {
                     )
                     .map(Lsn::new)
                     .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
-                let record_index = u32::try_from(page_index)
-                    .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
-                let frame_length = append_page_frame_direct(
+                let frame_length = append_frame_parts_direct(
                     &mut bytes,
                     self.format_version,
+                    record_type,
                     record_lsn,
                     commit.batch_id,
                     record_index,
-                    &page_id_bytes,
-                    &page.image,
+                    payload_parts[0].len() + payload_parts[1].len(),
                     payload_checksum,
+                    &payload_parts,
                     &mut attribution,
                 )?;
                 bytes_written = bytes_written
@@ -897,6 +1258,7 @@ impl<F: DurableFile> WalLog<F> {
     fn append_group_commit(
         &mut self,
         commit: &WalCommit,
+        records: &[PlannedRedo],
         first_record_lsn: Lsn,
         expected_batch_id: u64,
         injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
@@ -927,17 +1289,29 @@ impl<F: DurableFile> WalLog<F> {
             )));
         }
 
-        let mut digest_input = Vec::with_capacity(
-            pages
-                .len()
-                .checked_mul(PAGE_IMAGE_PAYLOAD_SIZE)
-                .ok_or_else(|| Error::invalid_input("WAL digest input is too large"))?,
-        );
+        let mut digest = 0u32;
         let mut bytes_written = 0usize;
-        for (index, page) in pages.iter().enumerate() {
+        for (index, (page, record)) in pages.iter().zip(records).enumerate() {
             validate_page_image_lsn(page, commit.commit_lsn)?;
-            let payload = encode_page_image(page, self.page_image_format)?;
-            digest_input.extend_from_slice(&payload);
+            let (record_type, payload) = match record {
+                PlannedRedo::Image => (
+                    WalRecordType::PageImage,
+                    encode_page_image(page, self.page_image_format)?,
+                ),
+                PlannedRedo::Delta(payload) => {
+                    validate_page_image(page, self.page_image_format)?;
+                    (WalRecordType::PageDelta, payload.clone())
+                }
+            };
+            let record_index = u32::try_from(index)
+                .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
+            digest = update_record_digest(
+                digest,
+                self.format_version,
+                record_type,
+                record_index,
+                &[&payload],
+            );
             let record_lsn = Lsn::new(
                 first_record_lsn
                     .get()
@@ -945,22 +1319,21 @@ impl<F: DurableFile> WalLog<F> {
                     .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
             );
             bytes_written = bytes_written
-                .checked_add(
-                    self.append_frame(
-                        WalRecordType::PageImage,
-                        record_lsn,
-                        commit.batch_id,
-                        u32::try_from(index)
-                            .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?,
-                        &payload,
-                        &mut *injector,
-                    )?,
-                )
+                .checked_add(self.append_frame(
+                    record_type,
+                    record_lsn,
+                    commit.batch_id,
+                    record_index,
+                    &payload,
+                    &mut *injector,
+                )?)
                 .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+            if record_type == WalRecordType::PageDelta {
+                hit(&mut *injector, "after_page_delta_record")?;
+            }
         }
         hit(&mut *injector, "after_page_images_written")?;
 
-        let digest = crc32c::crc32c(&digest_input);
         let mut commit_payload = [0u8; COMMIT_PAYLOAD_SIZE];
         commit_payload[0..8].copy_from_slice(&first_record_lsn.get().to_le_bytes());
         commit_payload[8..12].copy_from_slice(
@@ -1015,6 +1388,9 @@ impl<F: DurableFile> WalLog<F> {
 
         let offset = self.file.len()?;
         hit(injector, "during_wal_header_write")?;
+        if record_type == WalRecordType::PageDelta {
+            hit(injector, "during_page_delta_header_write")?;
+        }
         write_all_at_counted(
             &mut self.file,
             offset,
@@ -1022,6 +1398,9 @@ impl<F: DurableFile> WalLog<F> {
             &mut self.physical_write_calls,
         )?;
         hit(injector, "during_wal_payload_write")?;
+        if record_type == WalRecordType::PageDelta {
+            hit(injector, "during_page_delta_payload_write")?;
+        }
         write_all_at_counted(
             &mut self.file,
             offset
@@ -1059,11 +1438,12 @@ fn is_torn_initialization_prefix<F: DurableFile>(
     identity: &WalIdentity,
     start_after_lsn: Lsn,
     length: u64,
+    page_image_format: WalPageImageFormat,
 ) -> Result<bool> {
     let length = usize::try_from(length)
         .map_err(|_| Error::recovery("WAL torn INIT length does not fit usize"))?;
     let expected = encode_frame(
-        WAL_FORMAT_VERSION,
+        write_format_version(page_image_format),
         WalRecordType::Init,
         Lsn::ZERO,
         0,
@@ -1156,31 +1536,6 @@ fn encode_frame_impl(
     Ok(frame)
 }
 
-fn append_page_frame_direct(
-    output: &mut Vec<u8>,
-    format_version: u16,
-    record_lsn: Lsn,
-    batch_id: u64,
-    record_index: u32,
-    page_id: &[u8; 8],
-    page_image: &[u8; PAGE_SIZE],
-    payload_checksum: u32,
-    attribution: &mut WalEncodeAttribution,
-) -> Result<usize> {
-    append_frame_parts_direct(
-        output,
-        format_version,
-        WalRecordType::PageImage,
-        record_lsn,
-        batch_id,
-        record_index,
-        PAGE_IMAGE_PAYLOAD_SIZE,
-        payload_checksum,
-        &[page_id, page_image],
-        attribution,
-    )
-}
-
 fn append_frame_direct(
     output: &mut Vec<u8>,
     format_version: u16,
@@ -1252,7 +1607,7 @@ fn append_frame_parts_direct(
     header[HEADER_CHECKSUM_OFFSET..HEADER_CHECKSUM_OFFSET + 4]
         .copy_from_slice(&checksum.to_le_bytes());
     match record_type {
-        WalRecordType::PageImage => {
+        WalRecordType::PageImage | WalRecordType::PageDelta => {
             attribution.group_page_header_crc_nanos += header_crc_nanos;
         }
         WalRecordType::Commit => {
@@ -1272,7 +1627,7 @@ fn append_frame_parts_direct(
     );
     let direct_nanos = elapsed_nanos(direct_started)?;
     match record_type {
-        WalRecordType::PageImage => {
+        WalRecordType::PageImage | WalRecordType::PageDelta => {
             attribution.group_page_direct_encode_nanos += direct_nanos;
         }
         WalRecordType::Commit => {
@@ -1288,26 +1643,26 @@ fn elapsed_nanos(started: Instant) -> Result<u64> {
         .map_err(|_| Error::invariant("WAL timing does not fit u64"))
 }
 
-type WalScanResult = (
-    Lsn,
-    u64,
-    u16,
-    Lsn,
-    Vec<CommittedWalBatch>,
-    WalScanReport,
-    u64,
-);
-
 fn scan_wal<F: DurableFile>(
     file: &mut F,
     identity: &WalIdentity,
     page_image_format: WalPageImageFormat,
-) -> Result<WalScanResult> {
+    materialization: ScanMaterialization,
+) -> Result<WalScanOutput> {
     let length = file.len()?;
     let mut offset = 0u64;
     let mut previous_lsn = None;
-    let mut frames = Vec::new();
     let mut report = WalScanReport::default();
+    let mut header_state: Option<(u16, Lsn)> = None;
+    let mut batches = Vec::new();
+    let mut pages: BTreeMap<PageId, RecoveredWalPage> = BTreeMap::new();
+    let mut redo = WalRedoStats::default();
+    let mut pending: Option<PendingBatch> = None;
+    let mut highest_batch_id_seen = 0u64;
+    let mut max_batch_id = 0u64;
+    let mut last_commit_lsn = None;
+    let blink = page_image_format == WalPageImageFormat::ExperimentalBlink;
+    let keep_batches = !blink || materialization == ScanMaterialization::Batches;
     while offset < length {
         let remaining = length - offset;
         if remaining < WAL_HEADER_SIZE as u64 {
@@ -1323,10 +1678,7 @@ fn scan_wal<F: DurableFile>(
             batch_id,
             record_index,
         ) = decode_header(&header_bytes)?;
-        if frames
-            .first()
-            .is_some_and(|frame: &Frame| frame.format_version != format_version)
-        {
+        if header_state.is_some_and(|(first_version, _)| first_version != format_version) {
             return Err(Error::corruption(
                 "WAL frames use inconsistent format versions",
             ));
@@ -1371,112 +1723,176 @@ fn scan_wal<F: DurableFile>(
         }
         previous_lsn = Some(record_lsn);
         verify_payload_checksum(&header_bytes, &payload, offset)?;
-        frames.push(Frame {
-            format_version,
-            record_type,
-            record_lsn: Lsn::new(record_lsn),
-            batch_id,
-            record_index,
-            payload,
-        });
         report.records_scanned += 1;
         offset += frame_length_u64;
-    }
+        let record_lsn = Lsn::new(record_lsn);
 
-    let valid_length = offset;
-    let first = frames
-        .first()
-        .ok_or_else(|| Error::corruption("WAL has no complete initialization record"))?;
-    if first.record_type != WalRecordType::Init
-        || first.record_lsn != Lsn::ZERO
-        || first.batch_id != 0
-        || first.record_index != 0
-    {
-        return Err(Error::corruption(
-            "WAL does not begin with the required initialization record",
-        ));
-    }
-    let history_start_lsn = verify_identity(first.format_version, &first.payload, identity)?;
-
-    let mut committed = Vec::new();
-    let mut pending: Option<PendingBatch> = None;
-    let mut highest_batch_id_seen = 0u64;
-    let mut max_batch_id = 0u64;
-    for frame in frames.iter().skip(1) {
-        if frame.record_lsn <= history_start_lsn {
+        let Some((_, history_start_lsn)) = header_state else {
+            if record_type != WalRecordType::Init
+                || record_lsn != Lsn::ZERO
+                || batch_id != 0
+                || record_index != 0
+            {
+                return Err(Error::corruption(
+                    "WAL does not begin with the required initialization record",
+                ));
+            }
+            header_state = Some((
+                format_version,
+                verify_identity(format_version, &payload, identity)?,
+            ));
+            continue;
+        };
+        if record_lsn <= history_start_lsn {
             return Err(Error::corruption(
                 "WAL record LSN is not after the initialization history boundary",
             ));
         }
-        max_batch_id = max_batch_id.max(frame.batch_id);
-        match frame.record_type {
+        max_batch_id = max_batch_id.max(batch_id);
+        match record_type {
             WalRecordType::Init => {
                 return Err(Error::corruption(
                     "WAL contains a second initialization record",
                 ));
             }
-            WalRecordType::PageImage => {
-                let page = decode_page_image(&frame.payload)?;
-                validate_page_image(&page, page_image_format)?;
+            WalRecordType::PageImage | WalRecordType::PageDelta => {
+                let image = if record_type == WalRecordType::PageImage {
+                    let page = decode_page_image(&payload)?;
+                    validate_page_image(&page, page_image_format)?;
+                    Some(page)
+                } else {
+                    if format_version < WAL_FORMAT_VERSION || !blink {
+                        return Err(Error::corruption(
+                            "WAL page-delta record in a page-image-only WAL",
+                        ));
+                    }
+                    if is_superblock_page(decode_page_delta(&payload)?.page_id) {
+                        return Err(Error::corruption("WAL page delta targets a superblock"));
+                    }
+                    None
+                };
                 if pending
                     .as_ref()
-                    .is_none_or(|pending| pending.batch_id != frame.batch_id)
+                    .is_none_or(|pending| pending.batch_id != batch_id)
                 {
-                    if frame.batch_id <= highest_batch_id_seen {
+                    if batch_id <= highest_batch_id_seen {
                         return Err(Error::corruption(
                             "WAL batch IDs are not strictly increasing",
                         ));
                     }
-                    highest_batch_id_seen = frame.batch_id;
+                    highest_batch_id_seen = batch_id;
                     pending = Some(PendingBatch {
-                        batch_id: frame.batch_id,
-                        first_record_lsn: frame.record_lsn,
-                        pages: Vec::new(),
-                        digest_input: Vec::new(),
+                        batch_id,
+                        first_record_lsn: record_lsn,
+                        records: Vec::new(),
+                        digest: 0,
                     });
                 }
                 let current = pending.as_mut().expect("pending batch was created");
-                if frame.record_index != current.pages.len() as u32 {
+                if record_index != current.records.len() as u32 {
                     return Err(Error::corruption(
                         "WAL page-image record index is not contiguous",
                     ));
                 }
-                current.digest_input.extend_from_slice(&frame.payload);
-                current.pages.push(page);
+                current.digest = update_record_digest(
+                    current.digest,
+                    format_version,
+                    record_type,
+                    record_index,
+                    &[&payload],
+                );
+                current.records.push(match image {
+                    Some(page) => PendingRedo::Image(Box::new(page)),
+                    None => PendingRedo::Delta(payload),
+                });
             }
             WalRecordType::Commit => {
                 let current = pending.take().ok_or_else(|| {
                     Error::corruption("WAL commit has no matching page-image records")
                 })?;
-                if current.batch_id != frame.batch_id
-                    || frame.record_index != current.pages.len() as u32
-                {
+                if current.batch_id != batch_id || record_index != current.records.len() as u32 {
                     return Err(Error::corruption(
                         "WAL commit does not match its page-image sequence",
                     ));
                 }
-                let (first_lsn, page_count, digest) = decode_commit_payload(&frame.payload)?;
+                let (first_lsn, page_count, digest) = decode_commit_payload(&payload)?;
                 if first_lsn != current.first_record_lsn
-                    || page_count != current.pages.len()
-                    || crc32c::crc32c(&current.digest_input) != digest
+                    || page_count != current.records.len()
+                    || current.digest != digest
                 {
                     return Err(Error::corruption(
                         "WAL commit metadata does not match page images",
                     ));
                 }
-                for page in &current.pages {
-                    validate_page_image_lsn(page, frame.record_lsn)?;
+                let mut batch_pages = Vec::new();
+                let mut batch_kinds = Vec::new();
+                for record in current.records {
+                    let (page, kind) = match record {
+                        PendingRedo::Image(page) => {
+                            validate_page_image_lsn(&page, record_lsn)?;
+                            redo.page_image_records += 1;
+                            (*page, WalRedoKind::PageImage)
+                        }
+                        PendingRedo::Delta(delta_payload) => {
+                            let view = decode_page_delta(&delta_payload)?;
+                            let base = pages.get(&view.page_id).ok_or_else(|| {
+                                Error::corruption(format!(
+                                    "WAL page delta for page {} has no full-image base in this WAL history",
+                                    view.page_id
+                                ))
+                            })?;
+                            let page = WalPageImage {
+                                page_id: view.page_id,
+                                image: apply_page_delta(&base.image, &view)?,
+                            };
+                            validate_page_image(&page, page_image_format)?;
+                            validate_page_image_lsn(&page, record_lsn)?;
+                            redo.page_delta_records += 1;
+                            redo.page_delta_payload_bytes += delta_payload.len() as u64;
+                            redo.page_delta_spans += view.spans.len() as u64;
+                            redo.page_delta_changed_bytes += view.changed_bytes() as u64;
+                            (page, WalRedoKind::PageDelta)
+                        }
+                    };
+                    report.replayable_pages += 1;
+                    if blink {
+                        match pages.get_mut(&page.page_id) {
+                            Some(recovered) => {
+                                recovered.commit_lsn = record_lsn;
+                                *recovered.image = page.image;
+                            }
+                            None => {
+                                pages.insert(
+                                    page.page_id,
+                                    RecoveredWalPage {
+                                        commit_lsn: record_lsn,
+                                        image: Box::new(page.image),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if keep_batches {
+                        batch_pages.push(page);
+                        batch_kinds.push(kind);
+                    }
                 }
-                committed.push(CommittedWalBatch {
-                    batch_id: frame.batch_id,
-                    commit_lsn: frame.record_lsn,
-                    pages: current.pages,
-                });
+                if keep_batches {
+                    batches.push(CommittedWalBatch {
+                        batch_id,
+                        commit_lsn: record_lsn,
+                        pages: batch_pages,
+                        redo_kinds: batch_kinds,
+                    });
+                }
+                report.committed_batches += 1;
+                last_commit_lsn = Some(record_lsn);
             }
         }
     }
-    report.committed_batches = committed.len();
-    report.replayable_pages = committed.iter().map(|batch| batch.pages.len()).sum();
+
+    let (format_version, history_start_lsn) = header_state
+        .ok_or_else(|| Error::corruption("WAL has no complete initialization record"))?;
     let next_lsn = Lsn::new(
         previous_lsn
             .unwrap_or(Lsn::ZERO.get())
@@ -1487,15 +1903,18 @@ fn scan_wal<F: DurableFile>(
         .checked_add(1)
         .ok_or_else(|| Error::invariant("WAL batch ID exhausted"))?
         .max(1);
-    Ok((
+    Ok(WalScanOutput {
         next_lsn,
         next_batch_id,
-        first.format_version,
+        format_version,
         history_start_lsn,
-        committed,
+        last_commit_lsn,
+        batches,
+        pages,
+        redo,
         report,
-        valid_length,
-    ))
+        valid_length: offset,
+    })
 }
 
 fn decode_header(bytes: &[u8]) -> Result<(u16, WalRecordType, usize, usize, u64, u64, u32)> {
@@ -1506,7 +1925,10 @@ fn decode_header(bytes: &[u8]) -> Result<(u16, WalRecordType, usize, usize, u64,
         return Err(Error::corruption("WAL magic mismatch"));
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    if version != WAL_FORMAT_VERSION && version != LEGACY_WAL_FORMAT_VERSION {
+    if version != WAL_FORMAT_VERSION
+        && version != WAL_PAGE_IMAGE_FORMAT_VERSION
+        && version != LEGACY_WAL_FORMAT_VERSION
+    {
         return Err(Error::unsupported_format(format!(
             "WAL version {version}, supported {WAL_FORMAT_VERSION}"
         )));
@@ -1604,6 +2026,211 @@ fn validate_page_image_lsn(page: &WalPageImage, commit_lsn: Lsn) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn is_superblock_page(page_id: PageId) -> bool {
+    page_id == SUPERBLOCK_A_PAGE || page_id == SUPERBLOCK_B_PAGE
+}
+
+fn page_lsn_of(image: &[u8; PAGE_SIZE]) -> Lsn {
+    Lsn::new(u64::from_le_bytes(
+        image[PAGE_LSN_RANGE].try_into().unwrap(),
+    ))
+}
+
+fn write_format_version(page_image_format: WalPageImageFormat) -> u16 {
+    match page_image_format {
+        WalPageImageFormat::Baseline => WAL_PAGE_IMAGE_FORMAT_VERSION,
+        WalPageImageFormat::ExperimentalBlink => WAL_FORMAT_VERSION,
+    }
+}
+
+fn canonical_delta_spans(base: &[u8; PAGE_SIZE], target: &[u8; PAGE_SIZE]) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut position = 0usize;
+    while position < PAGE_SIZE {
+        if position.is_multiple_of(8)
+            && position + 8 <= PAGE_SIZE
+            && base[position..position + 8] == target[position..position + 8]
+        {
+            position += 8;
+            continue;
+        }
+        if base[position] == target[position] {
+            position += 1;
+            continue;
+        }
+        let run_start = position;
+        while position < PAGE_SIZE && base[position] != target[position] {
+            position += 1;
+        }
+        match spans.last_mut() {
+            Some(last) if run_start - last.1 <= PAGE_DELTA_SPAN_MERGE_GAP => last.1 = position,
+            _ => spans.push((run_start, position)),
+        }
+    }
+    spans
+}
+
+pub(crate) fn encode_page_delta(
+    page_id: PageId,
+    base: &[u8; PAGE_SIZE],
+    target: &[u8; PAGE_SIZE],
+) -> Result<Vec<u8>> {
+    let spans = canonical_delta_spans(base, target);
+    if spans.is_empty() {
+        return Err(Error::invalid_input(
+            "a page delta needs at least one changed byte",
+        ));
+    }
+    let payload_length = spans
+        .iter()
+        .fold(PAGE_DELTA_HEADER_SIZE, |length, (start, end)| {
+            length + PAGE_DELTA_SPAN_HEADER_SIZE + (end - start)
+        });
+    let mut payload = Vec::with_capacity(payload_length);
+    payload.extend_from_slice(&page_id.get().to_le_bytes());
+    payload.extend_from_slice(&page_lsn_of(base).get().to_le_bytes());
+    payload.extend_from_slice(&(spans.len() as u16).to_le_bytes());
+    for (start, end) in spans {
+        payload.extend_from_slice(&(start as u16).to_le_bytes());
+        payload.extend_from_slice(&((end - start) as u16).to_le_bytes());
+        payload.extend_from_slice(&target[start..end]);
+    }
+    Ok(payload)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PageDeltaView<'payload> {
+    pub page_id: PageId,
+    pub base_page_lsn: Lsn,
+    pub spans: Vec<(usize, &'payload [u8])>,
+}
+
+impl PageDeltaView<'_> {
+    pub(crate) fn changed_bytes(&self) -> usize {
+        self.spans.iter().map(|(_, bytes)| bytes.len()).sum()
+    }
+}
+
+pub(crate) fn decode_page_delta(payload: &[u8]) -> Result<PageDeltaView<'_>> {
+    if payload.len() < PAGE_DELTA_HEADER_SIZE {
+        return Err(Error::corruption("WAL page-delta payload is truncated"));
+    }
+    if payload.len() >= PAGE_IMAGE_PAYLOAD_SIZE {
+        return Err(Error::corruption(
+            "WAL page-delta payload is not smaller than a page image",
+        ));
+    }
+    let page_id = PageId::new(u64::from_le_bytes(payload[0..8].try_into().unwrap()));
+    let base_page_lsn = Lsn::new(u64::from_le_bytes(payload[8..16].try_into().unwrap()));
+    let span_count = usize::from(u16::from_le_bytes(payload[16..18].try_into().unwrap()));
+    if span_count == 0 || span_count > PAGE_DELTA_MAX_SPANS {
+        return Err(Error::corruption(format!(
+            "WAL page-delta span count {span_count} is out of range"
+        )));
+    }
+    let mut spans = Vec::with_capacity(span_count);
+    let mut cursor = PAGE_DELTA_HEADER_SIZE;
+    let mut previous_end: Option<usize> = None;
+    for _ in 0..span_count {
+        let span_header_end = cursor + PAGE_DELTA_SPAN_HEADER_SIZE;
+        if span_header_end > payload.len() {
+            return Err(Error::corruption("WAL page-delta span header is truncated"));
+        }
+        let offset = usize::from(u16::from_le_bytes(
+            payload[cursor..cursor + 2].try_into().unwrap(),
+        ));
+        let length = usize::from(u16::from_le_bytes(
+            payload[cursor + 2..cursor + 4].try_into().unwrap(),
+        ));
+        if length == 0 {
+            return Err(Error::corruption("WAL page-delta span has zero length"));
+        }
+        if offset >= PAGE_SIZE || offset + length > PAGE_SIZE {
+            return Err(Error::corruption("WAL page-delta span is outside the page"));
+        }
+        if previous_end.is_some_and(|end| offset <= end + PAGE_DELTA_SPAN_MERGE_GAP) {
+            return Err(Error::corruption(
+                "WAL page-delta spans overlap, are unsorted, or are not canonically merged",
+            ));
+        }
+        let span_end = span_header_end + length;
+        if span_end > payload.len() {
+            return Err(Error::corruption("WAL page-delta span bytes are truncated"));
+        }
+        spans.push((offset, &payload[span_header_end..span_end]));
+        previous_end = Some(offset + length);
+        cursor = span_end;
+    }
+    if cursor != payload.len() {
+        return Err(Error::corruption(
+            "WAL page-delta payload has trailing bytes",
+        ));
+    }
+    Ok(PageDeltaView {
+        page_id,
+        base_page_lsn,
+        spans,
+    })
+}
+
+pub(crate) fn apply_page_delta(
+    base: &[u8; PAGE_SIZE],
+    delta: &PageDeltaView<'_>,
+) -> Result<[u8; PAGE_SIZE]> {
+    if page_lsn_of(base) != delta.base_page_lsn {
+        return Err(Error::corruption(format!(
+            "WAL page delta for page {} expects base LSN {}, found {}",
+            delta.page_id,
+            delta.base_page_lsn,
+            page_lsn_of(base)
+        )));
+    }
+    let mut rebuilt = *base;
+    for (offset, bytes) in &delta.spans {
+        let original = &base[*offset..*offset + bytes.len()];
+        if original[0] == bytes[0] || original[bytes.len() - 1] == bytes[bytes.len() - 1] {
+            return Err(Error::corruption(
+                "WAL page-delta span does not start and end on a changed byte",
+            ));
+        }
+        let mut unchanged_run = 0usize;
+        for (original_byte, new_byte) in original.iter().zip(bytes.iter()) {
+            if original_byte == new_byte {
+                unchanged_run += 1;
+                if unchanged_run > PAGE_DELTA_SPAN_MERGE_GAP {
+                    return Err(Error::corruption(
+                        "WAL page-delta span contains an unchanged gap that should split it",
+                    ));
+                }
+            } else {
+                unchanged_run = 0;
+            }
+        }
+        rebuilt[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+    }
+    Ok(rebuilt)
+}
+
+fn update_record_digest(
+    digest: u32,
+    format_version: u16,
+    record_type: WalRecordType,
+    record_index: u32,
+    payload_parts: &[&[u8]],
+) -> u32 {
+    let mut digest = digest;
+    if format_version >= WAL_FORMAT_VERSION {
+        let payload_length: usize = payload_parts.iter().map(|part| part.len()).sum();
+        digest = crc32c::crc32c_append(digest, &[record_type as u8]);
+        digest = crc32c::crc32c_append(digest, &record_index.to_le_bytes());
+        digest = crc32c::crc32c_append(digest, &(payload_length as u32).to_le_bytes());
+    }
+    for part in payload_parts {
+        digest = crc32c::crc32c_append(digest, part);
+    }
+    digest
 }
 
 fn decode_commit_payload(payload: &[u8]) -> Result<(Lsn, usize, u32)> {
@@ -1710,6 +2337,120 @@ fn write_all_at_counted<F: DurableFile>(
         position += count;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestWalFrame {
+    pub version: u16,
+    pub record_type: WalRecordType,
+    pub record_lsn: u64,
+    pub batch_id: u64,
+    pub record_index: u32,
+    pub payload: Vec<u8>,
+}
+
+#[cfg(test)]
+pub(crate) fn parse_wal_frames_for_test(bytes: &[u8]) -> Vec<TestWalFrame> {
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    while offset + WAL_HEADER_SIZE <= bytes.len() {
+        let (
+            version,
+            record_type,
+            frame_length,
+            payload_length,
+            record_lsn,
+            batch_id,
+            record_index,
+        ) = decode_header(&bytes[offset..offset + WAL_HEADER_SIZE]).expect("test WAL header");
+        frames.push(TestWalFrame {
+            version,
+            record_type,
+            record_lsn,
+            batch_id,
+            record_index,
+            payload: bytes[offset + WAL_HEADER_SIZE..offset + WAL_HEADER_SIZE + payload_length]
+                .to_vec(),
+        });
+        offset += frame_length;
+    }
+    frames
+}
+
+#[cfg(test)]
+pub(crate) fn serialize_wal_frames_for_test(frames: &[TestWalFrame]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        bytes.extend_from_slice(
+            &encode_frame(
+                frame.version,
+                frame.record_type,
+                Lsn::new(frame.record_lsn),
+                frame.batch_id,
+                frame.record_index,
+                &frame.payload,
+            )
+            .expect("test WAL frame encodes"),
+        );
+    }
+    bytes
+}
+
+#[cfg(test)]
+pub(crate) fn recompute_commit_digests_for_test(frames: &mut [TestWalFrame]) {
+    let mut digest = 0u32;
+    let mut count = 0u32;
+    let mut first_lsn = None;
+    for frame in frames.iter_mut() {
+        match frame.record_type {
+            WalRecordType::Init => {}
+            WalRecordType::PageImage | WalRecordType::PageDelta => {
+                first_lsn.get_or_insert(frame.record_lsn);
+                digest = update_record_digest(
+                    digest,
+                    frame.version,
+                    frame.record_type,
+                    frame.record_index,
+                    &[&frame.payload],
+                );
+                count += 1;
+            }
+            WalRecordType::Commit => {
+                frame.payload[0..8].copy_from_slice(&first_lsn.take().unwrap_or(0).to_le_bytes());
+                frame.payload[8..12].copy_from_slice(&count.to_le_bytes());
+                frame.payload[12..16].copy_from_slice(&digest.to_le_bytes());
+                digest = 0;
+                count = 0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_digest_for_test(version: u16, records: &[(WalRecordType, u32, &[u8])]) -> u32 {
+    records
+        .iter()
+        .fold(0u32, |digest, (record_type, record_index, payload)| {
+            update_record_digest(digest, version, *record_type, *record_index, &[payload])
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn init_frame_for_test(
+    version: u16,
+    identity: &WalIdentity,
+    start_after_lsn: Lsn,
+) -> Vec<u8> {
+    encode_frame(
+        version,
+        WalRecordType::Init,
+        Lsn::ZERO,
+        0,
+        0,
+        &identity_payload(identity, start_after_lsn),
+    )
+    .expect("test INIT frame encodes")
 }
 
 #[cfg(test)]

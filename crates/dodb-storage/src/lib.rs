@@ -29,7 +29,7 @@ pub use superblock::{
     decode_superblock, encode_superblock,
 };
 pub use wal::{
-    CommittedWalBatch, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAGIC, WalAppendReport, WalCommit,
-    WalIdentity, WalLog, WalMetrics, WalPageImage, WalPageImageFormat, WalRecordType,
-    WalScanReport,
+    CommittedWalBatch, RecoveredWalPage, WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_MAGIC,
+    WAL_PAGE_IMAGE_FORMAT_VERSION, WalAppendReport, WalCommit, WalIdentity, WalLog, WalMetrics,
+    WalPageImage, WalPageImageFormat, WalRecordType, WalRedoKind, WalRedoStats, WalScanReport,
 };

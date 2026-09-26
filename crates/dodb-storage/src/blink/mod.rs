@@ -32,7 +32,7 @@ use crate::page::{
     PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageType, decode_page_at, finalize_encoded_page,
 };
 use crate::wal::{
-    CommittedWalBatch, WalCommit, WalIdentity, WalLog, WalMetrics, WalPageImage, WalPageImageFormat,
+    RecoveredWalPage, WalCommit, WalIdentity, WalLog, WalMetrics, WalPageImage, WalPageImageFormat,
 };
 
 const FIRST_DATA_PAGE: u64 = 2;
@@ -1202,8 +1202,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             checkpoint_hint,
             fault_injector.as_deref_mut(),
         )?;
-        let recovery_batches = wal.take_recovery_batches();
-        if file.is_empty()? && recovery_batches.is_empty() {
+        let recovery_pages = wal.take_recovery_pages();
+        if file.is_empty()? && recovery_pages.is_empty() {
             let mut store = Self::initialize(file, config)?;
             store.wal = Some(wal);
             store.next_lsn = store.wal.as_ref().unwrap().next_lsn();
@@ -1211,8 +1211,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             store.fault_injector = fault_injector;
             return Ok(store);
         }
-        recover_data_file(&mut file, &recovery_batches, checkpoint_hint)?;
-        drop(recovery_batches);
+        recover_data_file(&mut file, &recovery_pages, checkpoint_hint)?;
+        drop(recovery_pages);
         let (mut store, selected) = Self::load_file(file, config)?;
         wal.resume_after(selected.checkpoint_lsn)?;
         store.wal = Some(wal);
@@ -5692,19 +5692,17 @@ fn subtree_min_key(state: &BlinkState, mut page_id: PageId) -> Result<Option<Vec
 
 fn recover_data_file<F: DurableFile>(
     file: &mut F,
-    batches: &[CommittedWalBatch],
+    pages: &BTreeMap<PageId, RecoveredWalPage>,
     checkpoint_hint: Lsn,
 ) -> Result<()> {
     let mut images = Vec::new();
     let mut high_water = FIRST_DATA_PAGE;
-    for batch in batches {
-        if batch.commit_lsn <= checkpoint_hint {
+    for (page_id, page) in pages {
+        if page.commit_lsn <= checkpoint_hint {
             continue;
         }
-        for image in &batch.pages {
-            high_water = high_water.max(image.page_id.get());
-            images.push(image);
-        }
+        high_water = high_water.max(page_id.get());
+        images.push((*page_id, &page.image));
     }
     if images.is_empty() {
         return Ok(());
@@ -5716,16 +5714,16 @@ fn recover_data_file<F: DurableFile>(
     if file.len()? < length {
         file.set_len(length)?;
     }
-    for image in images {
+    for (page_id, image) in images {
         // The WAL validator already checked the format and checksum. Decode
         // again here so recovery never writes an image to the wrong physical
         // slot if the caller bypasses the normal open path in a test.
-        if image.page_id.get() >= FIRST_DATA_PAGE {
-            decode_blink_page(&image.image, image.page_id)?;
+        if page_id.get() >= FIRST_DATA_PAGE {
+            decode_blink_page(&image[..], page_id)?;
         } else {
-            decode_blink_superblock_image(&image.image)?;
+            decode_blink_superblock_image(&image[..])?;
         }
-        write_all_at(file, image.page_id.get() * PAGE_SIZE as u64, &image.image)?;
+        write_all_at(file, page_id.get() * PAGE_SIZE as u64, &image[..])?;
     }
     file.sync_data()
 }
@@ -5835,6 +5833,8 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::WalDeltaRequest;
+    use std::borrow::Cow;
 
     fn payload_sharing_test_state() -> (BlinkState, PageId, Vec<u8>, Vec<u8>) {
         let page_id = PageId::new(FIRST_DATA_PAGE);
@@ -9687,7 +9687,11 @@ mod tests {
         }
         let after = store.wal_metrics().unwrap().unwrap();
         assert_eq!(after.committed_batches - before.committed_batches, 4_000);
-        assert!(after.page_images - before.page_images >= 4_000);
+        assert!(
+            (after.page_images - before.page_images) as u64
+                + (after.redo.page_delta_records - before.redo.page_delta_records)
+                >= 4_000
+        );
         assert_no_retained_wal_payload(&store);
         assert_eq!(
             store
@@ -9725,10 +9729,9 @@ mod tests {
             WalPageImageFormat::ExperimentalBlink,
         )
         .unwrap();
-        assert_eq!(
-            reopened_wal.recovery_batches().len(),
-            committed_before_close
-        );
+        assert!(reopened_wal.recovery_batches().is_empty());
+        assert!(!reopened_wal.recovery_pages().is_empty());
+        assert_eq!(reopened_wal.committed_batch_count(), committed_before_close);
         assert_eq!(reopened_wal.last_commit_lsn(), last_commit_before_close);
         let wal = reopened_wal.into_file();
         let mut reopened = BlinkStore::open_with_wal(data, wal, DatabaseConfig::default()).unwrap();
@@ -9836,6 +9839,799 @@ mod tests {
             BlinkStore::open_with_wal(data, wal.unwrap(), DatabaseConfig::default()).unwrap();
         assert_eq!(again.get(&key).unwrap().value(), Some(&b"after-torn"[..]));
         again.check_invariants().unwrap();
+    }
+
+    fn blink_wal_identity() -> WalIdentity {
+        let config = DatabaseConfig::default();
+        WalIdentity::new(
+            config.database_uuid,
+            config.tenant_id,
+            config.shard_id,
+            config.shard_epoch,
+        )
+    }
+
+    fn random_test_bytes(state: &mut u64, length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|_| {
+                *state = splitmix_for_test(*state);
+                *state as u8
+            })
+            .collect()
+    }
+
+    fn random_leaf_entry(state: &mut u64, revision: u64) -> LeafEntry {
+        *state = splitmix_for_test(*state);
+        let key_length = 2 + (*state % 20) as usize;
+        let primary = random_test_bytes(state, key_length);
+        let secondary = random_test_bytes(state, key_length / 2 + 1);
+        *state = splitmix_for_test(*state);
+        let value = if (*state).is_multiple_of(6) {
+            None
+        } else {
+            let value_length = (*state % 90) as usize;
+            Some(BlinkValueRef::Inline(Arc::from(
+                random_test_bytes(state, value_length).as_slice(),
+            )))
+        };
+        LeafEntry {
+            key: Arc::from(DocumentKey::new(primary, secondary).encode().as_slice()),
+            revision: Revision::new(revision),
+            value,
+        }
+    }
+
+    fn random_leaf_page(seed: u64, lsn: Lsn) -> BlinkPage {
+        let mut state = seed;
+        state = splitmix_for_test(state);
+        let entry_count = 1 + (state % 30) as usize;
+        let mut entries = BTreeMap::new();
+        for _ in 0..entry_count {
+            state = splitmix_for_test(state);
+            let revision = 1 + state % lsn.get();
+            let entry = random_leaf_entry(&mut state, revision);
+            entries.insert(entry.key.to_vec(), entry);
+        }
+        BlinkPage::Leaf {
+            lsn,
+            high_key: None,
+            right_sibling: None,
+            entries: entries.into_values().collect(),
+        }
+    }
+
+    fn mutate_leaf_page(base: &BlinkPage, seed: u64) -> BlinkPage {
+        let BlinkPage::Leaf {
+            lsn,
+            high_key,
+            right_sibling,
+            entries,
+        } = base
+        else {
+            panic!("test page is a leaf");
+        };
+        let mut state = seed;
+        state = splitmix_for_test(state);
+        let target_lsn = Lsn::new(lsn.get() + 1 + state % 5);
+        let revision = Revision::new(target_lsn.get());
+        let mut entries = entries.clone();
+        state = splitmix_for_test(state);
+        let position = (state as usize) % entries.len();
+        state = splitmix_for_test(state);
+        match state % 6 {
+            0 => {
+                let length = match &entries[position].value {
+                    Some(BlinkValueRef::Inline(value)) => value.len(),
+                    _ => 8,
+                };
+                entries[position].value = Some(BlinkValueRef::Inline(Arc::from(
+                    random_test_bytes(&mut state, length).as_slice(),
+                )));
+                entries[position].revision = revision;
+            }
+            1 => {
+                let length = (splitmix_for_test(state) % 90) as usize;
+                entries[position].value = Some(BlinkValueRef::Inline(Arc::from(
+                    random_test_bytes(&mut state, length).as_slice(),
+                )));
+                entries[position].revision = revision;
+            }
+            2 if entries.len() > 1 => {
+                entries.remove(position);
+            }
+            3 => {
+                let entry = random_leaf_entry(&mut state, target_lsn.get());
+                if let Err(insert_at) =
+                    entries.binary_search_by(|existing| existing.key.as_ref().cmp(&entry.key))
+                {
+                    entries.insert(insert_at, entry);
+                }
+            }
+            4 => {
+                entries[position].value = None;
+                entries[position].revision = revision;
+            }
+            _ => {
+                entries[position].revision = revision;
+            }
+        }
+        BlinkPage::Leaf {
+            lsn: target_lsn,
+            high_key: high_key.clone(),
+            right_sibling: *right_sibling,
+            entries,
+        }
+    }
+
+    #[test]
+    fn page_delta_round_trips_randomized_blink_page_mutations() {
+        use crate::wal::{apply_page_delta, decode_page_delta, encode_page_delta};
+        let mut round_trips = 0;
+        for seed in 0..3_000u64 {
+            let page_id = PageId::new(FIRST_DATA_PAGE + seed % 50);
+            let base_page = random_leaf_page(seed, Lsn::new(100 + seed));
+            let Ok(base) = encode_blink_page(page_id, &base_page) else {
+                continue;
+            };
+            let target_page = mutate_leaf_page(&base_page, seed ^ 0x5eed);
+            let Ok(target) = encode_blink_page(page_id, &target_page) else {
+                continue;
+            };
+            let payload = encode_page_delta(page_id, &base, &target).unwrap();
+            let view = decode_page_delta(&payload).unwrap();
+            assert_eq!(view.page_id, page_id);
+            assert_eq!(view.base_page_lsn, base_page.lsn());
+            let rebuilt = apply_page_delta(&base, &view).unwrap();
+            assert_eq!(rebuilt, target, "seed {seed}");
+            validate_blink_page_image(&rebuilt, page_id).unwrap();
+            assert_eq!(
+                encode_page_delta(page_id, &base, &rebuilt).unwrap(),
+                payload
+            );
+            assert_eq!(encode_page_delta(page_id, &base, &target).unwrap(), payload);
+            round_trips += 1;
+        }
+        assert!(round_trips > 2_500, "{round_trips}");
+    }
+
+    #[test]
+    fn page_delta_round_trips_randomized_raw_byte_edits() {
+        use crate::wal::{apply_page_delta, decode_page_delta, encode_page_delta};
+        for seed in 0..2_000u64 {
+            let mut state = seed ^ 0xdead_beef;
+            let mut base = [0u8; PAGE_SIZE];
+            base.copy_from_slice(&random_test_bytes(&mut state, PAGE_SIZE));
+            let mut target = base;
+            state = splitmix_for_test(state);
+            let edit_count = 1 + state % 40;
+            for _ in 0..edit_count {
+                state = splitmix_for_test(state);
+                let offset = match state % 10 {
+                    0 => 0,
+                    1 => PAGE_SIZE - 1,
+                    _ => (state >> 8) as usize % PAGE_SIZE,
+                };
+                state = splitmix_for_test(state);
+                let length = (1 + state % 12) as usize;
+                for position in offset..(offset + length).min(PAGE_SIZE) {
+                    target[position] = base[position].wrapping_add(1 + (state % 200) as u8);
+                }
+            }
+            target[16..24].copy_from_slice(&(seed + 1).to_le_bytes());
+            base[16..24].copy_from_slice(&seed.to_le_bytes());
+            let payload = encode_page_delta(PageId::new(7), &base, &target).unwrap();
+            let rebuilt = apply_page_delta(&base, &decode_page_delta(&payload).unwrap()).unwrap();
+            assert_eq!(rebuilt, target, "seed {seed}");
+            assert_eq!(
+                encode_page_delta(PageId::new(7), &base, &rebuilt).unwrap(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn page_delta_spans_merge_only_small_unchanged_gaps() {
+        use crate::wal::{PAGE_DELTA_SPAN_MERGE_GAP, decode_page_delta, encode_page_delta};
+        let base = [0u8; PAGE_SIZE];
+        let mut target = base;
+        target[100] = 1;
+        target[100 + PAGE_DELTA_SPAN_MERGE_GAP + 1] = 1;
+        let merged = encode_page_delta(PageId::new(3), &base, &target).unwrap();
+        let view = decode_page_delta(&merged).unwrap();
+        assert_eq!(view.spans.len(), 1);
+        assert_eq!(view.spans[0].0, 100);
+        assert_eq!(view.spans[0].1.len(), PAGE_DELTA_SPAN_MERGE_GAP + 2);
+
+        let mut target = base;
+        target[100] = 1;
+        target[100 + PAGE_DELTA_SPAN_MERGE_GAP + 2] = 1;
+        let split = encode_page_delta(PageId::new(3), &base, &target).unwrap();
+        let view = decode_page_delta(&split).unwrap();
+        assert_eq!(view.spans.len(), 2);
+        assert_eq!(view.spans[1].0, 100 + PAGE_DELTA_SPAN_MERGE_GAP + 2);
+        assert!(encode_page_delta(PageId::new(3), &base, &base).is_err());
+    }
+
+    fn manual_delta_payload(
+        page_id: u64,
+        base_lsn: u64,
+        span_count: u16,
+        spans: &[(u16, u16, &[u8])],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&page_id.to_le_bytes());
+        payload.extend_from_slice(&base_lsn.to_le_bytes());
+        payload.extend_from_slice(&span_count.to_le_bytes());
+        for (offset, length, bytes) in spans {
+            payload.extend_from_slice(&offset.to_le_bytes());
+            payload.extend_from_slice(&length.to_le_bytes());
+            payload.extend_from_slice(bytes);
+        }
+        payload
+    }
+
+    fn delta_test_leaf(page_id: PageId, lsn: Lsn, value_byte: u8) -> [u8; PAGE_SIZE] {
+        let entries = (0..8u8)
+            .map(|index| LeafEntry {
+                key: Arc::from(
+                    DocumentKey::new(b"delta".to_vec(), vec![index; 4])
+                        .encode()
+                        .as_slice(),
+                ),
+                revision: Revision::new(if index == 3 { lsn.get() } else { 1 }),
+                value: Some(BlinkValueRef::Inline(Arc::from(
+                    vec![if index == 3 { value_byte } else { index }; 64].as_slice(),
+                ))),
+            })
+            .collect();
+        encode_blink_page(
+            page_id,
+            &BlinkPage::Leaf {
+                lsn,
+                high_key: None,
+                right_sibling: None,
+                entries,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn malformed_page_deltas_are_rejected_by_the_codec() {
+        use crate::wal::{
+            PAGE_DELTA_MAX_SPANS, apply_page_delta, decode_page_delta, encode_page_delta,
+        };
+        let page_id = PageId::new(5);
+        let base = delta_test_leaf(page_id, Lsn::new(10), 0xaa);
+        let target = delta_test_leaf(page_id, Lsn::new(11), 0xbb);
+        let valid = encode_page_delta(page_id, &base, &target).unwrap();
+        assert_eq!(
+            apply_page_delta(&base, &decode_page_delta(&valid).unwrap()).unwrap(),
+            target
+        );
+
+        let mut other_lsn_base = base;
+        other_lsn_base[16..24].copy_from_slice(&9u64.to_le_bytes());
+        assert!(apply_page_delta(&other_lsn_base, &decode_page_delta(&valid).unwrap()).is_err());
+
+        let mut bad_count = valid.clone();
+        bad_count[16..18].copy_from_slice(&0u16.to_le_bytes());
+        assert!(decode_page_delta(&bad_count).is_err());
+        let mut bad_count = valid.clone();
+        let count = u16::from_le_bytes(valid[16..18].try_into().unwrap());
+        bad_count[16..18].copy_from_slice(&(count + 1).to_le_bytes());
+        assert!(decode_page_delta(&bad_count).is_err());
+        let mut bad_count = valid.clone();
+        bad_count[16..18].copy_from_slice(&((PAGE_DELTA_MAX_SPANS + 1) as u16).to_le_bytes());
+        assert!(decode_page_delta(&bad_count).is_err());
+
+        assert!(decode_page_delta(&valid[..valid.len() - 1]).is_err());
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(decode_page_delta(&trailing).is_err());
+        assert!(decode_page_delta(&valid[..10]).is_err());
+
+        let zero_length = manual_delta_payload(5, 10, 1, &[(100, 0, &[])]);
+        assert!(decode_page_delta(&zero_length).is_err());
+        let past_end = manual_delta_payload(5, 10, 1, &[(4095, 2, &[1, 2])]);
+        assert!(decode_page_delta(&past_end).is_err());
+        let outside = manual_delta_payload(5, 10, 1, &[(4096, 1, &[1])]);
+        assert!(decode_page_delta(&outside).is_err());
+        let overlap = manual_delta_payload(5, 10, 2, &[(100, 10, &[1; 10]), (105, 5, &[1; 5])]);
+        assert!(decode_page_delta(&overlap).is_err());
+        let unsorted = manual_delta_payload(5, 10, 2, &[(200, 1, &[1]), (100, 1, &[1])]);
+        assert!(decode_page_delta(&unsorted).is_err());
+        let small_gap = manual_delta_payload(5, 10, 2, &[(100, 1, &[1]), (103, 1, &[1])]);
+        assert!(decode_page_delta(&small_gap).is_err());
+        let huge = manual_delta_payload(5, 10, 1, &[(0, 4096, &[1; 4096])]);
+        assert!(decode_page_delta(&huge).is_err());
+
+        let unchanged_start = manual_delta_payload(5, 10, 1, &[(40, 1, &[base[40]])]);
+        assert!(apply_page_delta(&base, &decode_page_delta(&unchanged_start).unwrap()).is_err());
+        let mut long_gap_bytes = base[40..50].to_vec();
+        long_gap_bytes[0] ^= 1;
+        long_gap_bytes[9] ^= 1;
+        let long_gap = manual_delta_payload(5, 10, 1, &[(40, 10, &long_gap_bytes)]);
+        assert!(apply_page_delta(&base, &decode_page_delta(&long_gap).unwrap()).is_err());
+
+        let mut bad_checksum_target = target;
+        bad_checksum_target[PAGE_SIZE - 3] ^= 0x40;
+        let bad_checksum = encode_page_delta(page_id, &base, &bad_checksum_target).unwrap();
+        let rebuilt = apply_page_delta(&base, &decode_page_delta(&bad_checksum).unwrap()).unwrap();
+        assert!(validate_blink_page_image(&rebuilt, page_id).is_err());
+
+        let mut wrong_page = valid.clone();
+        wrong_page[0..8].copy_from_slice(&6u64.to_le_bytes());
+        let view = decode_page_delta(&wrong_page).unwrap();
+        let rebuilt = apply_page_delta(&base, &view).unwrap();
+        assert!(validate_blink_page_image(&rebuilt, view.page_id).is_err());
+    }
+
+    fn blink_test_wal() -> WalLog<MemoryFile> {
+        WalLog::open_with_page_image_format(
+            MemoryFile::default(),
+            blink_wal_identity(),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap()
+    }
+
+    fn delta_commits(
+        wal: &WalLog<MemoryFile>,
+        pages_per_commit: &[&[(u64, u8)]],
+    ) -> Vec<WalCommit> {
+        let mut next_lsn = wal.next_lsn().get();
+        let mut batch_id = wal.next_batch_id();
+        pages_per_commit
+            .iter()
+            .map(|pages| {
+                let commit_lsn = Lsn::new(next_lsn + pages.len() as u64);
+                let commit = WalCommit {
+                    batch_id,
+                    commit_lsn,
+                    pages: pages
+                        .iter()
+                        .map(|(page_id, value_byte)| WalPageImage {
+                            page_id: PageId::new(*page_id),
+                            image: delta_test_leaf(PageId::new(*page_id), commit_lsn, *value_byte),
+                        })
+                        .collect(),
+                };
+                next_lsn = commit_lsn.get() + 1;
+                batch_id += 1;
+                commit
+            })
+            .collect()
+    }
+
+    fn append_with_bases(
+        wal: &mut WalLog<MemoryFile>,
+        commits: &[WalCommit],
+        bases: &BTreeMap<PageId, [u8; PAGE_SIZE]>,
+    ) -> Result<()> {
+        let eligible = vec![true; commits.len()];
+        let mut source = |page_id: PageId| bases.get(&page_id).map(Cow::Borrowed);
+        let mut request = WalDeltaRequest {
+            eligible_commits: &eligible,
+            base_source: &mut source,
+        };
+        wal.append_group_with_page_deltas(commits, &mut request, None)
+            .map(|_| ())
+    }
+
+    fn latest_images(commits: &[WalCommit], bases: &mut BTreeMap<PageId, [u8; PAGE_SIZE]>) {
+        for commit in commits {
+            for page in &commit.pages {
+                bases.insert(page.page_id, page.image);
+            }
+        }
+    }
+
+    fn redo_kinds(wal: &mut WalLog<MemoryFile>) -> Vec<Vec<crate::wal::WalRedoKind>> {
+        wal.committed_batches_on_disk()
+            .into_iter()
+            .map(|batch| batch.redo_kinds)
+            .collect()
+    }
+
+    #[test]
+    fn first_redo_after_wal_reset_is_a_full_image_then_deltas() {
+        use crate::wal::WalRedoKind::{PageDelta, PageImage};
+        let mut wal = blink_test_wal();
+        let mut bases = BTreeMap::new();
+        for value_byte in [1u8, 2, 3] {
+            let commits = delta_commits(&wal, &[&[(5, value_byte)]]);
+            append_with_bases(&mut wal, &commits, &bases).unwrap();
+            latest_images(&commits, &mut bases);
+        }
+        assert_eq!(
+            redo_kinds(&mut wal),
+            vec![vec![PageImage], vec![PageDelta], vec![PageDelta]]
+        );
+        let metrics = wal.metrics().unwrap();
+        assert_eq!(metrics.redo.image_first_touch, 1);
+        assert_eq!(metrics.redo.page_delta_records, 2);
+        let latest = bases[&PageId::new(5)];
+        let last_commit = wal.last_commit_lsn().unwrap();
+
+        let mut reopened = WalLog::open_with_page_image_format(
+            wal.into_file(),
+            blink_wal_identity(),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        let recovered = reopened.take_recovery_pages();
+        assert_eq!(*recovered[&PageId::new(5)].image, latest);
+        assert_eq!(recovered[&PageId::new(5)].commit_lsn, last_commit);
+        assert_eq!(reopened.metrics().unwrap().tracked_chain_pages, 1);
+
+        let commits = delta_commits(&reopened, &[&[(5, 4)]]);
+        append_with_bases(&mut reopened, &commits, &bases).unwrap();
+        latest_images(&commits, &mut bases);
+        reopened
+            .reset(reopened.last_commit_lsn().unwrap(), None)
+            .unwrap();
+        assert_eq!(reopened.metrics().unwrap().tracked_chain_pages, 0);
+        let commits = delta_commits(&reopened, &[&[(5, 5)]]);
+        append_with_bases(&mut reopened, &commits, &bases).unwrap();
+        assert_eq!(redo_kinds(&mut reopened), vec![vec![PageImage]]);
+    }
+
+    #[test]
+    fn page_delta_base_mismatch_is_an_invariant_error() {
+        let mut wal = blink_test_wal();
+        let mut bases = BTreeMap::new();
+        let commits = delta_commits(&wal, &[&[(5, 1)]]);
+        append_with_bases(&mut wal, &commits, &bases).unwrap();
+        latest_images(&commits, &mut bases);
+        let length = wal.metrics().unwrap().wal_bytes;
+        let committed_lsn = commits[0].commit_lsn;
+
+        let mut wrong_bytes = bases.clone();
+        wrong_bytes.insert(
+            PageId::new(5),
+            delta_test_leaf(PageId::new(5), committed_lsn, 9),
+        );
+        let next = delta_commits(&wal, &[&[(5, 2)]]);
+        assert!(matches!(
+            append_with_bases(&mut wal, &next, &wrong_bytes),
+            Err(Error::InternalInvariantViolation(_))
+        ));
+        let mut stale_lsn = bases.clone();
+        stale_lsn.insert(
+            PageId::new(5),
+            delta_test_leaf(PageId::new(5), Lsn::new(committed_lsn.get() - 1), 1),
+        );
+        assert!(matches!(
+            append_with_bases(&mut wal, &next, &stale_lsn),
+            Err(Error::InternalInvariantViolation(_))
+        ));
+        assert_eq!(wal.metrics().unwrap().wal_bytes, length);
+        append_with_bases(&mut wal, &next, &bases).unwrap();
+    }
+
+    #[test]
+    fn same_page_transactions_in_one_group_chain_in_fifo_order() {
+        use crate::wal::WalRedoKind::{PageDelta, PageImage};
+        let mut wal = blink_test_wal();
+        let bases = BTreeMap::new();
+        let group = delta_commits(&wal, &[&[(5, 1)], &[(5, 2)], &[(5, 3), (6, 3)], &[(6, 4)]]);
+        append_with_bases(&mut wal, &group, &bases).unwrap();
+        assert_eq!(
+            redo_kinds(&mut wal),
+            vec![
+                vec![PageImage],
+                vec![PageDelta],
+                vec![PageDelta, PageImage],
+                vec![PageDelta]
+            ]
+        );
+        let mut file = wal.into_file();
+        let frames = crate::wal::parse_wal_frames_for_test(&file.0);
+        let delta_bases = frames
+            .iter()
+            .filter(|frame| frame.record_type == crate::wal::WalRecordType::PageDelta)
+            .map(|frame| {
+                (
+                    u64::from_le_bytes(frame.payload[0..8].try_into().unwrap()),
+                    u64::from_le_bytes(frame.payload[8..16].try_into().unwrap()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delta_bases,
+            vec![
+                (5, group[0].commit_lsn.get()),
+                (5, group[1].commit_lsn.get()),
+                (6, group[2].commit_lsn.get())
+            ]
+        );
+        file.0.truncate(file.0.len());
+        let mut reopened = WalLog::open_with_page_image_format(
+            file,
+            blink_wal_identity(),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        let recovered = reopened.take_recovery_pages();
+        assert_eq!(*recovered[&PageId::new(5)].image, group[2].pages[0].image);
+        assert_eq!(*recovered[&PageId::new(6)].image, group[3].pages[0].image);
+    }
+
+    #[test]
+    fn page_deltas_skip_superblocks_ineligible_commits_and_page_image_wals() {
+        use crate::wal::WalRedoKind::PageImage;
+        let store = planned_store();
+        let superblock = encode_blink_superblock(&store.current_superblock).unwrap();
+        let mut wal = blink_test_wal();
+        let mut bases = BTreeMap::new();
+        let commits = delta_commits(&wal, &[&[(5, 1)]]);
+        append_with_bases(&mut wal, &commits, &bases).unwrap();
+        latest_images(&commits, &mut bases);
+        let commit_lsn = Lsn::new(wal.next_lsn().get() + 2);
+        let commits = vec![WalCommit {
+            batch_id: wal.next_batch_id(),
+            commit_lsn,
+            pages: vec![
+                WalPageImage {
+                    page_id: PageId::new(5),
+                    image: delta_test_leaf(PageId::new(5), commit_lsn, 2),
+                },
+                WalPageImage {
+                    page_id: PageId::ZERO,
+                    image: superblock,
+                },
+            ],
+        }];
+        let eligible = vec![false];
+        let mut source = |page_id: PageId| bases.get(&page_id).map(Cow::Borrowed);
+        let mut request = WalDeltaRequest {
+            eligible_commits: &eligible,
+            base_source: &mut source,
+        };
+        wal.append_group_with_page_deltas(&commits, &mut request, None)
+            .unwrap();
+        assert_eq!(redo_kinds(&mut wal)[1], vec![PageImage, PageImage]);
+        let redo = wal.metrics().unwrap().redo;
+        assert_eq!(redo.image_superblock, 1);
+        assert_eq!(redo.image_ineligible_commit, 1);
+
+        let legacy = MemoryFile(crate::wal::init_frame_for_test(
+            2,
+            &blink_wal_identity(),
+            Lsn::ZERO,
+        ));
+        let mut legacy_wal = WalLog::open_with_page_image_format(
+            legacy,
+            blink_wal_identity(),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        assert!(!legacy_wal.page_delta_enabled());
+        let mut legacy_bases = BTreeMap::new();
+        for value_byte in [1u8, 2] {
+            let commits = delta_commits(&legacy_wal, &[&[(5, value_byte)]]);
+            append_with_bases(&mut legacy_wal, &commits, &legacy_bases).unwrap();
+            latest_images(&commits, &mut legacy_bases);
+        }
+        assert_eq!(
+            redo_kinds(&mut legacy_wal),
+            vec![vec![PageImage], vec![PageImage]]
+        );
+        assert_eq!(
+            legacy_wal.metrics().unwrap().redo.image_page_image_format,
+            2
+        );
+        legacy_wal
+            .reset(legacy_wal.last_commit_lsn().unwrap(), None)
+            .unwrap();
+        assert!(legacy_wal.page_delta_enabled());
+    }
+
+    fn two_commit_delta_wal() -> (Vec<crate::wal::TestWalFrame>, Vec<WalCommit>) {
+        let mut wal = blink_test_wal();
+        let mut bases = BTreeMap::new();
+        let first = delta_commits(&wal, &[&[(5, 1), (6, 1)]]);
+        append_with_bases(&mut wal, &first, &bases).unwrap();
+        latest_images(&first, &mut bases);
+        let second = delta_commits(&wal, &[&[(5, 2), (6, 2)]]);
+        append_with_bases(&mut wal, &second, &bases).unwrap();
+        let frames = crate::wal::parse_wal_frames_for_test(&wal.into_file().0);
+        (frames, [first, second].concat())
+    }
+
+    fn open_test_frames(frames: &[crate::wal::TestWalFrame]) -> Result<WalLog<MemoryFile>> {
+        WalLog::open_with_page_image_format(
+            MemoryFile(crate::wal::serialize_wal_frames_for_test(frames)),
+            blink_wal_identity(),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+    }
+
+    #[test]
+    fn malformed_page_delta_records_are_rejected_on_scan() {
+        use crate::wal::{WalRecordType, encode_page_delta, recompute_commit_digests_for_test};
+        let (frames, commits) = two_commit_delta_wal();
+        let delta_frame = frames
+            .iter()
+            .position(|frame| frame.record_type == WalRecordType::PageDelta)
+            .unwrap();
+        let mut control = frames.clone();
+        recompute_commit_digests_for_test(&mut control);
+        let mut control_wal = open_test_frames(&control).unwrap();
+        assert_eq!(
+            *control_wal.take_recovery_pages()[&PageId::new(5)].image,
+            commits[1].pages[0].image
+        );
+
+        let valid_payload = frames[delta_frame].payload.clone();
+        let mut bad_checksum_target = commits[1].pages[0].image;
+        bad_checksum_target[PAGE_SIZE - 3] ^= 0x40;
+        let bad_checksum_payload = encode_page_delta(
+            PageId::new(5),
+            &commits[0].pages[0].image,
+            &bad_checksum_target,
+        )
+        .unwrap();
+        let mut variants: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut payload = valid_payload.clone();
+        payload[8..16].copy_from_slice(&(commits[0].commit_lsn.get() - 1).to_le_bytes());
+        variants.push(("bad base LSN", payload));
+        let mut payload = valid_payload.clone();
+        payload[0..8].copy_from_slice(&6u64.to_le_bytes());
+        variants.push(("wrong page ID with another base", payload));
+        let mut payload = valid_payload.clone();
+        payload[0..8].copy_from_slice(&77u64.to_le_bytes());
+        variants.push(("page without base", payload));
+        let mut payload = valid_payload.clone();
+        payload[0..8].copy_from_slice(&0u64.to_le_bytes());
+        variants.push(("superblock target", payload));
+        let mut payload = valid_payload.clone();
+        payload[20..22].copy_from_slice(&0u16.to_le_bytes());
+        variants.push(("zero-length span", payload));
+        let mut payload = valid_payload.clone();
+        payload[18..20].copy_from_slice(&4095u16.to_le_bytes());
+        variants.push(("out-of-range span", payload));
+        let mut payload = valid_payload.clone();
+        payload[16..18].copy_from_slice(&0u16.to_le_bytes());
+        variants.push(("bad span count", payload));
+        variants.push((
+            "truncated payload",
+            valid_payload[..valid_payload.len() - 1].to_vec(),
+        ));
+        variants.push(("invalid rebuilt checksum", bad_checksum_payload));
+        variants.push((
+            "overlapping spans",
+            manual_delta_payload(
+                5,
+                commits[0].commit_lsn.get(),
+                2,
+                &[(100, 10, &[1; 10]), (105, 5, &[1; 5])],
+            ),
+        ));
+        variants.push((
+            "unsorted spans",
+            manual_delta_payload(
+                5,
+                commits[0].commit_lsn.get(),
+                2,
+                &[(200, 1, &[1]), (100, 1, &[1])],
+            ),
+        ));
+        for (name, payload) in variants {
+            let mut malformed = frames.clone();
+            malformed[delta_frame].payload = payload;
+            recompute_commit_digests_for_test(&mut malformed);
+            assert!(
+                matches!(open_test_frames(&malformed), Err(Error::Corruption(_))),
+                "{name}"
+            );
+        }
+
+        let mut bad_digest = control.clone();
+        let commit_frame = bad_digest
+            .iter()
+            .rposition(|frame| frame.record_type == WalRecordType::Commit)
+            .unwrap();
+        bad_digest[commit_frame].payload[12] ^= 1;
+        assert!(matches!(
+            open_test_frames(&bad_digest),
+            Err(Error::Corruption(_))
+        ));
+
+        let mut in_page_image_wal = control.clone();
+        for frame in &mut in_page_image_wal {
+            frame.version = 2;
+        }
+        recompute_commit_digests_for_test(&mut in_page_image_wal);
+        assert!(matches!(
+            open_test_frames(&in_page_image_wal),
+            Err(Error::Corruption(_))
+        ));
+    }
+
+    #[test]
+    fn commit_digest_binds_the_exact_redo_record_sequence() {
+        use crate::wal::{WalRecordType, record_digest_for_test};
+        let (frames, _) = two_commit_delta_wal();
+        let first_delta = frames
+            .iter()
+            .position(|frame| frame.record_type == WalRecordType::PageDelta)
+            .unwrap();
+        let second_delta = first_delta + 1;
+        assert_eq!(frames[second_delta].record_type, WalRecordType::PageDelta);
+        let commit_frame = second_delta + 1;
+        assert_eq!(frames[commit_frame].record_type, WalRecordType::Commit);
+        assert!(open_test_frames(&frames).is_ok());
+
+        let mut omission = frames.clone();
+        omission.remove(second_delta);
+        let commit = omission
+            .iter_mut()
+            .rfind(|frame| frame.record_type == WalRecordType::Commit)
+            .unwrap();
+        commit.record_index = 1;
+        commit.payload[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            open_test_frames(&omission),
+            Err(Error::Corruption(_))
+        ));
+
+        let mut duplication = frames.clone();
+        duplication[second_delta].payload = duplication[first_delta].payload.clone();
+        assert!(matches!(
+            open_test_frames(&duplication),
+            Err(Error::Corruption(_))
+        ));
+
+        let mut reorder = frames.clone();
+        let first_payload = reorder[first_delta].payload.clone();
+        reorder[first_delta].payload = reorder[second_delta].payload.clone();
+        reorder[second_delta].payload = first_payload;
+        assert!(matches!(
+            open_test_frames(&reorder),
+            Err(Error::Corruption(_))
+        ));
+
+        let mut corrupted = frames.clone();
+        let last = corrupted[first_delta].payload.len() - 1;
+        corrupted[first_delta].payload[last] ^= 0x80;
+        assert!(matches!(
+            open_test_frames(&corrupted),
+            Err(Error::Corruption(_))
+        ));
+
+        let mut substituted = frames.clone();
+        substituted[first_delta].record_type = WalRecordType::PageImage;
+        assert!(matches!(
+            open_test_frames(&substituted),
+            Err(Error::Corruption(_))
+        ));
+        let payload = frames[first_delta].payload.as_slice();
+        assert_ne!(
+            record_digest_for_test(3, &[(WalRecordType::PageDelta, 0, payload)]),
+            record_digest_for_test(3, &[(WalRecordType::PageImage, 0, payload)])
+        );
+        assert_ne!(
+            record_digest_for_test(3, &[(WalRecordType::PageDelta, 0, payload)]),
+            record_digest_for_test(3, &[(WalRecordType::PageDelta, 1, payload)])
+        );
+
+        let mut other_wal = blink_test_wal();
+        let mut other_bases = BTreeMap::new();
+        let first = delta_commits(&other_wal, &[&[(5, 1), (6, 1)]]);
+        append_with_bases(&mut other_wal, &first, &other_bases).unwrap();
+        latest_images(&first, &mut other_bases);
+        let second = delta_commits(&other_wal, &[&[(5, 9), (6, 9)]]);
+        append_with_bases(&mut other_wal, &second, &other_bases).unwrap();
+        let other_frames = crate::wal::parse_wal_frames_for_test(&other_wal.into_file().0);
+        let mut spliced = frames.clone();
+        spliced[commit_frame] = other_frames[commit_frame].clone();
+        assert_ne!(spliced[commit_frame].payload, frames[commit_frame].payload);
+        assert!(matches!(
+            open_test_frames(&spliced),
+            Err(Error::Corruption(_))
+        ));
     }
 
     fn splitmix_for_test(mut state: u64) -> u64 {
