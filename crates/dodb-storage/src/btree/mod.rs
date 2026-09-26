@@ -441,13 +441,14 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         let checkpoint_hint =
             validate_existing_identity_before_wal(&mut file, &identity, wal_length)?
                 .unwrap_or(Lsn::ZERO);
-        let wal = WalLog::open_with_fault_injector_and_start_lsn(
+        let mut wal = WalLog::open_with_fault_injector_and_start_lsn(
             wal_file,
             identity.clone(),
             checkpoint_hint,
             fault_injector.as_deref_mut(),
         )?;
-        if file.is_empty()? && wal.committed_batches().is_empty() {
+        let recovery_batches = wal.take_recovery_batches();
+        if file.is_empty()? && recovery_batches.is_empty() {
             let mut store = BTreeStore::<F, W>::initialize(file, config)?;
             store.wal = Some(wal);
             store.next_lsn = store.wal.as_ref().unwrap().next_lsn();
@@ -458,10 +459,11 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
 
         recover_data_file(
             &mut file,
-            wal.committed_batches(),
+            &recovery_batches,
             checkpoint_hint,
             fault_injector.as_deref_mut(),
         )?;
+        drop(recovery_batches);
         let length = file.len()?;
         if length < (FIRST_DATA_PAGE * PAGE_SIZE as u64) || !length.is_multiple_of(PAGE_SIZE as u64)
         {
@@ -475,7 +477,6 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         validate_superblock_identity(&selected.superblock, &identity)?;
         let (root_page_id, free_list_head, high_water_page_id) =
             metadata_from_superblock(&selected.superblock, length)?;
-        let mut wal = wal;
         wal.resume_after(selected.superblock.checkpoint_lsn)?;
         let mut store = BTreeStore::<F, W> {
             file,
@@ -502,7 +503,7 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         let max_commit_lsn = store
             .wal
             .as_ref()
-            .and_then(|wal| wal.committed_batches().last().map(|batch| batch.commit_lsn))
+            .and_then(WalLog::last_commit_lsn)
             .unwrap_or(Lsn::ZERO);
         store.next_revision = Revision::new(
             report
@@ -916,9 +917,7 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
             ));
         };
         let checkpoint_lsn = wal
-            .committed_batches()
-            .last()
-            .map(|batch| batch.commit_lsn)
+            .last_commit_lsn()
             .unwrap_or(self.current_superblock.checkpoint_lsn);
         if checkpoint_lsn < self.current_superblock.checkpoint_lsn {
             return Err(Error::invariant("checkpoint LSN would move backwards"));
@@ -1004,7 +1003,7 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         }
 
         let should_reset_wal = self.wal.as_ref().is_some_and(|wal| {
-            !wal.committed_batches().is_empty() || wal.history_start_lsn() < checkpoint_lsn
+            wal.last_commit_lsn().is_some() || wal.history_start_lsn() < checkpoint_lsn
         });
         if should_reset_wal {
             let mut wal = self
@@ -1073,9 +1072,7 @@ impl<F: DurableFile, W: DurableFile> BTreeStore<F, W> {
         }
         if let Some(wal) = self.wal.as_ref() {
             let latest_known_lsn = wal
-                .committed_batches()
-                .last()
-                .map(|batch| batch.commit_lsn)
+                .last_commit_lsn()
                 .unwrap_or(self.current_superblock.checkpoint_lsn);
             if self.current_superblock.checkpoint_lsn > latest_known_lsn {
                 return Err(Error::corruption(

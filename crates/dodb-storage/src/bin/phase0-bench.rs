@@ -12,7 +12,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -283,6 +283,7 @@ struct Args {
     blink_workers: usize,
     seed: u64,
     output: PathBuf,
+    window_seconds: Option<u64>,
 }
 
 impl Default for Args {
@@ -316,6 +317,7 @@ impl Default for Args {
             blink_workers: 2,
             seed: 0xd0db_2026_0000_0001,
             output: PathBuf::from(DEFAULT_OUTPUT),
+            window_seconds: None,
         }
     }
 }
@@ -387,6 +389,10 @@ impl Args {
                 }
                 "--queue-capacity" => {
                     args.queue_capacity = parse_usize(&take_value(&mut values, &flag), &flag)
+                }
+                "--window-seconds" => {
+                    args.window_seconds =
+                        Some(parse_usize(&take_value(&mut values, &flag), &flag).max(1) as u64)
                 }
                 "--collection-delay" => {
                     args.collection_delay = Some(parse_duration(&take_value(&mut values, &flag)))
@@ -483,7 +489,8 @@ fn print_help() {
          --group-limit 64 --group-bytes 4194304 --queue-capacity 256\n\
          --collection-delay 500us --sync-mode real|injected|disabled --sync-delay 1ms\n\
          --transaction-mode unconditional|insert-if-absent\n\
-         --tokio-workers 12 --blink-workers 2 --seed 0xd0db2026 --output target/phase0/results.jsonl"
+         --tokio-workers 12 --blink-workers 2 --seed 0xd0db2026 --output target/phase0/results.jsonl\n\
+         --window-seconds 10 (per-window tx/s and latency, periodic WAL/RSS/dirty-page samples)"
     );
 }
 
@@ -1005,6 +1012,7 @@ struct EngineSnapshot {
     blink: Option<BlinkSplitMetrics>,
     batch: Option<BlinkBatchMetrics>,
     versioned: Option<BlinkVersionedReadMetrics>,
+    dirty_pages: Option<usize>,
 }
 
 trait EngineAdapter: Send + Sync {
@@ -1041,6 +1049,7 @@ impl EngineAdapter for BaselineAdapter {
             blink: None,
             batch: None,
             versioned: None,
+            dirty_pages: None,
         }
     }
 
@@ -1238,6 +1247,7 @@ impl EngineAdapter for BlinkAdapter {
                 blink: None,
                 batch: None,
                 versioned: None,
+                dirty_pages: None,
             };
         };
         EngineSnapshot {
@@ -1254,6 +1264,7 @@ impl EngineAdapter for BlinkAdapter {
                 .read_handle
                 .as_ref()
                 .map(|_| store.versioned_read_metrics()),
+            dirty_pages: Some(store.dirty_page_count()),
         }
     }
 
@@ -1326,6 +1337,7 @@ struct WorkerStats {
     e2e_latency: LatencySamples,
     write_latency: LatencySamples,
     read_latency: LatencySamples,
+    window_timeline: Vec<(u64, u64)>,
 }
 
 impl WorkerStats {
@@ -1347,6 +1359,7 @@ impl WorkerStats {
             e2e_latency: LatencySamples::with_seed(seed),
             write_latency: LatencySamples::with_seed(seed ^ 0x1111),
             read_latency: LatencySamples::with_seed(seed ^ 0x2222),
+            window_timeline: Vec::new(),
         }
     }
 
@@ -1373,6 +1386,7 @@ impl WorkerStats {
         for value in other.read_latency.values {
             self.read_latency.push(value);
         }
+        self.window_timeline.extend(other.window_timeline);
     }
 
     fn attempted_operations(&self) -> u64 {
@@ -2168,6 +2182,7 @@ async fn writer_loop(
     deadline: Instant,
     quota: Option<MixQuota>,
     warmup: bool,
+    timeline_start: Option<Instant>,
 ) -> WorkerStats {
     let mut generator = WorkloadGenerator::new(workload, seed, worker_id);
     let mut stats = WorkerStats::new(seed ^ worker_id as u64);
@@ -2190,6 +2205,12 @@ async fn writer_loop(
                 Ok(_) => {
                     stats.successful_transactions += 1;
                     stats.mutation_ops += width;
+                    if let Some(timeline_start) = timeline_start {
+                        stats.window_timeline.push((
+                            (started + elapsed - timeline_start).as_nanos() as u64,
+                            elapsed.as_nanos() as u64,
+                        ));
+                    }
                 }
                 Err(Error::Conflict(_)) => stats.conflicts += 1,
                 Err(Error::Overloaded(_)) => stats.overloads += 1,
@@ -2258,7 +2279,9 @@ async fn run_interval(
     duration: Duration,
     warmup: bool,
 ) -> WorkerStats {
-    let deadline = Instant::now() + duration;
+    let interval_start = Instant::now();
+    let deadline = interval_start + duration;
+    let timeline_start = (!warmup && args.window_seconds.is_some()).then_some(interval_start);
     let workload = WorkloadConfig {
         distribution: scenario.distribution,
         working_set: args.working_set,
@@ -2279,6 +2302,7 @@ async fn run_interval(
             deadline,
             quota.clone(),
             warmup,
+            timeline_start,
         )));
     }
     for worker_id in 0..scenario.readers {
@@ -2298,6 +2322,109 @@ async fn run_interval(
         stats.merge(task.await.expect("benchmark worker task should not panic"));
     }
     stats
+}
+
+#[derive(Clone, Debug)]
+struct ResourceSample {
+    label: String,
+    taken_at: Instant,
+    unix_ms: u128,
+    rss_kib: u64,
+    wal_bytes: u64,
+    wal_committed_batches: u64,
+    wal_page_images: u64,
+    retained_recovery_batches: u64,
+    retained_recovery_page_images: u64,
+    dirty_pages: u64,
+    logical_transactions: u64,
+}
+
+impl ResourceSample {
+    fn capture(adapter: &dyn EngineAdapter, label: String) -> Self {
+        let snapshot = adapter.snapshot();
+        let wal = snapshot.wal.unwrap_or_default();
+        let sample = Self {
+            label,
+            taken_at: Instant::now(),
+            unix_ms: unix_timestamp_ms(),
+            rss_kib: process_rss_kib(),
+            wal_bytes: wal.wal_bytes,
+            wal_committed_batches: wal.committed_batches as u64,
+            wal_page_images: wal.page_images as u64,
+            retained_recovery_batches: wal.retained_recovery_batches as u64,
+            retained_recovery_page_images: wal.retained_recovery_page_images as u64,
+            dirty_pages: snapshot.dirty_pages.unwrap_or_default() as u64,
+            logical_transactions: snapshot.coordinator.logical_transactions,
+        };
+        println!(
+            "resource_sample label={} unix_ms={} rss_kib={} wal_bytes={} wal_committed_batches={} wal_page_images={} retained_recovery_batches={} retained_recovery_page_images={} dirty_pages={} logical_transactions={}",
+            sample.label,
+            sample.unix_ms,
+            sample.rss_kib,
+            sample.wal_bytes,
+            sample.wal_committed_batches,
+            sample.wal_page_images,
+            sample.retained_recovery_batches,
+            sample.retained_recovery_page_images,
+            sample.dirty_pages,
+            sample.logical_transactions,
+        );
+        sample
+    }
+}
+
+fn process_rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|status_line| status_line.strip_prefix("VmRSS:"))
+                .and_then(|value| value.split_whitespace().next()?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+struct ResourceSampler {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Vec<ResourceSample>>,
+}
+
+impl ResourceSampler {
+    fn start(adapter: Arc<dyn EngineAdapter>, started: Instant, window: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut samples = Vec::new();
+            let mut window_index = 0u32;
+            loop {
+                let window_end = started + window * (window_index + 1);
+                loop {
+                    if thread_stop.load(Ordering::Acquire) {
+                        return samples;
+                    }
+                    let now = Instant::now();
+                    if now >= window_end {
+                        break;
+                    }
+                    std::thread::sleep((window_end - now).min(Duration::from_millis(50)));
+                }
+                samples.push(ResourceSample::capture(
+                    &*adapter,
+                    format!("window_{window_index:02}_end"),
+                ));
+                window_index += 1;
+            }
+        });
+        Self { stop, handle }
+    }
+
+    fn finish(self) -> Vec<ResourceSample> {
+        self.stop.store(true, Ordering::Release);
+        self.handle
+            .join()
+            .expect("resource sampler thread should not panic")
+    }
 }
 
 fn benchmark_config(args: &Args, scenario: &Scenario) -> CoordinatorConfig {
@@ -2583,6 +2710,8 @@ fn build_record(
     wall: Duration,
     cpu_start: &ProcessCpuSample,
     cpu_end: &ProcessCpuSample,
+    measurement_started: Instant,
+    samples: &[ResourceSample],
 ) -> String {
     let mut json = JsonObject::new();
     let seconds = wall.as_secs_f64().max(f64::EPSILON);
@@ -2977,6 +3106,90 @@ fn build_record(
         "component_timing_scope",
         "existing cumulative coordinator/storage/WAL metrics; per-request component percentiles unavailable without production hot-path instrumentation",
     );
+    if let Some(window_seconds) = args.window_seconds {
+        let mut timeline = measured.window_timeline.clone();
+        timeline.sort_unstable();
+        let window_nanos = window_seconds * 1_000_000_000;
+        let wall_nanos = wall.as_nanos() as u64;
+        let window_count = wall_nanos.div_ceil(window_nanos);
+        json.u64("window_seconds", window_seconds);
+        json.u64("window_count", window_count);
+        for window_index in 0..window_count {
+            let start = window_index * window_nanos;
+            let end = start + window_nanos;
+            let mut latencies: Vec<u64> = timeline
+                .iter()
+                .filter(|(finish, _)| *finish >= start && *finish < end)
+                .map(|(_, latency)| *latency)
+                .collect();
+            latencies.sort_unstable();
+            let span = (end.min(wall_nanos) - start) as f64 / 1e9;
+            let percentile = |fraction: f64| {
+                if latencies.is_empty() {
+                    0.0
+                } else {
+                    latencies[((latencies.len() - 1) as f64 * fraction).round() as usize] as f64
+                        / 1_000.0
+                }
+            };
+            json.u64(
+                &format!("window_{window_index:02}_successful_transactions"),
+                latencies.len() as u64,
+            );
+            json.f64(&format!("window_{window_index:02}_span_seconds"), span);
+            json.f64(
+                &format!("window_{window_index:02}_logical_tx_per_second"),
+                latencies.len() as f64 / span,
+            );
+            json.f64(
+                &format!("window_{window_index:02}_p50_us"),
+                percentile(0.50),
+            );
+            json.f64(
+                &format!("window_{window_index:02}_p95_us"),
+                percentile(0.95),
+            );
+            json.f64(
+                &format!("window_{window_index:02}_p99_us"),
+                percentile(0.99),
+            );
+        }
+        json.u64("resource_sample_count", samples.len() as u64);
+        for (sample_index, sample) in samples.iter().enumerate() {
+            let prefix = format!("resource_sample_{sample_index:02}");
+            let since_measurement_start = if sample.taken_at >= measurement_started {
+                (sample.taken_at - measurement_started).as_secs_f64()
+            } else {
+                -(measurement_started - sample.taken_at).as_secs_f64()
+            };
+            json.string(&format!("{prefix}_label"), &sample.label);
+            json.f64(
+                &format!("{prefix}_since_measurement_start_seconds"),
+                since_measurement_start,
+            );
+            json.u64(&format!("{prefix}_unix_ms"), sample.unix_ms as u64);
+            json.u64(&format!("{prefix}_rss_kib"), sample.rss_kib);
+            json.u64(&format!("{prefix}_wal_bytes"), sample.wal_bytes);
+            json.u64(
+                &format!("{prefix}_wal_committed_batches"),
+                sample.wal_committed_batches,
+            );
+            json.u64(&format!("{prefix}_wal_page_images"), sample.wal_page_images);
+            json.u64(
+                &format!("{prefix}_retained_recovery_batches"),
+                sample.retained_recovery_batches,
+            );
+            json.u64(
+                &format!("{prefix}_retained_recovery_page_images"),
+                sample.retained_recovery_page_images,
+            );
+            json.u64(&format!("{prefix}_dirty_pages"), sample.dirty_pages);
+            json.u64(
+                &format!("{prefix}_logical_transactions"),
+                sample.logical_transactions,
+            );
+        }
+    }
     json.finish()
 }
 
@@ -3017,6 +3230,10 @@ async fn run_repetition(
     output: &mut std::fs::File,
 ) -> Result<()> {
     let (adapter, data_path, seeded_rows) = open_adapter(args, scenario, repetition, seed).await?;
+    let mut samples = Vec::new();
+    if args.window_seconds.is_some() {
+        samples.push(ResourceSample::capture(&*adapter, "seeded".to_string()));
+    }
     let warmup_stats = run_interval(
         Arc::clone(&adapter),
         args,
@@ -3027,9 +3244,22 @@ async fn run_repetition(
     )
     .await;
     let _ = warmup_stats;
+    if args.window_seconds.is_some() {
+        samples.push(ResourceSample::capture(
+            &*adapter,
+            "measurement_start".to_string(),
+        ));
+    }
     let before = adapter.snapshot();
     let cpu_start = ProcessCpuSample::capture();
     let started = Instant::now();
+    let sampler = args.window_seconds.map(|window_seconds| {
+        ResourceSampler::start(
+            Arc::clone(&adapter),
+            started,
+            Duration::from_secs(window_seconds),
+        )
+    });
     let measured = run_interval(
         Arc::clone(&adapter),
         args,
@@ -3041,6 +3271,13 @@ async fn run_repetition(
     .await;
     let wall = started.elapsed();
     let cpu_end = ProcessCpuSample::capture();
+    if let Some(sampler) = sampler {
+        samples.extend(sampler.finish());
+        samples.push(ResourceSample::capture(
+            &*adapter,
+            "measurement_end".to_string(),
+        ));
+    }
     let after = adapter.snapshot();
     let delta = MetricDelta::from(&before, &after);
     print_run_summary(scenario, repetition, &measured, wall, &delta);
@@ -3056,6 +3293,8 @@ async fn run_repetition(
         wall,
         &cpu_start,
         &cpu_end,
+        started,
+        &samples,
     );
     use std::io::Write;
     writeln!(output, "{line}")?;

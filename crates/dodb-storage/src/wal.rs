@@ -140,6 +140,8 @@ pub struct WalMetrics {
     pub wal_syncs: u64,
     pub committed_batches: usize,
     pub page_images: usize,
+    pub retained_recovery_batches: usize,
+    pub retained_recovery_page_images: usize,
     pub append_nanos: u64,
     pub sync_nanos: u64,
     pub group_encode_nanos: u64,
@@ -213,7 +215,7 @@ struct WalEncodeAttribution {
     group_page_validations: u64,
 }
 
-/// A WAL file with a validated in-memory index of complete commits.
+/// A WAL file with the metadata of its complete commits.
 pub struct WalLog<F: DurableFile> {
     file: F,
     identity: WalIdentity,
@@ -221,7 +223,8 @@ pub struct WalLog<F: DurableFile> {
     next_lsn: Lsn,
     next_batch_id: u64,
     history_start_lsn: Lsn,
-    committed: Vec<CommittedWalBatch>,
+    last_commit_lsn: Option<Lsn>,
+    recovery_batches: Vec<CommittedWalBatch>,
     scan_report: WalScanReport,
     sync_count: u64,
     page_images: usize,
@@ -320,6 +323,7 @@ impl<F: DurableFile> WalLog<F> {
         report.torn_tail_bytes = usize::try_from(length - valid_length)
             .map_err(|_| Error::invariant("WAL tail length does not fit usize"))?;
         let page_images = report.replayable_pages;
+        let last_commit_lsn = committed.last().map(|batch| batch.commit_lsn);
         Ok(Self {
             file,
             identity,
@@ -327,7 +331,8 @@ impl<F: DurableFile> WalLog<F> {
             next_lsn,
             next_batch_id,
             history_start_lsn,
-            committed,
+            last_commit_lsn,
+            recovery_batches: committed,
             scan_report: report,
             sync_count: 0,
             page_images,
@@ -359,7 +364,8 @@ impl<F: DurableFile> WalLog<F> {
             next_lsn,
             next_batch_id: 1,
             history_start_lsn: start_after_lsn,
-            committed: Vec::new(),
+            last_commit_lsn: None,
+            recovery_batches: Vec::new(),
             scan_report: WalScanReport::default(),
             sync_count: 0,
             page_images: 0,
@@ -385,8 +391,27 @@ impl<F: DurableFile> WalLog<F> {
         self.file
     }
 
-    pub fn committed_batches(&self) -> &[CommittedWalBatch] {
-        &self.committed
+    pub fn recovery_batches(&self) -> &[CommittedWalBatch] {
+        &self.recovery_batches
+    }
+
+    pub fn take_recovery_batches(&mut self) -> Vec<CommittedWalBatch> {
+        std::mem::take(&mut self.recovery_batches)
+    }
+
+    pub fn last_commit_lsn(&self) -> Option<Lsn> {
+        self.last_commit_lsn
+    }
+
+    pub fn committed_batch_count(&self) -> usize {
+        self.scan_report.committed_batches
+    }
+
+    #[cfg(test)]
+    pub(crate) fn committed_batches_on_disk(&mut self) -> Vec<CommittedWalBatch> {
+        scan_wal(&mut self.file, &self.identity, self.page_image_format)
+            .expect("WAL on disk scans")
+            .4
     }
 
     pub fn next_lsn(&self) -> Lsn {
@@ -443,7 +468,8 @@ impl<F: DurableFile> WalLog<F> {
             .map(Lsn::new)
             .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
         self.next_batch_id = 1;
-        self.committed.clear();
+        self.last_commit_lsn = None;
+        self.recovery_batches = Vec::new();
         self.scan_report = WalScanReport {
             records_scanned: 1,
             ..WalScanReport::default()
@@ -482,8 +508,14 @@ impl<F: DurableFile> WalLog<F> {
         Ok(WalMetrics {
             wal_bytes: self.file.len()?,
             wal_syncs: self.sync_count,
-            committed_batches: self.committed.len(),
+            committed_batches: self.scan_report.committed_batches,
             page_images: self.page_images,
+            retained_recovery_batches: self.recovery_batches.len(),
+            retained_recovery_page_images: self
+                .recovery_batches
+                .iter()
+                .map(|batch| batch.pages.len())
+                .sum(),
             append_nanos: self.append_nanos,
             sync_nanos: self.sync_nanos,
             group_encode_nanos: self.group_encode_nanos,
@@ -629,15 +661,6 @@ impl<F: DurableFile> WalLog<F> {
             (encoded.reports, encoded.next_lsn, encoded.next_batch_id)
         };
 
-        let committed = commits
-            .iter()
-            .map(|commit| CommittedWalBatch {
-                batch_id: commit.batch_id,
-                commit_lsn: commit.commit_lsn,
-                pages: commit.pages.clone(),
-            })
-            .collect::<Vec<_>>();
-
         self.append_nanos = self
             .append_nanos
             .checked_add(elapsed_nanos(append_started)?)
@@ -662,7 +685,7 @@ impl<F: DurableFile> WalLog<F> {
             .ok_or_else(|| Error::invariant("WAL sync count overflow"))?;
         hit(&mut injector, "after_wal_sync")?;
 
-        self.committed.extend(committed);
+        self.last_commit_lsn = Some(commits.last().expect("non-empty WAL group").commit_lsn);
         self.next_lsn = next_lsn;
         self.next_batch_id = next_batch_id;
         let record_count = commits.iter().try_fold(0usize, |count, commit| {
@@ -1864,7 +1887,8 @@ mod tests {
         let mut wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
         let commit_lsn = Lsn::new(2);
         wal.append_commit(1, commit_lsn, &[page(2)], None).unwrap();
-        assert_eq!(wal.committed_batches()[0].commit_lsn, commit_lsn);
+        assert_eq!(wal.last_commit_lsn(), Some(commit_lsn));
+        assert_eq!(wal.committed_batches_on_disk()[0].commit_lsn, commit_lsn);
         assert_eq!(wal.next_lsn(), Lsn::new(3));
     }
 
@@ -2054,7 +2078,54 @@ mod tests {
             wal.append_group_trusted_internal(&malformed_commit, Some(&mut injector))
                 .is_err()
         );
-        assert!(wal.committed_batches().is_empty());
+        assert_eq!(wal.committed_batch_count(), 0);
+        assert_eq!(wal.last_commit_lsn(), None);
+    }
+
+    #[test]
+    fn appended_commits_keep_only_metadata_and_reopen_hands_payload_once() {
+        let mut wal = WalLog::open(MemoryFile::default(), identity()).unwrap();
+        let commits = wal_commits(3_000, 1);
+        for commit_group in commits.chunks(7) {
+            wal.append_group(commit_group, None).unwrap();
+        }
+        let metrics = wal.metrics().unwrap();
+        assert_eq!(metrics.committed_batches, 3_000);
+        assert_eq!(metrics.page_images, 3_000);
+        assert_eq!(metrics.retained_recovery_batches, 0);
+        assert_eq!(metrics.retained_recovery_page_images, 0);
+        assert!(wal.recovery_batches().is_empty());
+        let last_commit_lsn = commits.last().unwrap().commit_lsn;
+        assert_eq!(wal.last_commit_lsn(), Some(last_commit_lsn));
+
+        let mut reopened = WalLog::open(wal.into_file(), identity()).unwrap();
+        assert_eq!(reopened.last_commit_lsn(), Some(last_commit_lsn));
+        assert_eq!(reopened.recovery_batches().len(), 3_000);
+        assert_eq!(
+            reopened.metrics().unwrap().retained_recovery_page_images,
+            3_000
+        );
+        let recovery = reopened.take_recovery_batches();
+        assert_eq!(
+            recovery
+                .iter()
+                .map(|batch| (batch.batch_id, batch.commit_lsn, batch.pages.clone()))
+                .collect::<Vec<_>>(),
+            commits
+                .iter()
+                .map(|commit| (commit.batch_id, commit.commit_lsn, commit.pages.clone()))
+                .collect::<Vec<_>>()
+        );
+        let metrics = reopened.metrics().unwrap();
+        assert_eq!(metrics.retained_recovery_batches, 0);
+        assert_eq!(metrics.retained_recovery_page_images, 0);
+        assert_eq!(metrics.committed_batches, 3_000);
+        assert_eq!(reopened.last_commit_lsn(), Some(last_commit_lsn));
+        assert!(reopened.take_recovery_batches().is_empty());
+
+        reopened.reset(last_commit_lsn, None).unwrap();
+        assert_eq!(reopened.last_commit_lsn(), None);
+        assert_eq!(reopened.committed_batch_count(), 0);
     }
 
     #[test]
@@ -2088,7 +2159,7 @@ mod tests {
         assert!(wal.file.write_calls > 1);
         let file = wal.into_file();
         let reopened = WalLog::open(file, identity()).unwrap();
-        assert_eq!(reopened.committed_batches().len(), 10);
+        assert_eq!(reopened.recovery_batches().len(), 10);
         assert_eq!(reopened.scan_report().replayable_pages, 20);
     }
 
@@ -2100,7 +2171,7 @@ mod tests {
         let original_length = file.len().unwrap();
         file.set_len(original_length - 10).unwrap();
         let reopened = WalLog::open(file, identity()).unwrap();
-        assert_eq!(reopened.committed_batches().len(), 1);
+        assert_eq!(reopened.recovery_batches().len(), 1);
         assert_eq!(reopened.scan_report().replayable_pages, 1);
         assert_eq!(reopened.scan_report().torn_tail_bytes, 58);
     }

@@ -1195,14 +1195,15 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             config.shard_epoch,
         );
         let checkpoint_hint = existing_checkpoint(&mut file, &identity, wal_file.len()?)?;
-        let wal = WalLog::open_with_page_image_format_and_fault_injector_and_start_lsn(
+        let mut wal = WalLog::open_with_page_image_format_and_fault_injector_and_start_lsn(
             wal_file,
             identity,
             WalPageImageFormat::ExperimentalBlink,
             checkpoint_hint,
             fault_injector.as_deref_mut(),
         )?;
-        if file.is_empty()? && wal.committed_batches().is_empty() {
+        let recovery_batches = wal.take_recovery_batches();
+        if file.is_empty()? && recovery_batches.is_empty() {
             let mut store = Self::initialize(file, config)?;
             store.wal = Some(wal);
             store.next_lsn = store.wal.as_ref().unwrap().next_lsn();
@@ -1210,9 +1211,9 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             store.fault_injector = fault_injector;
             return Ok(store);
         }
-        recover_data_file(&mut file, wal.committed_batches(), checkpoint_hint)?;
+        recover_data_file(&mut file, &recovery_batches, checkpoint_hint)?;
+        drop(recovery_batches);
         let (mut store, selected) = Self::load_file(file, config)?;
-        let mut wal = wal;
         wal.resume_after(selected.checkpoint_lsn)?;
         store.wal = Some(wal);
         store.next_lsn = store.wal.as_ref().unwrap().next_lsn();
@@ -1365,6 +1366,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
 
     pub fn batch_metrics(&self) -> BlinkBatchMetrics {
         self.batch_metrics.clone()
+    }
+
+    pub fn dirty_page_count(&self) -> usize {
+        self.dirty_pages.len()
     }
 
     pub fn enable_planned_execution(&mut self) {
@@ -2155,7 +2160,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         let checkpoint_lsn = self
             .wal
             .as_ref()
-            .and_then(|wal| wal.committed_batches().last().map(|batch| batch.commit_lsn))
+            .and_then(WalLog::last_commit_lsn)
             .unwrap_or(self.current_superblock.checkpoint_lsn);
         self.flush()?;
         if checkpoint_lsn > self.current_superblock.checkpoint_lsn {
@@ -7173,7 +7178,8 @@ mod tests {
             )
             .unwrap();
             assert!(wal.append_group(&[commit], None).is_err());
-            assert!(wal.committed_batches().is_empty());
+            assert_eq!(wal.committed_batch_count(), 0);
+            assert_eq!(wal.last_commit_lsn(), None);
         }
     }
 
@@ -7647,7 +7653,7 @@ mod tests {
         assert!(metrics.same_leaf_groups > before.same_leaf_groups);
         assert!(metrics.coalesced_mutations > before.coalesced_mutations);
         assert!(metrics.leaf_loads < metrics.mutations_planned);
-        let committed = store.wal.as_ref().unwrap().committed_batches();
+        let committed = store.wal.as_mut().unwrap().committed_batches_on_disk();
         assert_eq!(committed.len(), 4);
         assert!(committed.iter().all(|batch| !batch.pages.is_empty()));
         let encoded_key = key.encode();
@@ -7722,7 +7728,7 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
             .unwrap();
-        let batches = store.wal.as_ref().unwrap().committed_batches();
+        let batches = store.wal.as_mut().unwrap().committed_batches_on_disk();
         assert_eq!(batches.len(), 8);
         for batch in &batches[4..] {
             assert_eq!(batch.pages.len(), 1);
@@ -7775,21 +7781,22 @@ mod tests {
         let mut store = planned_store();
         let replacement_key = DocumentKey::new(b"structure".to_vec(), b"replacement".to_vec());
         store.put(replacement_key.clone(), b"old".to_vec()).unwrap();
-        let replacement_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        let replacement_batch = store.wal.as_ref().unwrap().committed_batch_count();
         store.put(replacement_key.clone(), b"new".to_vec()).unwrap();
-        let replacement = &store.wal.as_ref().unwrap().committed_batches()[replacement_batch];
+        let replacement =
+            &store.wal.as_mut().unwrap().committed_batches_on_disk()[replacement_batch];
         assert_eq!(replacement.pages.len(), 1);
 
         let insert_key = DocumentKey::new(b"structure".to_vec(), b"insert".to_vec());
-        let insert_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        let insert_batch = store.wal.as_ref().unwrap().committed_batch_count();
         store.put(insert_key.clone(), b"value".to_vec()).unwrap();
-        let insert = &store.wal.as_ref().unwrap().committed_batches()[insert_batch];
+        let insert = &store.wal.as_mut().unwrap().committed_batches_on_disk()[insert_batch];
         assert_eq!(insert.pages.len(), 1);
 
         let overflow_key = DocumentKey::new(b"structure".to_vec(), b"overflow".to_vec());
-        let overflow_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        let overflow_batch = store.wal.as_ref().unwrap().committed_batch_count();
         store.put(overflow_key.clone(), vec![7; 2_000]).unwrap();
-        let overflow = &store.wal.as_ref().unwrap().committed_batches()[overflow_batch];
+        let overflow = &store.wal.as_mut().unwrap().committed_batches_on_disk()[overflow_batch];
         assert!(
             overflow
                 .pages
@@ -7797,9 +7804,10 @@ mod tests {
                 .any(|image| image.page_id.get() < FIRST_DATA_PAGE)
         );
 
-        let freed_overflow_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        let freed_overflow_batch = store.wal.as_ref().unwrap().committed_batch_count();
         store.delete(overflow_key.clone()).unwrap();
-        let freed_overflow = &store.wal.as_ref().unwrap().committed_batches()[freed_overflow_batch];
+        let freed_overflow =
+            &store.wal.as_mut().unwrap().committed_batches_on_disk()[freed_overflow_batch];
         assert!(
             freed_overflow
                 .pages
@@ -7809,12 +7817,12 @@ mod tests {
 
         let reused_overflow_key =
             DocumentKey::new(b"structure".to_vec(), b"overflow-reused".to_vec());
-        let reused_overflow_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        let reused_overflow_batch = store.wal.as_ref().unwrap().committed_batch_count();
         store
             .put(reused_overflow_key.clone(), vec![9; 2_000])
             .unwrap();
         let reused_overflow =
-            &store.wal.as_ref().unwrap().committed_batches()[reused_overflow_batch];
+            &store.wal.as_mut().unwrap().committed_batches_on_disk()[reused_overflow_batch];
         assert!(
             reused_overflow
                 .pages
@@ -7826,7 +7834,7 @@ mod tests {
         let mut observed_root_split = false;
         for position in 0..800u64 {
             let prior_metrics = store.split_metrics();
-            let prior_batch_count = store.wal.as_ref().unwrap().committed_batches().len();
+            let prior_batch_count = store.wal.as_ref().unwrap().committed_batch_count();
             store
                 .put(
                     DocumentKey::new(b"split".to_vec(), position.to_be_bytes().to_vec()),
@@ -7834,7 +7842,12 @@ mod tests {
                 )
                 .unwrap();
             let next_metrics = store.split_metrics();
-            let batch = &store.wal.as_ref().unwrap().committed_batches()[prior_batch_count];
+            if next_metrics.leaf_splits == prior_metrics.leaf_splits
+                && next_metrics.root_splits == prior_metrics.root_splits
+            {
+                continue;
+            }
+            let batch = &store.wal.as_mut().unwrap().committed_batches_on_disk()[prior_batch_count];
             if next_metrics.leaf_splits > prior_metrics.leaf_splits {
                 observed_leaf_split = true;
                 assert!(
@@ -7858,13 +7871,13 @@ mod tests {
         assert!(observed_leaf_split);
         assert!(observed_root_split);
 
-        let stable_batch = store.wal.as_ref().unwrap().committed_batches().len();
+        let stable_batch = store.wal.as_ref().unwrap().committed_batch_count();
         let root_page_id = store.current_superblock.root_page_id;
         let high_water_page_id = store.current_superblock.high_water_page_id;
         store
             .put(replacement_key.clone(), b"after-split".to_vec())
             .unwrap();
-        let stable = &store.wal.as_ref().unwrap().committed_batches()[stable_batch];
+        let stable = &store.wal.as_mut().unwrap().committed_batches_on_disk()[stable_batch];
         assert_eq!(stable.pages.len(), 1);
         let (data, wal) = store.into_files();
         let mut reopened = BlinkStore::open_with_wal(data, wal.unwrap(), config).unwrap();
@@ -7927,7 +7940,7 @@ mod tests {
         store.put(key.clone(), b"before".to_vec()).unwrap();
         let before_contents = store.scan(None, 100).unwrap();
         let before_lsn = store.next_lsn;
-        let before_batches = store.wal.as_ref().unwrap().committed_batches().len();
+        let before_batches = store.wal.as_ref().unwrap().committed_batch_count();
         let before_publications = store.versioned_read_metrics().published_generations;
         store.set_fault_injector(FailOnce {
             point: "before_wal_sync",
@@ -7937,7 +7950,7 @@ mod tests {
         assert_eq!(store.scan(None, 100).unwrap(), before_contents);
         assert_eq!(store.next_lsn, before_lsn);
         assert_eq!(
-            store.wal.as_ref().unwrap().committed_batches().len(),
+            store.wal.as_ref().unwrap().committed_batch_count(),
             before_batches
         );
         assert_eq!(
@@ -7962,7 +7975,7 @@ mod tests {
         let lsn_before = store.next_lsn;
         let batch_before = store.next_batch_id;
         let generation_before = store.versioned_read_metrics().published_generations;
-        let wal_before = store.wal.as_ref().unwrap().committed_batches().len();
+        let wal_before = store.wal.as_ref().unwrap().committed_batch_count();
         let error = store
             .apply_transaction_group(&[TransactionRequest::new(
                 Vec::new(),
@@ -7987,7 +8000,7 @@ mod tests {
             generation_before
         );
         assert_eq!(
-            store.wal.as_ref().unwrap().committed_batches().len(),
+            store.wal.as_ref().unwrap().committed_batch_count(),
             wal_before
         );
         assert_eq!(store.get(&key).unwrap().value(), Some(&b"small"[..]));
@@ -8331,8 +8344,8 @@ mod tests {
             parallel_results[2].as_ref().unwrap().commit_lsn.into()
         );
         assert_eq!(parallel.batch_metrics().parallel_skipped_single_leaf, 1);
-        let parallel_wal = parallel.wal.as_ref().unwrap().committed_batches();
-        let serial_wal = serial.wal.as_ref().unwrap().committed_batches();
+        let parallel_wal = parallel.wal.as_mut().unwrap().committed_batches_on_disk();
+        let serial_wal = serial.wal.as_mut().unwrap().committed_batches_on_disk();
         assert_eq!(parallel_wal, serial_wal);
     }
 
@@ -8368,14 +8381,7 @@ mod tests {
         assert_eq!(parallel.get(&last).unwrap(), serial.get(&last).unwrap());
         assert_eq!(parallel.batch_metrics().parallel_fallback_multi_leaf, 1);
         assert_eq!(
-            parallel
-                .wal
-                .as_ref()
-                .unwrap()
-                .committed_batches()
-                .last()
-                .unwrap()
-                .commit_lsn,
+            parallel.wal.as_ref().unwrap().last_commit_lsn().unwrap(),
             parallel_result.commit_lsn
         );
         parallel.check_invariants().unwrap();
@@ -8638,7 +8644,7 @@ mod tests {
         let last = wide_key(10_000);
         let old_pin = store.publisher.pin();
         let read_handle = store.versioned_read_handle();
-        let before_batches = store.wal.as_ref().unwrap().committed_batches().len();
+        let before_batches = store.wal.as_ref().unwrap().committed_batch_count();
         let result = store
             .transact(TransactionRequest::new(
                 Vec::new(),
@@ -8684,7 +8690,7 @@ mod tests {
             Some(&b"multi-last"[..])
         );
         assert_eq!(
-            store.wal.as_ref().unwrap().committed_batches().len(),
+            store.wal.as_ref().unwrap().committed_batch_count(),
             before_batches + 1
         );
         store.check_invariants().unwrap();
@@ -9653,6 +9659,183 @@ mod tests {
             entries.swap(0, 1);
         }
         assert!(check_state(&unordered).is_err());
+    }
+
+    fn retention_key(index: u64) -> DocumentKey {
+        DocumentKey::new(b"retention".to_vec(), (index % 257).to_be_bytes().to_vec())
+    }
+
+    fn assert_no_retained_wal_payload(store: &BlinkStore<MemoryFile, MemoryFile>) {
+        let metrics = store.wal_metrics().unwrap().unwrap();
+        assert_eq!(metrics.retained_recovery_batches, 0);
+        assert_eq!(metrics.retained_recovery_page_images, 0);
+        assert!(store.wal.as_ref().unwrap().recovery_batches().is_empty());
+    }
+
+    #[test]
+    fn runtime_commits_do_not_retain_wal_page_images() {
+        let mut store = planned_store();
+        let before = store.wal_metrics().unwrap().unwrap();
+        let mut last_revision = Revision::new(0);
+        for index in 0..4_000u64 {
+            last_revision = store
+                .put(retention_key(index), index.to_be_bytes().to_vec())
+                .unwrap();
+            if index % 1_000 == 999 {
+                assert_no_retained_wal_payload(&store);
+            }
+        }
+        let after = store.wal_metrics().unwrap().unwrap();
+        assert_eq!(after.committed_batches - before.committed_batches, 4_000);
+        assert!(after.page_images - before.page_images >= 4_000);
+        assert_no_retained_wal_payload(&store);
+        assert_eq!(
+            store
+                .wal
+                .as_ref()
+                .unwrap()
+                .last_commit_lsn()
+                .map(Revision::from),
+            Some(last_revision)
+        );
+    }
+
+    #[test]
+    fn reopen_without_checkpoint_replays_every_commit_and_drops_payload() {
+        let mut store = planned_store();
+        let mut expected = BTreeMap::new();
+        for index in 0..3_000u64 {
+            let key = retention_key(index);
+            let value = index.to_be_bytes().to_vec();
+            store.put(key.clone(), value.clone()).unwrap();
+            expected.insert(key, value);
+        }
+        let committed_before_close = store.wal_metrics().unwrap().unwrap().committed_batches;
+        let last_commit_before_close = store.wal.as_ref().unwrap().last_commit_lsn();
+        let (data, wal) = store.into_files();
+        let config = DatabaseConfig::default();
+        let reopened_wal = WalLog::open_with_page_image_format(
+            wal.unwrap(),
+            WalIdentity::new(
+                config.database_uuid,
+                config.tenant_id,
+                config.shard_id,
+                config.shard_epoch,
+            ),
+            WalPageImageFormat::ExperimentalBlink,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_wal.recovery_batches().len(),
+            committed_before_close
+        );
+        assert_eq!(reopened_wal.last_commit_lsn(), last_commit_before_close);
+        let wal = reopened_wal.into_file();
+        let mut reopened = BlinkStore::open_with_wal(data, wal, DatabaseConfig::default()).unwrap();
+        assert_no_retained_wal_payload(&reopened);
+        assert_eq!(
+            reopened.wal_metrics().unwrap().unwrap().committed_batches,
+            committed_before_close
+        );
+        assert_eq!(
+            reopened.wal.as_ref().unwrap().last_commit_lsn(),
+            last_commit_before_close
+        );
+        for (key, value) in &expected {
+            assert_eq!(reopened.get(key).unwrap().value(), Some(&value[..]));
+        }
+        reopened.check_invariants().unwrap();
+        reopened
+            .put(retention_key(0), b"after-reopen".to_vec())
+            .unwrap();
+        assert_no_retained_wal_payload(&reopened);
+    }
+
+    #[test]
+    fn checkpoint_uses_last_commit_lsn_without_retained_payload() {
+        let mut store = planned_store();
+        let mut expected = BTreeMap::new();
+        let mut last_revision = Revision::new(0);
+        for index in 0..1_500u64 {
+            let key = retention_key(index);
+            let value = index.to_be_bytes().to_vec();
+            last_revision = store.put(key.clone(), value.clone()).unwrap();
+            expected.insert(key, value);
+        }
+        let report = store.checkpoint().unwrap();
+        assert_eq!(Revision::from(report.checkpoint_lsn), last_revision);
+        assert_eq!(
+            store.current_superblock.checkpoint_lsn,
+            report.checkpoint_lsn
+        );
+        assert_eq!(store.wal.as_ref().unwrap().last_commit_lsn(), None);
+        assert_eq!(
+            store.wal.as_ref().unwrap().history_start_lsn(),
+            report.checkpoint_lsn
+        );
+        assert!(report.wal_bytes_reclaimed > 0);
+        let idle = store.checkpoint().unwrap();
+        assert_eq!(idle.checkpoint_lsn, report.checkpoint_lsn);
+        assert_eq!(idle.wal_bytes_reclaimed, 0);
+
+        for index in 1_500..2_500u64 {
+            let key = retention_key(index);
+            let value = index.to_be_bytes().to_vec();
+            store.put(key.clone(), value.clone()).unwrap();
+            expected.insert(key, value);
+        }
+        assert_no_retained_wal_payload(&store);
+        let (data, wal) = store.into_files();
+        let mut reopened =
+            BlinkStore::open_with_wal(data, wal.unwrap(), DatabaseConfig::default()).unwrap();
+        assert_no_retained_wal_payload(&reopened);
+        assert_eq!(
+            reopened.current_superblock.checkpoint_lsn,
+            report.checkpoint_lsn
+        );
+        for (key, value) in &expected {
+            assert_eq!(reopened.get(key).unwrap().value(), Some(&value[..]));
+        }
+        reopened.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn torn_final_commit_is_discarded_on_reopen_without_retained_payload() {
+        let mut store = planned_store();
+        let key = retention_key(7);
+        store.put(key.clone(), b"durable".to_vec()).unwrap();
+        for index in 0..500u64 {
+            store
+                .put(retention_key(index * 2 + 100), b"filler".to_vec())
+                .unwrap();
+        }
+        store.put(key.clone(), b"durable-2".to_vec()).unwrap();
+        let length_before_torn = store.wal_metrics().unwrap().unwrap().wal_bytes;
+        let committed_before_torn = store.wal_metrics().unwrap().unwrap().committed_batches;
+        store.put(key.clone(), b"torn".to_vec()).unwrap();
+        let (data, wal) = store.into_files();
+        let mut wal = wal.unwrap();
+        let full_length = wal.len().unwrap();
+        assert!(full_length > length_before_torn + 10);
+        wal.set_len(full_length - 10).unwrap();
+        let mut reopened = BlinkStore::open_with_wal(data, wal, DatabaseConfig::default()).unwrap();
+        assert_no_retained_wal_payload(&reopened);
+        let metrics = reopened.wal_metrics().unwrap().unwrap();
+        assert!(metrics.wal_bytes >= length_before_torn);
+        assert!(metrics.wal_bytes < full_length - 10);
+        assert_eq!(metrics.committed_batches, committed_before_torn);
+        assert_eq!(
+            reopened.wal.as_ref().unwrap().scan_report().torn_tail_bytes as u64,
+            full_length - 10 - metrics.wal_bytes
+        );
+        assert_eq!(reopened.get(&key).unwrap().value(), Some(&b"durable-2"[..]));
+        reopened.check_invariants().unwrap();
+        reopened.put(key.clone(), b"after-torn".to_vec()).unwrap();
+        let (data, wal) = reopened.into_files();
+        let mut again =
+            BlinkStore::open_with_wal(data, wal.unwrap(), DatabaseConfig::default()).unwrap();
+        assert_eq!(again.get(&key).unwrap().value(), Some(&b"after-torn"[..]));
+        again.check_invariants().unwrap();
     }
 
     fn splitmix_for_test(mut state: u64) -> u64 {
