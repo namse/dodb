@@ -36,7 +36,7 @@ use crate::page::{
 use crate::wal::{
     PAGE_IMAGE_PAYLOAD_SIZE, PreparedWalCommit, PreparedWalRecord, PreparedWalRedo,
     RecoveredWalPage, WalCommit, WalDeltaRequest, WalIdentity, WalLog, WalMetrics, WalPageImage,
-    WalPageImageFormat, apply_page_delta, decode_page_delta, encode_page_delta,
+    WalPageImageFormat, decode_page_delta, encode_page_delta, page_delta_rebuilds,
 };
 
 const FIRST_DATA_PAGE: u64 = 2;
@@ -1228,7 +1228,7 @@ enum ParallelWorkerFault {
 struct LeafChainJob {
     leaf_id: PageId,
     initial_page: Arc<BlinkPage>,
-    base_image: Option<Box<[u8; PAGE_SIZE]>>,
+    base_image: Option<Arc<[u8; PAGE_SIZE]>>,
     chain_entry: Option<(Lsn, u32)>,
     steps: Vec<(u32, u32)>,
     plan: Arc<BatchPlan>,
@@ -1238,7 +1238,7 @@ struct LeafChainJob {
 }
 
 enum LeafChainRedo {
-    Image(Box<[u8; PAGE_SIZE]>),
+    Image(Arc<[u8; PAGE_SIZE]>),
     Delta {
         payload: Vec<u8>,
         base_lsn: Lsn,
@@ -1267,7 +1267,7 @@ struct LeafChainResult {
     leaf_id: PageId,
     boundaries: Vec<LeafChainBoundary>,
     final_page: BlinkPage,
-    final_image: Box<[u8; PAGE_SIZE]>,
+    final_image: Arc<[u8; PAGE_SIZE]>,
     timing: LeafChainTiming,
 }
 
@@ -1309,7 +1309,7 @@ pub struct BlinkStore<F: DurableFile, W: DurableFile = crate::btree::NoWal> {
     next_lsn: Lsn,
     next_batch_id: u64,
     config: DatabaseConfig,
-    dirty_pages: BTreeMap<PageId, [u8; PAGE_SIZE]>,
+    dirty_pages: BTreeMap<PageId, Arc<[u8; PAGE_SIZE]>>,
     dirty_superblock: Option<[u8; PAGE_SIZE]>,
     storage_metrics: StorageMetrics,
     split_metrics: BlinkSplitMetrics,
@@ -1963,7 +1963,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             final_images
                 .iter()
                 .filter(|(id, _)| **id != PageId::ZERO && **id != PageId::new(1))
-                .map(|(id, image)| (*id, *image)),
+                .map(|(id, image)| (*id, Arc::new(*image))),
         );
         self.dirty_superblock = Some(final_sb);
         self.split_metrics.pages_touched = self
@@ -2126,7 +2126,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         drop(serial_site);
         let PlannedExecutionPreparation {
             working,
-            executed,
+            mut executed,
             parallel_redo,
         } = preparation;
         self.batch_metrics.physical_execution_nanos = self
@@ -2188,25 +2188,28 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
 
         let wal_assembly_started = Instant::now();
         let wal_assembly_site = churn::enter(ChurnSite::WalAssembly);
-        let mut wal_commits = Vec::with_capacity(executed.len());
+        let serial_redo_record_count = executed
+            .iter()
+            .map(|transaction| transaction.images.len() as u64)
+            .sum::<u64>();
+        let wal_commits = executed
+            .iter_mut()
+            .map(|transaction| WalCommit {
+                batch_id: transaction.batch_id,
+                commit_lsn: transaction.result.commit_lsn,
+                pages: std::mem::take(&mut transaction.images),
+            })
+            .collect::<Vec<_>>();
+        let final_execution = executed
+            .last()
+            .ok_or_else(|| Error::invariant("planned execution produced no transaction"))?;
         let mut final_images = BTreeMap::new();
-        let mut wal_bytes = 0u64;
-        for transaction in &executed {
-            if self.wal.is_some() {
-                for _ in &transaction.images {
-                    count_image_copy();
-                }
-                wal_commits.push(WalCommit {
-                    batch_id: transaction.batch_id,
-                    commit_lsn: transaction.result.commit_lsn,
-                    pages: transaction.images.clone(),
-                });
-            }
-            for image in &transaction.images {
-                count_image_copy();
-                final_images.insert(image.page_id, image.image);
+        for commit in &wal_commits {
+            for image in &commit.pages {
+                final_images.insert(image.page_id, &image.image);
             }
         }
+        let mut wal_bytes = 0u64;
         self.batch_metrics.wal_assembly_nanos = self
             .batch_metrics
             .wal_assembly_nanos
@@ -2234,7 +2237,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                                 page_lsn: boundary.commit_lsn,
                                 image_crc: boundary.image_crc,
                                 redo: match &boundary.redo {
-                                    LeafChainRedo::Image(image) => PreparedWalRedo::Image(image),
+                                    LeafChainRedo::Image(image) => PreparedWalRedo::Image(&**image),
                                     LeafChainRedo::Delta {
                                         payload,
                                         base_lsn,
@@ -2281,7 +2284,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             let committed_pages = &self.state.pages;
             let mut base_source = |page_id: PageId| -> Option<Cow<'_, [u8; PAGE_SIZE]>> {
                 if let Some(image) = dirty_pages.get(&page_id) {
-                    return Some(Cow::Borrowed(image));
+                    return Some(Cow::Borrowed(&**image));
                 }
                 committed_pages
                     .get(&page_id)
@@ -2312,7 +2315,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 .sum();
         } else {
             for (page_id, image) in &final_images {
-                write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, image)?;
+                write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, *image)?;
             }
             self.file.sync_data()?;
         }
@@ -2399,45 +2402,11 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .batch_metrics
             .retired_generation_drop_nanos
             .saturating_add(publish_timing.retired_generation_drop_nanos);
-        let dirty_tracking_started = Instant::now();
-        let dirty_tracking_site = churn::enter(ChurnSite::DirtyTracking);
-        if let Some(parallel_redo) = &parallel_redo {
-            for result in &parallel_redo.results {
-                count_dirty_insert(&self.dirty_pages, result.leaf_id);
-                self.dirty_pages.insert(result.leaf_id, *result.final_image);
-            }
-        }
-        for page_id in final_images.keys() {
-            if *page_id != PageId::ZERO && *page_id != PageId::new(1) {
-                count_dirty_insert(&self.dirty_pages, *page_id);
-            }
-        }
-        self.dirty_pages.extend(
-            final_images
-                .iter()
-                .filter(|(page_id, _)| **page_id != PageId::ZERO && **page_id != PageId::new(1))
-                .map(|(page_id, image)| (*page_id, *image)),
-        );
-        if let Some(image) = final_images.get(&match final_execution.slot {
-            SuperblockSlot::A => PageId::ZERO,
-            SuperblockSlot::B => PageId::new(1),
-        }) {
-            count_image_copy();
-            self.dirty_superblock = Some(*image);
-        }
-        drop(dirty_tracking_site);
-        self.batch_metrics.dirty_tracking_nanos = self
-            .batch_metrics
-            .dirty_tracking_nanos
-            .saturating_add(elapsed_nanos(dirty_tracking_started));
         let final_page_count = final_images.len() as u64
             + parallel_redo
                 .as_ref()
                 .map_or(0, |parallel_redo| parallel_redo.results.len() as u64);
-        let redo_record_count = executed
-            .iter()
-            .map(|transaction| transaction.images.len() as u64)
-            .sum::<u64>()
+        let redo_record_count = serial_redo_record_count
             + parallel_redo.as_ref().map_or(0, |parallel_redo| {
                 parallel_redo
                     .transaction_records
@@ -2445,6 +2414,32 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                     .map(|records| records.len() as u64)
                     .sum::<u64>()
             });
+        let dirty_tracking_started = Instant::now();
+        let dirty_tracking_site = churn::enter(ChurnSite::DirtyTracking);
+        if let Some(parallel_redo) = parallel_redo {
+            for result in parallel_redo.results {
+                count_dirty_insert(&self.dirty_pages, result.leaf_id, false);
+                self.dirty_pages.insert(result.leaf_id, result.final_image);
+            }
+        }
+        for (page_id, image) in &final_images {
+            if *page_id != PageId::ZERO && *page_id != PageId::new(1) {
+                count_dirty_insert(&self.dirty_pages, *page_id, true);
+                self.dirty_pages.insert(*page_id, Arc::new(**image));
+            }
+        }
+        if let Some(image) = final_images.get(&match final_execution.slot {
+            SuperblockSlot::A => PageId::ZERO,
+            SuperblockSlot::B => PageId::new(1),
+        }) {
+            count_image_copy();
+            self.dirty_superblock = Some(**image);
+        }
+        drop(dirty_tracking_site);
+        self.batch_metrics.dirty_tracking_nanos = self
+            .batch_metrics
+            .dirty_tracking_nanos
+            .saturating_add(elapsed_nanos(dirty_tracking_started));
         self.split_metrics.pages_touched = self
             .split_metrics
             .pages_touched
@@ -2491,7 +2486,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         let mut bytes = 0u64;
         for (page_id, image) in std::mem::take(&mut self.dirty_pages) {
             self.hit_checkpoint_fault(checkpoint, "during_checkpoint_page_write")?;
-            write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, &image)?;
+            write_all_at(&mut self.file, page_id.get() * PAGE_SIZE as u64, &image[..])?;
             bytes = bytes.saturating_add(PAGE_SIZE as u64);
         }
         if let Some(image) = self.dirty_superblock.take() {
@@ -3228,7 +3223,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     plan: &Arc<BatchPlan>,
     worker_pool: &ParallelWorkerPool,
     wal: Option<&WalLog<W>>,
-    dirty_pages: &BTreeMap<PageId, [u8; PAGE_SIZE]>,
+    dirty_pages: &BTreeMap<PageId, Arc<[u8; PAGE_SIZE]>>,
     current_superblock: &BlinkSuperblock,
     active_slot: SuperblockSlot,
     starting_lsn: Lsn,
@@ -3336,11 +3331,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
         }
         let chain_entry = wal.page_chain_entry(leaf_id);
         let base_image = if chain_entry.is_some() {
-            dirty_pages.get(&leaf_id).map(|image| {
-                count_image_copy();
-                churn::add(ChurnCounter::PageImageBuffers, 1);
-                Box::new(*image)
-            })
+            dirty_pages.get(&leaf_id).map(Arc::clone)
         } else {
             None
         };
@@ -3580,9 +3571,8 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
                 Some(image) => image,
                 None => {
                     churn::add(ChurnCounter::PageEncodes, 1);
-                    count_image_copy();
                     churn::add(ChurnCounter::PageImageBuffers, 1);
-                    Box::new(encode_blink_page(leaf_id, &page)?)
+                    encode_blink_page_arc(leaf_id, &page)?
                 }
             };
             let image_crc = crc32c::crc32c(&image[..]);
@@ -3633,7 +3623,8 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
 
         let encode_started = Instant::now();
         churn::add(ChurnCounter::PageEncodes, 1);
-        let image = encode_blink_page(leaf_id, &page)?;
+        churn::add(ChurnCounter::PageImageBuffers, 1);
+        let image = encode_blink_page_arc(leaf_id, &page)?;
         timing.encode_nanos = timing
             .encode_nanos
             .saturating_add(elapsed_nanos(encode_started));
@@ -3641,20 +3632,14 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
         let delta_started = Instant::now();
         let image_crc = crc32c::crc32c(&image[..]);
         let redo = match &base {
-            None => {
-                count_image_copy();
-                churn::add(ChurnCounter::PageImageBuffers, 1);
-                LeafChainRedo::Image(Box::new(image))
-            }
+            None => LeafChainRedo::Image(Arc::clone(&image)),
             Some((base_image, base_lsn, base_crc)) => {
                 let payload = encode_page_delta(leaf_id, base_image, &image)?;
                 if payload.len() >= PAGE_IMAGE_PAYLOAD_SIZE {
-                    count_image_copy();
-                    churn::add(ChurnCounter::PageImageBuffers, 1);
-                    LeafChainRedo::Image(Box::new(image))
+                    LeafChainRedo::Image(Arc::clone(&image))
                 } else {
                     let view = decode_page_delta(&payload)?;
-                    if apply_page_delta(base_image, &view)? != image {
+                    if !page_delta_rebuilds(base_image, &view, &image)? {
                         return Err(Error::invariant(format!(
                             "page {leaf_id} parallel delta does not rebuild its after-image"
                         )));
@@ -3672,18 +3657,7 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
                 }
             }
         };
-        count_image_copy();
-        match &mut base {
-            Some((base_image, base_lsn, base_crc)) => {
-                **base_image = image;
-                *base_lsn = commit_lsn;
-                *base_crc = image_crc;
-            }
-            None => {
-                churn::add(ChurnCounter::PageImageBuffers, 1);
-                base = Some((Box::new(image), commit_lsn, image_crc))
-            }
-        }
+        base = Some((image, commit_lsn, image_crc));
         timing.delta_nanos = timing
             .delta_nanos
             .saturating_add(elapsed_nanos(delta_started));
@@ -3712,15 +3686,17 @@ fn count_image_copy() {
     }
 }
 
-fn count_dirty_insert<V>(dirty_pages: &BTreeMap<PageId, V>, page_id: PageId) {
+fn count_dirty_insert<V>(dirty_pages: &BTreeMap<PageId, V>, page_id: PageId, copied: bool) {
     if churn::ENABLED {
         if dirty_pages.contains_key(&page_id) {
             churn::add(ChurnCounter::DirtyPageReplaces, 1);
         } else {
             churn::add(ChurnCounter::DirtyPageInserts, 1);
         }
-        churn::add(ChurnCounter::DirtyPageBytesCopied, PAGE_SIZE as u64);
-        count_image_copy();
+        if copied {
+            churn::add(ChurnCounter::DirtyPageBytesCopied, PAGE_SIZE as u64);
+            count_image_copy();
+        }
     }
 }
 
@@ -5041,6 +5017,26 @@ fn split_internal<S: BlinkMutationState>(
 
 fn encode_blink_page(page_id: PageId, page: &BlinkPage) -> Result<[u8; PAGE_SIZE]> {
     let mut encoded = [0u8; PAGE_SIZE];
+    encode_blink_page_into(page_id, page, &mut encoded)?;
+    Ok(encoded)
+}
+
+fn encode_blink_page_arc(page_id: PageId, page: &BlinkPage) -> Result<Arc<[u8; PAGE_SIZE]>> {
+    let mut encoded = Arc::new([0u8; PAGE_SIZE]);
+    encode_blink_page_into(
+        page_id,
+        page,
+        Arc::get_mut(&mut encoded)
+            .ok_or_else(|| Error::invariant("fresh Blink page buffer is shared"))?,
+    )?;
+    Ok(encoded)
+}
+
+fn encode_blink_page_into(
+    page_id: PageId,
+    page: &BlinkPage,
+    encoded: &mut [u8; PAGE_SIZE],
+) -> Result<()> {
     {
         let body = &mut encoded[PAGE_HEADER_SIZE..];
         match page {
@@ -5076,9 +5072,8 @@ fn encode_blink_page(page_id: PageId, page: &BlinkPage) -> Result<[u8; PAGE_SIZE
     }
     finalize_encoded_page(
         PageHeader::new(page.page_type(), page_id, page.lsn()),
-        &mut encoded,
-    )?;
-    Ok(encoded)
+        encoded,
+    )
 }
 
 #[cfg(test)]
@@ -10872,6 +10867,67 @@ mod tests {
     }
 
     #[test]
+    fn page_delta_rebuild_check_matches_apply_and_compare() {
+        use crate::wal::{apply_page_delta, decode_page_delta, encode_page_delta};
+        let mut checked_equal = 0u32;
+        let mut checked_different = 0u32;
+        let mut checked_errors = 0u32;
+        for seed in 0..3_000u64 {
+            let mut state = seed ^ 0x5eed_cafe;
+            let mut base = [0u8; PAGE_SIZE];
+            base.copy_from_slice(&random_test_bytes(&mut state, PAGE_SIZE));
+            let mut target = base;
+            state = splitmix_for_test(state);
+            for _ in 0..1 + state % 30 {
+                state = splitmix_for_test(state);
+                let offset = (state >> 8) as usize % PAGE_SIZE;
+                let length = (1 + state % 12) as usize;
+                for position in offset..(offset + length).min(PAGE_SIZE) {
+                    target[position] = base[position].wrapping_add(1 + (state % 200) as u8);
+                }
+            }
+            base[16..24].copy_from_slice(&seed.to_le_bytes());
+            target[16..24].copy_from_slice(&(seed + 1).to_le_bytes());
+            let payload = encode_page_delta(PageId::new(9), &base, &target).unwrap();
+            let view = decode_page_delta(&payload).unwrap();
+            let mut candidates = vec![target];
+            state = splitmix_for_test(state);
+            let mut flipped = target;
+            flipped[(state >> 8) as usize % PAGE_SIZE] ^= 1 << (state % 8);
+            candidates.push(flipped);
+            let mut other_base = base;
+            other_base[(state >> 20) as usize % PAGE_SIZE] ^= 0x40;
+            for (base_variant, candidate) in candidates
+                .iter()
+                .map(|candidate| (&base, candidate))
+                .chain(std::iter::once((&other_base, &target)))
+            {
+                let expected =
+                    apply_page_delta(base_variant, &view).map(|rebuilt| rebuilt == *candidate);
+                let actual = page_delta_rebuilds(base_variant, &view, candidate);
+                match (expected, actual) {
+                    (Ok(expected), Ok(actual)) => {
+                        assert_eq!(expected, actual, "seed {seed}");
+                        if expected {
+                            checked_equal += 1;
+                        } else {
+                            checked_different += 1;
+                        }
+                    }
+                    (Err(expected), Err(actual)) => {
+                        assert_eq!(expected.to_string(), actual.to_string(), "seed {seed}");
+                        checked_errors += 1;
+                    }
+                    (expected, actual) => {
+                        panic!("seed {seed}: apply {expected:?}, rebuild check {actual:?}")
+                    }
+                }
+            }
+        }
+        assert!(checked_equal >= 3_000 && checked_different >= 2_000 && checked_errors > 0);
+    }
+
+    #[test]
     fn page_delta_spans_merge_only_small_unchanged_gaps() {
         use crate::wal::{PAGE_DELTA_SPAN_MERGE_GAP, decode_page_delta, encode_page_delta};
         let base = [0u8; PAGE_SIZE];
@@ -11559,7 +11615,7 @@ mod tests {
                     b0_value(key_index, round + 50),
                 )
                 .unwrap();
-            committed_images.push(store.dirty_pages[&page_id]);
+            committed_images.push(*store.dirty_pages[&page_id]);
         }
         let redo = store.wal_metrics().unwrap().unwrap().redo;
         assert!(redo.page_delta_records >= 8, "{redo:?}");
@@ -11590,7 +11646,7 @@ mod tests {
             .dirty_pages
             .iter()
             .filter(|(id, _)| **id != page_id)
-            .map(|(id, image)| (*id, *image))
+            .map(|(id, image)| (*id, **image))
             .collect::<Vec<_>>();
         let (data, wal) = store.into_files();
         let wal = wal.unwrap();
@@ -12571,7 +12627,7 @@ mod tests {
         let (mut store, _) = phase_d_store(0, 200);
         let key = b0_key(7);
         let leaf_id = leaf_of_key(&store, &key);
-        let base = store.dirty_pages[&leaf_id];
+        let base = *store.dirty_pages[&leaf_id];
         let base_lsn = blink_image_lsn(&base);
         let base_crc = crc32c::crc32c(&base);
         let wal = store.wal.as_mut().unwrap();

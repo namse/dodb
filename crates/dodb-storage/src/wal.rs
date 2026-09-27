@@ -2714,10 +2714,7 @@ pub(crate) fn decode_page_delta(payload: &[u8]) -> Result<PageDeltaView<'_>> {
     })
 }
 
-pub(crate) fn apply_page_delta(
-    base: &[u8; PAGE_SIZE],
-    delta: &PageDeltaView<'_>,
-) -> Result<[u8; PAGE_SIZE]> {
+fn check_page_delta_against_base(base: &[u8; PAGE_SIZE], delta: &PageDeltaView<'_>) -> Result<()> {
     if page_lsn_of(base) != delta.base_page_lsn {
         return Err(Error::corruption(format!(
             "WAL page delta for page {} expects base LSN {}, found {}",
@@ -2726,15 +2723,6 @@ pub(crate) fn apply_page_delta(
             page_lsn_of(base)
         )));
     }
-    if crate::churn::ENABLED {
-        crate::churn::add(crate::churn::ChurnCounter::DeltaVerifyImages, 1);
-        crate::churn::add(crate::churn::ChurnCounter::PageImageCopies, 1);
-        crate::churn::add(
-            crate::churn::ChurnCounter::PageImageBytesCopied,
-            PAGE_SIZE as u64,
-        );
-    }
-    let mut rebuilt = *base;
     for (offset, bytes) in &delta.spans {
         let original = &base[*offset..*offset + bytes.len()];
         if original[0] == bytes[0] || original[bytes.len() - 1] == bytes[bytes.len() - 1] {
@@ -2755,9 +2743,53 @@ pub(crate) fn apply_page_delta(
                 unchanged_run = 0;
             }
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_page_delta(
+    base: &[u8; PAGE_SIZE],
+    delta: &PageDeltaView<'_>,
+) -> Result<[u8; PAGE_SIZE]> {
+    check_page_delta_against_base(base, delta)?;
+    if crate::churn::ENABLED {
+        crate::churn::add(crate::churn::ChurnCounter::DeltaVerifyImages, 1);
+        crate::churn::add(crate::churn::ChurnCounter::PageImageCopies, 1);
+        crate::churn::add(
+            crate::churn::ChurnCounter::PageImageBytesCopied,
+            PAGE_SIZE as u64,
+        );
+    }
+    let mut rebuilt = *base;
+    for (offset, bytes) in &delta.spans {
         rebuilt[*offset..*offset + bytes.len()].copy_from_slice(bytes);
     }
     Ok(rebuilt)
+}
+
+pub(crate) fn page_delta_rebuilds(
+    base: &[u8; PAGE_SIZE],
+    delta: &PageDeltaView<'_>,
+    target: &[u8; PAGE_SIZE],
+) -> Result<bool> {
+    let ordered = delta
+        .spans
+        .windows(2)
+        .all(|pair| pair[0].0 + pair[0].1.len() <= pair[1].0);
+    if !ordered {
+        return Ok(apply_page_delta(base, delta)? == *target);
+    }
+    check_page_delta_against_base(base, delta)?;
+    let mut cursor = 0usize;
+    for (offset, bytes) in &delta.spans {
+        let span_end = *offset + bytes.len();
+        if base[cursor..*offset] != target[cursor..*offset] || **bytes != target[*offset..span_end]
+        {
+            return Ok(false);
+        }
+        cursor = span_end;
+    }
+    Ok(base[cursor..] == target[cursor..])
 }
 
 fn prepared_commit_payload(
