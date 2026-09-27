@@ -307,6 +307,7 @@ struct Args {
     transaction_mode: TransactionMode,
     tokio_workers: usize,
     blink_workers: usize,
+    parallel_workers: usize,
     seed: u64,
     output: PathBuf,
     window_seconds: Option<u64>,
@@ -341,6 +342,7 @@ impl Default for Args {
             tokio_workers: std::thread::available_parallelism()
                 .map_or(1, std::num::NonZeroUsize::get),
             blink_workers: 2,
+            parallel_workers: 0,
             seed: 0xd0db_2026_0000_0001,
             output: PathBuf::from(DEFAULT_OUTPUT),
             window_seconds: None,
@@ -435,6 +437,9 @@ impl Args {
                 "--tokio-workers" => {
                     args.tokio_workers = parse_usize(&take_value(&mut values, &flag), &flag)
                 }
+                "--parallel-workers" => {
+                    args.parallel_workers = parse_usize(&take_value(&mut values, &flag), &flag)
+                }
                 "--blink-workers" => {
                     args.blink_workers = parse_usize(&take_value(&mut values, &flag), &flag)
                 }
@@ -519,7 +524,7 @@ fn print_help() {
          --group-limit 64 --group-bytes 4194304 --queue-capacity 256\n\
          --collection-delay 500us --sync-mode real|injected|disabled --sync-delay 1ms\n\
          --transaction-mode unconditional|insert-if-absent\n\
-         --tokio-workers 12 --blink-workers 2 --seed 0xd0db2026 --output target/phase0/results.jsonl\n\
+         --tokio-workers 12 --blink-workers 2 --parallel-workers 0|1|2 (planned-blink leaf workers, 0 = serial) --seed 0xd0db2026 --output target/phase0/results.jsonl\n\
          --window-seconds 10 (per-window tx/s and latency, periodic WAL/RSS/dirty-page samples)"
     );
 }
@@ -1580,8 +1585,17 @@ struct MetricDelta {
     parallel_worker_nanos: u64,
     parallel_join_nanos: u64,
     parallel_fallback_groups: u64,
-    parallel_fallback_multi_leaf: u64,
-    parallel_fallback_dependency: u64,
+    parallel_job_operations: u64,
+    parallel_dispatch_nanos: u64,
+    parallel_collect_nanos: u64,
+    parallel_worker_slot_nanos: u64,
+    parallel_worker_base_nanos: u64,
+    parallel_worker_mutation_nanos: u64,
+    parallel_worker_encode_nanos: u64,
+    parallel_worker_delta_nanos: u64,
+    parallel_fallback_after_dispatch: u64,
+    parallel_fallback_no_delta_wal: u64,
+    parallel_fallback_route: u64,
     parallel_fallback_overflow: u64,
     parallel_fallback_structural: u64,
     parallel_skipped_single_leaf: u64,
@@ -2008,13 +2022,49 @@ impl MetricDelta {
                 batch_after.parallel_fallback_groups,
                 batch_before.parallel_fallback_groups,
             ),
-            parallel_fallback_multi_leaf: subtraction(
-                batch_after.parallel_fallback_multi_leaf,
-                batch_before.parallel_fallback_multi_leaf,
+            parallel_job_operations: subtraction(
+                batch_after.parallel_job_operations,
+                batch_before.parallel_job_operations,
             ),
-            parallel_fallback_dependency: subtraction(
-                batch_after.parallel_fallback_dependency,
-                batch_before.parallel_fallback_dependency,
+            parallel_dispatch_nanos: subtraction(
+                batch_after.parallel_dispatch_nanos,
+                batch_before.parallel_dispatch_nanos,
+            ),
+            parallel_collect_nanos: subtraction(
+                batch_after.parallel_collect_nanos,
+                batch_before.parallel_collect_nanos,
+            ),
+            parallel_worker_slot_nanos: subtraction(
+                batch_after.parallel_worker_slot_nanos,
+                batch_before.parallel_worker_slot_nanos,
+            ),
+            parallel_worker_base_nanos: subtraction(
+                batch_after.parallel_worker_base_nanos,
+                batch_before.parallel_worker_base_nanos,
+            ),
+            parallel_worker_mutation_nanos: subtraction(
+                batch_after.parallel_worker_mutation_nanos,
+                batch_before.parallel_worker_mutation_nanos,
+            ),
+            parallel_worker_encode_nanos: subtraction(
+                batch_after.parallel_worker_encode_nanos,
+                batch_before.parallel_worker_encode_nanos,
+            ),
+            parallel_worker_delta_nanos: subtraction(
+                batch_after.parallel_worker_delta_nanos,
+                batch_before.parallel_worker_delta_nanos,
+            ),
+            parallel_fallback_after_dispatch: subtraction(
+                batch_after.parallel_fallback_after_dispatch,
+                batch_before.parallel_fallback_after_dispatch,
+            ),
+            parallel_fallback_no_delta_wal: subtraction(
+                batch_after.parallel_fallback_no_delta_wal,
+                batch_before.parallel_fallback_no_delta_wal,
+            ),
+            parallel_fallback_route: subtraction(
+                batch_after.parallel_fallback_route,
+                batch_before.parallel_fallback_route,
             ),
             parallel_fallback_overflow: subtraction(
                 batch_after.parallel_fallback_overflow,
@@ -2727,6 +2777,9 @@ async fn open_adapter(
             for chunk in requests.chunks(64) {
                 store.apply_transaction_group(chunk)?;
             }
+            if args.parallel_workers > 0 {
+                store.enable_parallel_execution(args.parallel_workers)?;
+            }
             if CHECKPOINT_WAL_BYTES.load(Ordering::Relaxed) > 0 {
                 checkpoint_blink_store(&mut store)?;
             }
@@ -2888,6 +2941,7 @@ fn build_record(
     json.string("rust_version", &machine.rust_version);
     json.usize("tokio_workers", args.tokio_workers);
     json.usize("blink_workers", args.blink_workers);
+    json.usize("parallel_workers", args.parallel_workers);
     json.string("suite", scenario.suite.as_str());
     json.string("workload", scenario.workload);
     json.usize("writers", scenario.writers);
@@ -3248,12 +3302,45 @@ fn build_record(
         delta.parallel_fallback_groups,
     );
     json.u64(
-        "parallel_fallback_multi_leaf_delta",
-        delta.parallel_fallback_multi_leaf,
+        "parallel_job_operations_delta",
+        delta.parallel_job_operations,
     );
     json.u64(
-        "parallel_fallback_dependency_delta",
-        delta.parallel_fallback_dependency,
+        "parallel_dispatch_nanos_total",
+        delta.parallel_dispatch_nanos,
+    );
+    json.u64("parallel_collect_nanos_total", delta.parallel_collect_nanos);
+    json.u64(
+        "parallel_worker_slot_nanos_total",
+        delta.parallel_worker_slot_nanos,
+    );
+    json.u64(
+        "parallel_worker_base_nanos_total",
+        delta.parallel_worker_base_nanos,
+    );
+    json.u64(
+        "parallel_worker_mutation_nanos_total",
+        delta.parallel_worker_mutation_nanos,
+    );
+    json.u64(
+        "parallel_worker_encode_nanos_total",
+        delta.parallel_worker_encode_nanos,
+    );
+    json.u64(
+        "parallel_worker_delta_nanos_total",
+        delta.parallel_worker_delta_nanos,
+    );
+    json.u64(
+        "parallel_fallback_after_dispatch_delta",
+        delta.parallel_fallback_after_dispatch,
+    );
+    json.u64(
+        "parallel_fallback_no_delta_wal_delta",
+        delta.parallel_fallback_no_delta_wal,
+    );
+    json.u64(
+        "parallel_fallback_route_delta",
+        delta.parallel_fallback_route,
     );
     json.u64(
         "parallel_fallback_overflow_delta",
