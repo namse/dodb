@@ -32,7 +32,7 @@ const LEGACY_WAL_FORMAT_VERSION: u16 = 1;
 const LEGACY_INIT_PAYLOAD_SIZE: usize = 44;
 const INIT_PAYLOAD_SIZE: usize = 52;
 const INIT_FRAME_SIZE: usize = WAL_HEADER_SIZE + INIT_PAYLOAD_SIZE + WAL_TRAILER_SIZE;
-const PAGE_IMAGE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE;
+pub(crate) const PAGE_IMAGE_PAYLOAD_SIZE: usize = 8 + PAGE_SIZE;
 const COMMIT_PAYLOAD_SIZE: usize = 16;
 pub const PAGE_DELTA_HEADER_SIZE: usize = 18;
 pub const PAGE_DELTA_SPAN_HEADER_SIZE: usize = 4;
@@ -265,6 +265,43 @@ struct RedoPlan {
     records: Vec<Vec<PlannedRedo>>,
     chain_updates: Vec<(PageId, PageChainEntry)>,
     stats: WalRedoStats,
+}
+
+struct GroupAppendOutcome {
+    last_commit_lsn: Lsn,
+    next_lsn: Lsn,
+    next_batch_id: u64,
+    committed_batches: usize,
+    replayable_pages: usize,
+    stats: WalRedoStats,
+    chain_updates: Vec<(PageId, PageChainEntry)>,
+}
+
+/// One logical commit whose redo records were already planned and encoded by
+/// this engine's leaf workers. The WAL still checks the page chain, the LSNs
+/// and the batch identity before it writes anything.
+pub(crate) struct PreparedWalCommit<'record> {
+    pub batch_id: u64,
+    pub commit_lsn: Lsn,
+    pub records: Vec<PreparedWalRecord<'record>>,
+}
+
+pub(crate) struct PreparedWalRecord<'record> {
+    pub page_id: PageId,
+    pub page_lsn: Lsn,
+    pub image_crc: u32,
+    pub redo: PreparedWalRedo<'record>,
+}
+
+pub(crate) enum PreparedWalRedo<'record> {
+    Image(&'record [u8; PAGE_SIZE]),
+    Delta {
+        payload: &'record [u8],
+        base_lsn: Lsn,
+        base_crc: u32,
+        spans: u64,
+        changed_bytes: u64,
+    },
 }
 
 struct WalScanOutput {
@@ -894,18 +931,45 @@ impl<F: DurableFile> WalLog<F> {
             (encoded.reports, encoded.next_lsn, encoded.next_batch_id)
         };
 
+        let replayable_pages = commits
+            .iter()
+            .map(|commit| commit.pages.len())
+            .try_fold(0usize, |count, pages| count.checked_add(pages))
+            .ok_or_else(|| Error::invariant("WAL record count overflow"))?;
+        self.finish_group_append(
+            append_started,
+            &mut injector,
+            GroupAppendOutcome {
+                last_commit_lsn: commits.last().expect("non-empty WAL group").commit_lsn,
+                next_lsn,
+                next_batch_id,
+                committed_batches: commits.len(),
+                replayable_pages,
+                stats: plan.stats,
+                chain_updates: plan.chain_updates,
+            },
+        )?;
+        Ok(reports)
+    }
+
+    fn finish_group_append(
+        &mut self,
+        append_started: Instant,
+        injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
+        outcome: GroupAppendOutcome,
+    ) -> Result<()> {
         self.append_nanos = self
             .append_nanos
             .checked_add(elapsed_nanos(append_started)?)
             .ok_or_else(|| Error::invariant("WAL append timing overflow"))?;
-        hit(&mut injector, "after_group_records_written")?;
-        hit(&mut injector, "before_wal_sync")?;
-        hit(&mut injector, "during_wal_sync")?;
+        hit(injector, "after_group_records_written")?;
+        hit(injector, "before_wal_sync")?;
+        hit(injector, "during_wal_sync")?;
         let sync_started = Instant::now();
         self.file.sync_data().map_err(|error| {
             Error::durability(format!(
                 "WAL group sync failed at commit LSN {}: {error}",
-                commits.last().expect("non-empty WAL group").commit_lsn
+                outcome.last_commit_lsn
             ))
         })?;
         self.sync_nanos = self
@@ -916,39 +980,484 @@ impl<F: DurableFile> WalLog<F> {
             .sync_count
             .checked_add(1)
             .ok_or_else(|| Error::invariant("WAL sync count overflow"))?;
-        hit(&mut injector, "after_wal_sync")?;
+        hit(injector, "after_wal_sync")?;
 
-        self.last_commit_lsn = Some(commits.last().expect("non-empty WAL group").commit_lsn);
-        self.next_lsn = next_lsn;
-        self.next_batch_id = next_batch_id;
-        let record_count = commits.iter().try_fold(0usize, |count, commit| {
-            count
-                .checked_add(commit.pages.len() + 1)
-                .ok_or_else(|| Error::invariant("WAL record count overflow"))
-        })?;
+        self.last_commit_lsn = Some(outcome.last_commit_lsn);
+        self.next_lsn = outcome.next_lsn;
+        self.next_batch_id = outcome.next_batch_id;
+        let record_count = outcome
+            .replayable_pages
+            .checked_add(outcome.committed_batches)
+            .ok_or_else(|| Error::invariant("WAL record count overflow"))?;
         self.scan_report.records_scanned = self
             .scan_report
             .records_scanned
             .checked_add(record_count)
             .ok_or_else(|| Error::invariant("WAL record count overflow"))?;
-        self.scan_report.committed_batches += commits.len();
-        self.scan_report.replayable_pages += commits
-            .iter()
-            .map(|commit| commit.pages.len())
-            .sum::<usize>();
+        self.scan_report.committed_batches += outcome.committed_batches;
+        self.scan_report.replayable_pages += outcome.replayable_pages;
         self.page_images = self
             .page_images
             .checked_add(
-                usize::try_from(plan.stats.page_image_records)
+                usize::try_from(outcome.stats.page_image_records)
                     .map_err(|_| Error::invariant("WAL page-image count overflow"))?,
             )
             .ok_or_else(|| Error::invariant("WAL page-image count overflow"))?;
-        for (page_id, entry) in plan.chain_updates {
+        for (page_id, entry) in outcome.chain_updates {
             self.page_chain.insert(page_id, entry);
         }
-        self.redo_stats.add(&plan.stats);
+        self.redo_stats.add(&outcome.stats);
+        Ok(())
+    }
 
+    /// Appends commits whose page redo records were prepared outside the WAL
+    /// (image or page delta, with the image CRC of every after-image). The
+    /// chain check below uses the same rule as `plan_redo`: a delta must name
+    /// the LSN and CRC of the latest committed image of its page.
+    pub(crate) fn append_group_prepared(
+        &mut self,
+        commits: &[PreparedWalCommit<'_>],
+        mut injector: Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<Vec<WalAppendReport>> {
+        if commits.is_empty() {
+            return Err(Error::invalid_input("a WAL group must contain a commit"));
+        }
+        if !self.page_delta_enabled() {
+            return Err(Error::invariant(
+                "prepared page redo needs a page-delta WAL",
+            ));
+        }
+        let append_started = Instant::now();
+        hit(&mut injector, "before_wal_append")?;
+        let plan_started = Instant::now();
+        let strict = injector.is_some() || cfg!(debug_assertions);
+        let (chain_updates, stats) = self.check_prepared_chain(commits, strict)?;
+        let plan_nanos = elapsed_nanos(plan_started)?;
+        self.redo_plan_nanos = self.redo_plan_nanos.saturating_add(plan_nanos);
+        self.group_encode_nanos = self
+            .group_encode_nanos
+            .checked_add(plan_nanos)
+            .ok_or_else(|| Error::invariant("WAL group-encode timing overflow"))?;
+        let (reports, next_lsn, next_batch_id) = if injector.is_some() {
+            self.append_prepared_fault_injectable(commits, &mut injector)?
+        } else {
+            let encode_started = Instant::now();
+            let encoded = self.encode_prepared_group(commits)?;
+            self.group_encode_nanos = self
+                .group_encode_nanos
+                .checked_add(elapsed_nanos(encode_started)?)
+                .ok_or_else(|| Error::invariant("WAL group-encode timing overflow"))?;
+            self.add_attribution(&encoded.attribution)?;
+            let write_started = Instant::now();
+            let write_result = (|| {
+                let offset = self.file.len()?;
+                write_all_at_counted(
+                    &mut self.file,
+                    offset,
+                    &encoded.bytes,
+                    &mut self.physical_write_calls,
+                )
+            })();
+            self.group_write_nanos = self
+                .group_write_nanos
+                .checked_add(elapsed_nanos(write_started)?)
+                .ok_or_else(|| Error::invariant("WAL group-write timing overflow"))?;
+            write_result?;
+            (encoded.reports, encoded.next_lsn, encoded.next_batch_id)
+        };
+        let replayable_pages = commits
+            .iter()
+            .map(|commit| commit.records.len())
+            .try_fold(0usize, |count, records| count.checked_add(records))
+            .ok_or_else(|| Error::invariant("WAL record count overflow"))?;
+        self.finish_group_append(
+            append_started,
+            &mut injector,
+            GroupAppendOutcome {
+                last_commit_lsn: commits.last().expect("non-empty WAL group").commit_lsn,
+                next_lsn,
+                next_batch_id,
+                committed_batches: commits.len(),
+                replayable_pages,
+                stats,
+                chain_updates,
+            },
+        )?;
         Ok(reports)
+    }
+
+    fn check_prepared_chain(
+        &self,
+        commits: &[PreparedWalCommit<'_>],
+        strict: bool,
+    ) -> Result<(Vec<(PageId, PageChainEntry)>, WalRedoStats)> {
+        let mut group_chain: HashMap<PageId, PageChainEntry> = HashMap::new();
+        let mut chain_updates = Vec::new();
+        let mut stats = WalRedoStats::default();
+        let mut next_lsn = self.next_lsn;
+        let mut next_batch_id = self.next_batch_id;
+        for commit in commits {
+            if commit.records.is_empty() {
+                return Err(Error::invalid_input(
+                    "a WAL commit must contain at least one page image",
+                ));
+            }
+            if commit.batch_id != next_batch_id {
+                return Err(Error::invariant(format!(
+                    "WAL batch id {}, expected {}",
+                    commit.batch_id, next_batch_id
+                )));
+            }
+            let expected_commit_lsn = next_lsn
+                .get()
+                .checked_add(commit.records.len() as u64)
+                .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
+            if commit.commit_lsn.get() != expected_commit_lsn {
+                return Err(Error::invariant(format!(
+                    "WAL commit LSN {}, expected {}",
+                    commit.commit_lsn.get(),
+                    expected_commit_lsn
+                )));
+            }
+            let mut previous_page_id = None;
+            for record in &commit.records {
+                if is_superblock_page(record.page_id) {
+                    return Err(Error::invariant(
+                        "prepared page redo cannot carry a superblock",
+                    ));
+                }
+                if previous_page_id.is_some_and(|previous| previous >= record.page_id) {
+                    return Err(Error::invariant(
+                        "prepared page redo records are not in page order",
+                    ));
+                }
+                previous_page_id = Some(record.page_id);
+                if record.page_lsn != commit.commit_lsn {
+                    return Err(Error::corruption(format!(
+                        "WAL page {} has page LSN {}, commit LSN {}",
+                        record.page_id, record.page_lsn, commit.commit_lsn
+                    )));
+                }
+                let known = group_chain
+                    .get(&record.page_id)
+                    .or_else(|| self.page_chain.get(&record.page_id))
+                    .copied();
+                match &record.redo {
+                    PreparedWalRedo::Image(image) => {
+                        if page_lsn_of(image) != record.page_lsn {
+                            return Err(Error::corruption(format!(
+                                "WAL page {} image LSN does not match its record",
+                                record.page_id
+                            )));
+                        }
+                        if strict {
+                            crate::blink::validate_blink_page_image(&image[..], record.page_id)?;
+                            if crc32c::crc32c(&image[..]) != record.image_crc {
+                                return Err(Error::invariant(format!(
+                                    "WAL page {} image CRC does not match its record",
+                                    record.page_id
+                                )));
+                            }
+                        }
+                        if known.is_some() {
+                            stats.image_not_smaller += 1;
+                        } else {
+                            stats.image_first_touch += 1;
+                        }
+                        stats.page_image_records += 1;
+                    }
+                    PreparedWalRedo::Delta {
+                        payload,
+                        base_lsn,
+                        base_crc,
+                        spans,
+                        changed_bytes,
+                    } => {
+                        if payload.len() < PAGE_DELTA_HEADER_SIZE
+                            || payload.len() >= PAGE_IMAGE_PAYLOAD_SIZE
+                        {
+                            return Err(Error::invariant(format!(
+                                "page {} prepared delta has {} bytes",
+                                record.page_id,
+                                payload.len()
+                            )));
+                        }
+                        let payload_page_id =
+                            PageId::new(u64::from_le_bytes(payload[0..8].try_into().unwrap()));
+                        let payload_base_lsn =
+                            Lsn::new(u64::from_le_bytes(payload[8..16].try_into().unwrap()));
+                        if payload_page_id != record.page_id || payload_base_lsn != *base_lsn {
+                            return Err(Error::invariant(format!(
+                                "page {} prepared delta header does not match its record",
+                                record.page_id
+                            )));
+                        }
+                        match known {
+                            Some(entry)
+                                if entry.page_lsn == *base_lsn && entry.image_crc == *base_crc => {}
+                            Some(entry) => {
+                                return Err(Error::invariant(format!(
+                                    "page {} delta base does not match the WAL page chain (chain LSN {}, base LSN {})",
+                                    record.page_id, entry.page_lsn, base_lsn
+                                )));
+                            }
+                            None => {
+                                return Err(Error::invariant(format!(
+                                    "page {} delta has no WAL page-chain base",
+                                    record.page_id
+                                )));
+                            }
+                        }
+                        if strict {
+                            let view = decode_page_delta(payload)?;
+                            if view.spans.len() as u64 != *spans
+                                || view.changed_bytes() as u64 != *changed_bytes
+                            {
+                                return Err(Error::invariant(format!(
+                                    "page {} prepared delta counters do not match its payload",
+                                    record.page_id
+                                )));
+                            }
+                        }
+                        stats.page_delta_records += 1;
+                        stats.page_delta_payload_bytes += payload.len() as u64;
+                        stats.page_delta_spans += *spans;
+                        stats.page_delta_changed_bytes += *changed_bytes;
+                    }
+                }
+                let entry = PageChainEntry {
+                    page_lsn: record.page_lsn,
+                    image_crc: record.image_crc,
+                };
+                group_chain.insert(record.page_id, entry);
+                chain_updates.push((record.page_id, entry));
+            }
+            next_lsn = Lsn::new(
+                expected_commit_lsn
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            );
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
+        }
+        Ok((chain_updates, stats))
+    }
+
+    fn encode_prepared_group(&self, commits: &[PreparedWalCommit<'_>]) -> Result<EncodedWalGroup> {
+        let mut attribution = WalEncodeAttribution::default();
+        let mut capacity = 0usize;
+        for commit in commits {
+            for record in &commit.records {
+                let payload_length = match &record.redo {
+                    PreparedWalRedo::Image(_) => PAGE_IMAGE_PAYLOAD_SIZE,
+                    PreparedWalRedo::Delta { payload, .. } => payload.len(),
+                };
+                capacity = capacity
+                    .checked_add(payload_length + WAL_HEADER_SIZE + WAL_TRAILER_SIZE)
+                    .ok_or_else(|| Error::invalid_input("WAL group size overflows"))?;
+            }
+            capacity = capacity
+                .checked_add(WAL_HEADER_SIZE + COMMIT_PAYLOAD_SIZE + WAL_TRAILER_SIZE)
+                .ok_or_else(|| Error::invalid_input("WAL group size overflows"))?;
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve(capacity)
+            .map_err(|_| Error::invalid_input("WAL group buffer is too large"))?;
+        let mut reports = Vec::with_capacity(commits.len());
+        let mut next_lsn = self.next_lsn;
+        let mut next_batch_id = self.next_batch_id;
+        for commit in commits {
+            let first_record_lsn = next_lsn;
+            let mut bytes_written = 0usize;
+            let mut digest = 0u32;
+            for (record_position, record) in commit.records.iter().enumerate() {
+                let page_id_bytes = record.page_id.get().to_le_bytes();
+                let record_index = u32::try_from(record_position)
+                    .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
+                let (record_type, payload_parts): (WalRecordType, [&[u8]; 2]) = match &record.redo {
+                    PreparedWalRedo::Image(image) => {
+                        (WalRecordType::PageImage, [&page_id_bytes, &image[..]])
+                    }
+                    PreparedWalRedo::Delta { payload, .. } => {
+                        (WalRecordType::PageDelta, [payload, &[]])
+                    }
+                };
+                let payload_crc_started = Instant::now();
+                let payload_checksum = crc32c::crc32c(payload_parts[0]);
+                let payload_checksum = crc32c::crc32c_append(payload_checksum, payload_parts[1]);
+                attribution.group_page_payload_crc_nanos += elapsed_nanos(payload_crc_started)?;
+                let digest_started = Instant::now();
+                digest = update_record_digest(
+                    digest,
+                    self.format_version,
+                    record_type,
+                    record_index,
+                    &payload_parts,
+                );
+                attribution.group_commit_digest_crc_nanos += elapsed_nanos(digest_started)?;
+                let record_lsn = first_record_lsn
+                    .get()
+                    .checked_add(record_position as u64)
+                    .map(Lsn::new)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?;
+                let frame_length = append_frame_parts_direct(
+                    &mut bytes,
+                    self.format_version,
+                    record_type,
+                    record_lsn,
+                    commit.batch_id,
+                    record_index,
+                    payload_parts[0].len() + payload_parts[1].len(),
+                    payload_checksum,
+                    &payload_parts,
+                    &mut attribution,
+                )?;
+                bytes_written = bytes_written
+                    .checked_add(frame_length)
+                    .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+                attribution.group_page_frames += 1;
+            }
+            let commit_payload =
+                prepared_commit_payload(first_record_lsn, commit.records.len(), digest)?;
+            let commit_record_index = u32::try_from(commit.records.len())
+                .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
+            let commit_frame_length = append_frame_direct(
+                &mut bytes,
+                self.format_version,
+                WalRecordType::Commit,
+                commit.commit_lsn,
+                commit.batch_id,
+                commit_record_index,
+                &commit_payload,
+                &mut attribution,
+            )?;
+            bytes_written = bytes_written
+                .checked_add(commit_frame_length)
+                .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+            attribution.group_commit_frames += 1;
+            reports.push(WalAppendReport {
+                first_record_lsn,
+                commit_lsn: commit.commit_lsn,
+                page_count: commit.records.len(),
+                bytes_written,
+            });
+            next_lsn = Lsn::new(
+                commit
+                    .commit_lsn
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            );
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
+        }
+        Ok(EncodedWalGroup {
+            bytes,
+            reports,
+            next_lsn,
+            next_batch_id,
+            attribution,
+        })
+    }
+
+    fn append_prepared_fault_injectable(
+        &mut self,
+        commits: &[PreparedWalCommit<'_>],
+        injector: &mut Option<&mut (dyn FaultInjector + Send + '_)>,
+    ) -> Result<(Vec<WalAppendReport>, Lsn, u64)> {
+        let mut next_lsn = self.next_lsn;
+        let mut next_batch_id = self.next_batch_id;
+        let mut reports = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let first_record_lsn = next_lsn;
+            let mut digest = 0u32;
+            let mut bytes_written = 0usize;
+            for (record_position, record) in commit.records.iter().enumerate() {
+                let (record_type, payload) = match &record.redo {
+                    PreparedWalRedo::Image(image) => {
+                        let mut payload = Vec::with_capacity(PAGE_IMAGE_PAYLOAD_SIZE);
+                        payload.extend_from_slice(&record.page_id.get().to_le_bytes());
+                        payload.extend_from_slice(&image[..]);
+                        (WalRecordType::PageImage, payload)
+                    }
+                    PreparedWalRedo::Delta { payload, .. } => {
+                        (WalRecordType::PageDelta, payload.to_vec())
+                    }
+                };
+                let record_index = u32::try_from(record_position)
+                    .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?;
+                digest = update_record_digest(
+                    digest,
+                    self.format_version,
+                    record_type,
+                    record_index,
+                    &[&payload],
+                );
+                let record_lsn = Lsn::new(
+                    first_record_lsn
+                        .get()
+                        .checked_add(record_position as u64)
+                        .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+                );
+                bytes_written = bytes_written
+                    .checked_add(self.append_frame(
+                        record_type,
+                        record_lsn,
+                        commit.batch_id,
+                        record_index,
+                        &payload,
+                        &mut *injector,
+                    )?)
+                    .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+                if record_type == WalRecordType::PageDelta {
+                    hit(&mut *injector, "after_page_delta_record")?;
+                }
+            }
+            hit(&mut *injector, "after_page_images_written")?;
+            let commit_payload =
+                prepared_commit_payload(first_record_lsn, commit.records.len(), digest)?;
+            hit(&mut *injector, "before_commit_record")?;
+            bytes_written = bytes_written
+                .checked_add(
+                    self.append_frame(
+                        WalRecordType::Commit,
+                        commit.commit_lsn,
+                        commit.batch_id,
+                        u32::try_from(commit.records.len())
+                            .map_err(|_| Error::invalid_input("WAL record index overflows u32"))?,
+                        &commit_payload,
+                        &mut *injector,
+                    )?,
+                )
+                .ok_or_else(|| Error::invariant("WAL byte count overflow"))?;
+            hit(&mut *injector, "after_commit_record_write")?;
+            reports.push(WalAppendReport {
+                first_record_lsn,
+                commit_lsn: commit.commit_lsn,
+                page_count: commit.records.len(),
+                bytes_written,
+            });
+            next_lsn = Lsn::new(
+                commit
+                    .commit_lsn
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("WAL LSN exhausted"))?,
+            );
+            next_batch_id = next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("WAL batch id exhausted"))?;
+        }
+        Ok((reports, next_lsn, next_batch_id))
+    }
+
+    pub(crate) fn page_chain_entry(&self, page_id: PageId) -> Option<(Lsn, u32)> {
+        self.page_chain
+            .get(&page_id)
+            .map(|entry| (entry.page_lsn, entry.image_crc))
     }
 
     fn plan_redo(
@@ -2234,6 +2743,22 @@ pub(crate) fn apply_page_delta(
         rebuilt[*offset..*offset + bytes.len()].copy_from_slice(bytes);
     }
     Ok(rebuilt)
+}
+
+fn prepared_commit_payload(
+    first_record_lsn: Lsn,
+    record_count: usize,
+    digest: u32,
+) -> Result<[u8; COMMIT_PAYLOAD_SIZE]> {
+    let mut commit_payload = [0u8; COMMIT_PAYLOAD_SIZE];
+    commit_payload[0..8].copy_from_slice(&first_record_lsn.get().to_le_bytes());
+    commit_payload[8..12].copy_from_slice(
+        &u32::try_from(record_count)
+            .map_err(|_| Error::invalid_input("WAL page count does not fit u32"))?
+            .to_le_bytes(),
+    );
+    commit_payload[12..16].copy_from_slice(&digest.to_le_bytes());
+    Ok(commit_payload)
 }
 
 fn update_record_digest(

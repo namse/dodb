@@ -33,8 +33,9 @@ use crate::page::{
     PAGE_HEADER_SIZE, PAGE_SIZE, PageHeader, PageType, decode_page_at, finalize_encoded_page,
 };
 use crate::wal::{
+    PAGE_IMAGE_PAYLOAD_SIZE, PreparedWalCommit, PreparedWalRecord, PreparedWalRedo,
     RecoveredWalPage, WalCommit, WalDeltaRequest, WalIdentity, WalLog, WalMetrics, WalPageImage,
-    WalPageImageFormat,
+    WalPageImageFormat, apply_page_delta, decode_page_delta, encode_page_delta,
 };
 
 const FIRST_DATA_PAGE: u64 = 2;
@@ -203,9 +204,18 @@ pub struct BlinkBatchMetrics {
     pub parallel_worker_dispatches: u64,
     pub parallel_worker_nanos: u64,
     pub parallel_join_nanos: u64,
+    pub parallel_job_operations: u64,
+    pub parallel_dispatch_nanos: u64,
+    pub parallel_collect_nanos: u64,
+    pub parallel_worker_slot_nanos: u64,
+    pub parallel_worker_base_nanos: u64,
+    pub parallel_worker_mutation_nanos: u64,
+    pub parallel_worker_encode_nanos: u64,
+    pub parallel_worker_delta_nanos: u64,
     pub parallel_fallback_groups: u64,
-    pub parallel_fallback_multi_leaf: u64,
-    pub parallel_fallback_dependency: u64,
+    pub parallel_fallback_after_dispatch: u64,
+    pub parallel_fallback_no_delta_wal: u64,
+    pub parallel_fallback_route: u64,
     pub parallel_fallback_overflow: u64,
     pub parallel_fallback_structural: u64,
     pub parallel_skipped_single_leaf: u64,
@@ -1110,31 +1120,84 @@ struct ExecutedPlanTransaction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParallelFallbackReason {
-    MultiLeafTransaction,
-    CrossLeafDependency,
+    NoPageDeltaWal,
+    RouteMismatch,
     OverflowOrAllocator,
     Structural,
 }
 
-struct ParallelLeafBoundary {
-    fifo_position: usize,
-    page_image: [u8; PAGE_SIZE],
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParallelWorkerFault {
+    Error { leaf_group_index: usize },
+    Panic { leaf_group_index: usize },
 }
 
-struct ParallelLeafJobResult {
+/// All physical work of one leaf in one WAL group: the mutations of every
+/// transaction that routes to this leaf, in transaction FIFO order.
+struct LeafChainJob {
     leaf_id: PageId,
-    boundaries: Vec<ParallelLeafBoundary>,
-    final_page: BlinkPage,
+    initial_page: BlinkPage,
+    base_image: Option<Box<[u8; PAGE_SIZE]>>,
+    chain_entry: Option<(Lsn, u32)>,
+    steps: Vec<(u32, u32)>,
+    plan: Arc<BatchPlan>,
+    commit_lsns: Arc<[Lsn]>,
+    #[cfg(test)]
+    fault: Option<ParallelWorkerFault>,
 }
 
-enum ParallelLeafJobOutcome {
-    Prepared(ParallelLeafJobResult),
+enum LeafChainRedo {
+    Image(Box<[u8; PAGE_SIZE]>),
+    Delta {
+        payload: Vec<u8>,
+        base_lsn: Lsn,
+        base_crc: u32,
+        spans: u64,
+        changed_bytes: u64,
+    },
+}
+
+struct LeafChainBoundary {
+    transaction_index: usize,
+    commit_lsn: Lsn,
+    image_crc: u32,
+    redo: LeafChainRedo,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LeafChainTiming {
+    base_nanos: u64,
+    mutation_nanos: u64,
+    encode_nanos: u64,
+    delta_nanos: u64,
+}
+
+struct LeafChainResult {
+    leaf_id: PageId,
+    boundaries: Vec<LeafChainBoundary>,
+    final_page: BlinkPage,
+    final_image: Box<[u8; PAGE_SIZE]>,
+    timing: LeafChainTiming,
+}
+
+enum LeafChainOutcome {
+    Prepared(LeafChainResult),
     Fallback { reason: ParallelFallbackReason },
+}
+
+/// Worker output kept by the coordinator until the WAL append. Each
+/// transaction lists its records as (result index, boundary index) in page
+/// order, the same order the serial executor writes its dirty pages.
+struct LeafParallelRedo {
+    results: Vec<LeafChainResult>,
+    transaction_records: Vec<Vec<(u32, u32)>>,
 }
 
 struct PlannedExecutionPreparation<'a> {
     working: WorkingBlinkState<'a>,
     executed: Vec<ExecutedPlanTransaction>,
+    parallel_redo: Option<LeafParallelRedo>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1164,6 +1227,8 @@ pub struct BlinkStore<F: DurableFile, W: DurableFile = crate::btree::NoWal> {
     planned_execution: bool,
     parallel_workers: usize,
     parallel_worker_pool: Option<ParallelWorkerPool>,
+    #[cfg(test)]
+    parallel_worker_fault: Option<ParallelWorkerFault>,
     broken: Option<String>,
     fault_injector: Option<Box<dyn FaultInjector + Send>>,
 }
@@ -1291,6 +1356,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             planned_execution: false,
             parallel_workers: 1,
             parallel_worker_pool: None,
+            #[cfg(test)]
+            parallel_worker_fault: None,
             broken: None,
             fault_injector: None,
         })
@@ -1360,6 +1427,8 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             planned_execution: false,
             parallel_workers: 1,
             parallel_worker_pool: None,
+            #[cfg(test)]
+            parallel_worker_fault: None,
             broken: None,
             fault_injector: None,
         };
@@ -1912,7 +1981,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         }
 
         let planning_started = Instant::now();
-        let plan = plan_batch(&self.state, &admitted, &mut self.batch_metrics)?;
+        let plan = Arc::new(plan_batch(&self.state, &admitted, &mut self.batch_metrics)?);
         self.batch_metrics.planning_nanos = self
             .batch_metrics
             .planning_nanos
@@ -1924,22 +1993,24 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .as_ref()
             .map_or(self.next_batch_id, WalLog::next_batch_id);
         let physical_started = Instant::now();
-        let parallel_preparation = if self.parallel_workers >= 2 {
-            prepare_parallel_execution(
+        let parallel_preparation = match self.parallel_worker_pool.as_ref() {
+            Some(worker_pool) => prepare_leaf_parallel_execution(
                 &self.state,
                 &plan,
-                self.parallel_worker_pool.as_ref().ok_or_else(|| {
-                    Error::invariant("parallel Blink worker pool is not initialized")
-                })?,
+                worker_pool,
+                self.wal.as_ref(),
+                &self.dirty_pages,
                 &self.current_superblock,
                 self.active_slot,
                 current_next_lsn,
                 current_next_batch_id,
                 self.publisher.can_reuse_pages(),
                 &mut self.batch_metrics,
-            )?
-        } else {
-            None
+                &mut self.fault_injector,
+                #[cfg(test)]
+                self.parallel_worker_fault,
+            )?,
+            None => None,
         };
         let preparation = match parallel_preparation {
             Some(preparation) => preparation,
@@ -1955,7 +2026,11 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 &mut self.batch_metrics,
             )?,
         };
-        let PlannedExecutionPreparation { working, executed } = preparation;
+        let PlannedExecutionPreparation {
+            working,
+            executed,
+            parallel_redo,
+        } = preparation;
         self.batch_metrics.physical_execution_nanos = self
             .batch_metrics
             .physical_execution_nanos
@@ -2032,7 +2107,66 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .wal_assembly_nanos
             .saturating_add(elapsed_nanos(wal_assembly_started));
         let delta = working.into_delta();
-        if let Some(wal) = self.wal.as_mut() {
+        if let Some(parallel_redo) = &parallel_redo {
+            let wal = self
+                .wal
+                .as_mut()
+                .ok_or_else(|| Error::invariant("parallel Blink redo needs a WAL"))?;
+            let prepared_assembly_started = Instant::now();
+            let prepared_commits = executed
+                .iter()
+                .zip(&parallel_redo.transaction_records)
+                .map(|(transaction, records)| PreparedWalCommit {
+                    batch_id: transaction.batch_id,
+                    commit_lsn: transaction.result.commit_lsn,
+                    records: records
+                        .iter()
+                        .map(|(result_index, boundary_index)| {
+                            let result = &parallel_redo.results[*result_index as usize];
+                            let boundary = &result.boundaries[*boundary_index as usize];
+                            PreparedWalRecord {
+                                page_id: result.leaf_id,
+                                page_lsn: boundary.commit_lsn,
+                                image_crc: boundary.image_crc,
+                                redo: match &boundary.redo {
+                                    LeafChainRedo::Image(image) => PreparedWalRedo::Image(image),
+                                    LeafChainRedo::Delta {
+                                        payload,
+                                        base_lsn,
+                                        base_crc,
+                                        spans,
+                                        changed_bytes,
+                                    } => PreparedWalRedo::Delta {
+                                        payload,
+                                        base_lsn: *base_lsn,
+                                        base_crc: *base_crc,
+                                        spans: *spans,
+                                        changed_bytes: *changed_bytes,
+                                    },
+                                },
+                            }
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            self.batch_metrics.wal_assembly_nanos = self
+                .batch_metrics
+                .wal_assembly_nanos
+                .saturating_add(elapsed_nanos(prepared_assembly_started));
+            let reports = match wal
+                .append_group_prepared(&prepared_commits, self.fault_injector.as_deref_mut())
+            {
+                Ok(reports) => reports,
+                Err(error) => {
+                    self.broken = Some(error.to_string());
+                    return Err(error);
+                }
+            };
+            wal_bytes = reports
+                .iter()
+                .map(|report| report.bytes_written as u64)
+                .sum();
+        } else if let Some(wal) = self.wal.as_mut() {
             let eligible_commits = executed
                 .iter()
                 .map(|transaction| !transaction.superblock_image_emitted)
@@ -2076,6 +2210,12 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             self.file.sync_data()?;
         }
 
+        if let Some(injector) = self.fault_injector.as_deref_mut()
+            && let Err(error) = injector.hit("before_generation_publication")
+        {
+            self.broken = Some(error.to_string());
+            return Err(error);
+        }
         for transaction in &executed {
             if transaction.superblock_image_emitted {
                 self.batch_metrics.superblock_images_emitted = self
@@ -2148,6 +2288,11 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .retired_generation_drop_nanos
             .saturating_add(publish_timing.retired_generation_drop_nanos);
         let dirty_tracking_started = Instant::now();
+        if let Some(parallel_redo) = &parallel_redo {
+            for result in &parallel_redo.results {
+                self.dirty_pages.insert(result.leaf_id, *result.final_image);
+            }
+        }
         self.dirty_pages.extend(
             final_images
                 .iter()
@@ -2164,20 +2309,33 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .batch_metrics
             .dirty_tracking_nanos
             .saturating_add(elapsed_nanos(dirty_tracking_started));
+        let final_page_count = final_images.len() as u64
+            + parallel_redo
+                .as_ref()
+                .map_or(0, |parallel_redo| parallel_redo.results.len() as u64);
+        let redo_record_count = executed
+            .iter()
+            .map(|transaction| transaction.images.len() as u64)
+            .sum::<u64>()
+            + parallel_redo.as_ref().map_or(0, |parallel_redo| {
+                parallel_redo
+                    .transaction_records
+                    .iter()
+                    .map(|records| records.len() as u64)
+                    .sum::<u64>()
+            });
         self.split_metrics.pages_touched = self
             .split_metrics
             .pages_touched
-            .saturating_add(final_images.len() as u64);
+            .saturating_add(final_page_count);
         self.split_metrics.page_images = self
             .split_metrics
             .page_images
-            .saturating_add(final_images.len() as u64);
-        self.batch_metrics.page_images = self.batch_metrics.page_images.saturating_add(
-            executed
-                .iter()
-                .map(|transaction| transaction.images.len() as u64)
-                .sum(),
-        );
+            .saturating_add(final_page_count);
+        self.batch_metrics.page_images = self
+            .batch_metrics
+            .page_images
+            .saturating_add(redo_record_count);
         self.batch_metrics.wal_bytes = self.batch_metrics.wal_bytes.saturating_add(wal_bytes);
         self.storage_metrics.btree_preparation_nanos = self
             .storage_metrics
@@ -2676,13 +2834,12 @@ fn plan_batch(
 fn record_parallel_fallback(metrics: &mut BlinkBatchMetrics, reason: ParallelFallbackReason) {
     metrics.parallel_fallback_groups = metrics.parallel_fallback_groups.saturating_add(1);
     match reason {
-        ParallelFallbackReason::MultiLeafTransaction => {
-            metrics.parallel_fallback_multi_leaf =
-                metrics.parallel_fallback_multi_leaf.saturating_add(1);
+        ParallelFallbackReason::NoPageDeltaWal => {
+            metrics.parallel_fallback_no_delta_wal =
+                metrics.parallel_fallback_no_delta_wal.saturating_add(1);
         }
-        ParallelFallbackReason::CrossLeafDependency => {
-            metrics.parallel_fallback_dependency =
-                metrics.parallel_fallback_dependency.saturating_add(1);
+        ParallelFallbackReason::RouteMismatch => {
+            metrics.parallel_fallback_route = metrics.parallel_fallback_route.saturating_add(1);
         }
         ParallelFallbackReason::OverflowOrAllocator => {
             metrics.parallel_fallback_overflow =
@@ -2693,12 +2850,6 @@ fn record_parallel_fallback(metrics: &mut BlinkBatchMetrics, reason: ParallelFal
                 metrics.parallel_fallback_structural.saturating_add(1);
         }
     }
-}
-
-struct ParallelLeafJob {
-    leaf_id: PageId,
-    initial_page: BlinkPage,
-    steps: Vec<(usize, usize, PlannedMutation, Lsn)>,
 }
 
 struct ParallelWorkerPool {
@@ -2712,7 +2863,7 @@ struct ParallelWorkerSlot {
 
 enum ParallelWorkerCommand {
     Execute {
-        jobs: Vec<ParallelLeafJob>,
+        jobs: Vec<LeafChainJob>,
         results: Sender<ParallelWorkerResult>,
     },
     Shutdown,
@@ -2721,13 +2872,13 @@ enum ParallelWorkerCommand {
 struct ParallelWorkerResult {
     worker_index: usize,
     thread_id: ThreadId,
-    outcomes: Vec<Result<ParallelLeafJobOutcome>>,
+    outcomes: Vec<Result<LeafChainOutcome>>,
     worker_panicked: bool,
     busy_nanos: u64,
 }
 
 struct ParallelWorkerRun {
-    outcomes: Vec<ParallelLeafJobOutcome>,
+    outcomes: Vec<LeafChainOutcome>,
     worker_nanos: u64,
     join_nanos: u64,
     worker_dispatches: u64,
@@ -2757,7 +2908,7 @@ impl ParallelWorkerPool {
         Ok(Self { workers })
     }
 
-    fn execute(&self, worker_buckets: Vec<Vec<ParallelLeafJob>>) -> Result<ParallelWorkerRun> {
+    fn execute(&self, worker_buckets: Vec<Vec<LeafChainJob>>) -> Result<ParallelWorkerRun> {
         if worker_buckets.len() > self.workers.len() {
             return Err(Error::invariant(
                 "parallel job partition exceeds persistent worker pool",
@@ -2871,9 +3022,7 @@ fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerCo
                 let busy_started = Instant::now();
                 let job_count = jobs.len();
                 let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    jobs.into_iter()
-                        .map(run_parallel_leaf_job)
-                        .collect::<Vec<_>>()
+                    jobs.into_iter().map(run_leaf_chain_job).collect::<Vec<_>>()
                 }));
                 let busy_nanos = elapsed_nanos(busy_started);
                 let (outcomes, worker_panicked) = match executed {
@@ -2892,64 +3041,99 @@ fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerCo
     }
 }
 
-fn prepare_parallel_execution<'a>(
+/// Leaf-partitioned physical execution of a whole WAL group. It runs only when
+/// every transaction is an in-place change of leaves the planner already
+/// routed, so each transaction writes exactly one redo record per touched leaf
+/// and its commit LSN is known before any worker starts. Any other shape falls
+/// back to the serial executor before anything reaches the WAL.
+#[allow(clippy::too_many_arguments)]
+fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     state: &'a BlinkState,
-    plan: &BatchPlan,
+    plan: &Arc<BatchPlan>,
     worker_pool: &ParallelWorkerPool,
+    wal: Option<&WalLog<W>>,
+    dirty_pages: &BTreeMap<PageId, [u8; PAGE_SIZE]>,
     current_superblock: &BlinkSuperblock,
     active_slot: SuperblockSlot,
     starting_lsn: Lsn,
     starting_batch_id: u64,
     allow_page_reuse: bool,
     metrics: &mut BlinkBatchMetrics,
+    fault_injector: &mut Option<Box<dyn FaultInjector + Send>>,
+    #[cfg(test)] worker_fault: Option<ParallelWorkerFault>,
 ) -> Result<Option<PlannedExecutionPreparation<'a>>> {
     if plan.leaf_groups.len() <= 1 {
         metrics.parallel_skipped_single_leaf =
             metrics.parallel_skipped_single_leaf.saturating_add(1);
         return Ok(None);
     }
-
-    let mut transaction_groups = BTreeMap::<usize, BTreeSet<usize>>::new();
-    for (leaf_group_index, leaf_group) in plan.leaf_groups.iter().enumerate() {
-        for (fifo_position, _) in &leaf_group.mutations {
-            transaction_groups
-                .entry(*fifo_position)
-                .or_default()
-                .insert(leaf_group_index);
-        }
+    let Some(wal) = wal.filter(|wal| wal.page_delta_enabled()) else {
+        record_parallel_fallback(metrics, ParallelFallbackReason::NoPageDeltaWal);
+        return Ok(None);
+    };
+    let dispatch_started = Instant::now();
+    let transaction_count = plan.transactions.len();
+    let fifo_limit = plan
+        .transactions
+        .iter()
+        .map(|transaction| transaction.fifo_position + 1)
+        .max()
+        .unwrap_or(0);
+    let mut transaction_index_by_fifo = vec![u32::MAX; fifo_limit];
+    for (transaction_index, transaction) in plan.transactions.iter().enumerate() {
+        transaction_index_by_fifo[transaction.fifo_position] = u32::try_from(transaction_index)
+            .map_err(|_| Error::invariant("parallel transaction index overflows u32"))?;
     }
-    for transaction in &plan.transactions {
-        match transaction_groups.get(&transaction.fifo_position) {
-            Some(groups) if groups.len() == 1 => {}
-            _ => {
-                record_parallel_fallback(metrics, ParallelFallbackReason::MultiLeafTransaction);
+    let mut record_counts = vec![0u64; transaction_count];
+    let mut job_steps = Vec::with_capacity(plan.leaf_groups.len());
+    for leaf_group in &plan.leaf_groups {
+        let mut steps = Vec::with_capacity(leaf_group.mutations.len());
+        let mut previous_transaction = None;
+        for (fifo_position, mutation_index) in &leaf_group.mutations {
+            let transaction_index = transaction_index_by_fifo
+                .get(*fifo_position)
+                .copied()
+                .filter(|transaction_index| *transaction_index != u32::MAX)
+                .ok_or_else(|| Error::invariant("parallel leaf references unknown transaction"))?;
+            if previous_transaction != Some(transaction_index) {
+                if previous_transaction.is_some_and(|previous| previous > transaction_index) {
+                    return Err(Error::invariant(
+                        "parallel leaf chain is not in transaction order",
+                    ));
+                }
+                record_counts[transaction_index as usize] += 1;
+                previous_transaction = Some(transaction_index);
+            }
+            if let TransactionMutation::Put { value, .. } = &plan.transactions
+                [transaction_index as usize]
+                .mutations
+                .get(*mutation_index)
+                .ok_or_else(|| Error::invariant("parallel leaf references unknown mutation"))?
+                .mutation
+                && value.len() > INLINE_VALUE_LIMIT
+            {
+                record_parallel_fallback(metrics, ParallelFallbackReason::OverflowOrAllocator);
                 return Ok(None);
             }
+            let mutation_index = u32::try_from(*mutation_index)
+                .map_err(|_| Error::invariant("parallel mutation index overflows u32"))?;
+            steps.push((transaction_index, mutation_index));
         }
+        job_steps.push(steps);
     }
-    for dependency in &plan.dependencies {
-        let Some(predecessor_groups) = transaction_groups.get(&dependency.predecessor) else {
-            continue;
-        };
-        let Some(successor_groups) = transaction_groups.get(&dependency.successor) else {
-            continue;
-        };
-        if predecessor_groups.is_disjoint(successor_groups) {
-            record_parallel_fallback(metrics, ParallelFallbackReason::CrossLeafDependency);
-            return Ok(None);
-        }
-    }
-
-    let mut transaction_lsns = BTreeMap::new();
+    let mut commit_lsns = Vec::with_capacity(transaction_count);
     let mut next_lsn = starting_lsn;
-    for transaction in &plan.transactions {
+    for record_count in &record_counts {
+        if *record_count == 0 {
+            return Err(Error::invariant("planned transaction has no target leaf"));
+        }
         let commit_lsn = Lsn::new(
             next_lsn
                 .get()
-                .checked_add(1)
+                .checked_add(*record_count)
                 .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
         );
-        transaction_lsns.insert(transaction.fifo_position, commit_lsn);
+        commit_lsns.push(commit_lsn);
         next_lsn = Lsn::new(
             commit_lsn
                 .get()
@@ -2957,53 +3141,65 @@ fn prepare_parallel_execution<'a>(
                 .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
         );
     }
+    let commit_lsns: Arc<[Lsn]> = commit_lsns.into();
 
     let mut jobs = Vec::with_capacity(plan.leaf_groups.len());
-    for leaf_group in &plan.leaf_groups {
-        let initial_page = state
-            .pages
-            .get(&leaf_group.leaf_hint)
-            .cloned()
-            .ok_or_else(|| Error::corruption("parallel Blink target leaf is missing"))?;
-        if !matches!(initial_page, BlinkPage::Leaf { .. }) {
-            return Err(Error::corruption(
-                "parallel Blink target page is not a leaf",
-            ));
-        }
-        let mut steps = Vec::with_capacity(leaf_group.mutations.len());
-        for (fifo_position, mutation_index) in &leaf_group.mutations {
-            let transaction = plan
-                .transactions
-                .iter()
-                .find(|transaction| transaction.fifo_position == *fifo_position)
-                .ok_or_else(|| Error::invariant("parallel leaf references unknown transaction"))?;
-            let mutation = transaction
-                .mutations
-                .get(*mutation_index)
-                .ok_or_else(|| Error::invariant("parallel leaf references unknown mutation"))?
-                .clone();
-            let commit_lsn = *transaction_lsns
-                .get(fifo_position)
-                .ok_or_else(|| Error::invariant("parallel transaction LSN is missing"))?;
-            steps.push((*fifo_position, *mutation_index, mutation, commit_lsn));
-        }
-        steps
-            .sort_by_key(|(fifo_position, mutation_index, _, _)| (*fifo_position, *mutation_index));
-        jobs.push(ParallelLeafJob {
-            leaf_id: leaf_group.leaf_hint,
+    for (leaf_group, steps) in plan.leaf_groups.iter().zip(job_steps) {
+        let leaf_id = leaf_group.leaf_hint;
+        let initial_page = match state.pages.get(&leaf_id) {
+            Some(page @ BlinkPage::Leaf { .. }) => page.clone(),
+            _ => {
+                record_parallel_fallback(metrics, ParallelFallbackReason::RouteMismatch);
+                return Ok(None);
+            }
+        };
+        let chain_entry = wal.page_chain_entry(leaf_id);
+        let base_image = if chain_entry.is_some() {
+            dirty_pages.get(&leaf_id).map(|image| Box::new(*image))
+        } else {
+            None
+        };
+        jobs.push(LeafChainJob {
+            leaf_id,
             initial_page,
+            base_image,
+            chain_entry,
             steps,
+            plan: Arc::clone(plan),
+            commit_lsns: Arc::clone(&commit_lsns),
+            #[cfg(test)]
+            fault: None,
         });
     }
-    let worker_count = worker_pool.workers.len().min(jobs.len());
-    if worker_count < 2 {
-        metrics.parallel_skipped_single_leaf =
-            metrics.parallel_skipped_single_leaf.saturating_add(1);
-        return Ok(None);
+    #[cfg(test)]
+    if let Some(
+        fault @ (ParallelWorkerFault::Error { leaf_group_index }
+        | ParallelWorkerFault::Panic { leaf_group_index }),
+    ) = worker_fault
+        && let Some(job) = jobs.get_mut(leaf_group_index)
+    {
+        job.fault = Some(fault);
     }
-    let mut worker_buckets = (0..worker_count).map(|_| Vec::new()).collect::<Vec<_>>();
-    for (job_index, job) in jobs.into_iter().enumerate() {
-        worker_buckets[job_index % worker_count].push(job);
+    let worker_count = worker_pool.workers.len().min(jobs.len());
+    let mut worker_buckets = (0..worker_count)
+        .map(|_| Vec::with_capacity(jobs.len() / worker_count + 1))
+        .collect::<Vec<_>>();
+    let mut bucket_weights = vec![0usize; worker_count];
+    for job in jobs {
+        let lightest = bucket_weights
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, weight)| **weight)
+            .map(|(bucket_index, _)| bucket_index)
+            .ok_or_else(|| Error::invariant("parallel worker pool is empty"))?;
+        bucket_weights[lightest] += job.steps.len() + 2;
+        worker_buckets[lightest].push(job);
+    }
+    metrics.parallel_dispatch_nanos = metrics
+        .parallel_dispatch_nanos
+        .saturating_add(elapsed_nanos(dispatch_started));
+    if let Some(injector) = fault_injector.as_deref_mut() {
+        injector.hit("before_parallel_leaf_dispatch")?;
     }
 
     let worker_run = worker_pool.execute(worker_buckets)?;
@@ -3015,114 +3211,338 @@ fn prepare_parallel_execution<'a>(
     metrics.parallel_join_nanos = metrics
         .parallel_join_nanos
         .saturating_add(worker_run.join_nanos);
+    metrics.parallel_worker_slot_nanos = metrics.parallel_worker_slot_nanos.saturating_add(
+        worker_run
+            .join_nanos
+            .saturating_mul(worker_run.worker_dispatches),
+    );
     metrics.parallel_worker_dispatches = metrics
         .parallel_worker_dispatches
         .saturating_add(worker_run.worker_dispatches);
     metrics.parallel_worker_nanos = metrics
         .parallel_worker_nanos
         .saturating_add(worker_run.worker_nanos);
-    let outcomes = worker_run.outcomes;
-    if let Some(reason) = outcomes.iter().find_map(|outcome| match outcome {
-        ParallelLeafJobOutcome::Prepared(_) => None,
-        ParallelLeafJobOutcome::Fallback { reason, .. } => Some(*reason),
-    }) {
-        record_parallel_fallback(metrics, reason);
-        return Ok(None);
+    if let Some(injector) = fault_injector.as_deref_mut() {
+        injector.hit("after_parallel_leaf_join")?;
     }
 
+    let collect_started = Instant::now();
+    let mut results = Vec::with_capacity(worker_run.outcomes.len());
+    let mut fallback = None;
+    for outcome in worker_run.outcomes {
+        match outcome {
+            LeafChainOutcome::Prepared(result) => results.push(result),
+            LeafChainOutcome::Fallback { reason } => {
+                fallback.get_or_insert(reason);
+            }
+        }
+    }
+    let mut timing = LeafChainTiming::default();
+    for result in &results {
+        timing.base_nanos = timing.base_nanos.saturating_add(result.timing.base_nanos);
+        timing.mutation_nanos = timing
+            .mutation_nanos
+            .saturating_add(result.timing.mutation_nanos);
+        timing.encode_nanos = timing
+            .encode_nanos
+            .saturating_add(result.timing.encode_nanos);
+        timing.delta_nanos = timing.delta_nanos.saturating_add(result.timing.delta_nanos);
+    }
+    metrics.parallel_worker_base_nanos = metrics
+        .parallel_worker_base_nanos
+        .saturating_add(timing.base_nanos);
+    metrics.parallel_worker_mutation_nanos = metrics
+        .parallel_worker_mutation_nanos
+        .saturating_add(timing.mutation_nanos);
+    metrics.parallel_worker_encode_nanos = metrics
+        .parallel_worker_encode_nanos
+        .saturating_add(timing.encode_nanos);
+    metrics.parallel_worker_delta_nanos = metrics
+        .parallel_worker_delta_nanos
+        .saturating_add(timing.delta_nanos);
+    if let Some(reason) = fallback {
+        record_parallel_fallback(metrics, reason);
+        metrics.parallel_fallback_after_dispatch =
+            metrics.parallel_fallback_after_dispatch.saturating_add(1);
+        return Ok(None);
+    }
+    if results.len() != plan.leaf_groups.len() {
+        return Err(Error::invariant(
+            "parallel Blink workers returned the wrong number of leaf chains",
+        ));
+    }
+
+    let mut transaction_records = record_counts
+        .iter()
+        .map(|record_count| Vec::with_capacity(*record_count as usize))
+        .collect::<Vec<Vec<(u32, u32)>>>();
+    let mut boundary_count = 0u64;
+    for (result_index, result) in results.iter().enumerate() {
+        for (boundary_index, boundary) in result.boundaries.iter().enumerate() {
+            if commit_lsns.get(boundary.transaction_index) != Some(&boundary.commit_lsn) {
+                return Err(Error::invariant(
+                    "parallel leaf boundary has the wrong commit LSN",
+                ));
+            }
+            transaction_records[boundary.transaction_index]
+                .push((result_index as u32, boundary_index as u32));
+            boundary_count += 1;
+        }
+    }
+    for (records, record_count) in transaction_records.iter_mut().zip(&record_counts) {
+        records.sort_unstable_by_key(|(result_index, _)| results[*result_index as usize].leaf_id);
+        if records.len() as u64 != *record_count
+            || records.windows(2).any(|pair| {
+                results[pair[0].0 as usize].leaf_id == results[pair[1].0 as usize].leaf_id
+            })
+        {
+            return Err(Error::invariant(
+                "parallel transaction does not have one redo record per leaf",
+            ));
+        }
+    }
+
+    let mut working = WorkingBlinkState::new(state, allow_page_reuse);
+    for result in &mut results {
+        let final_page = std::mem::replace(
+            &mut result.final_page,
+            BlinkPage::Free {
+                lsn: Lsn::ZERO,
+                next: None,
+            },
+        );
+        working.insert_page(result.leaf_id, final_page);
+    }
+    let mut executed = Vec::with_capacity(transaction_count);
+    let mut superblock = current_superblock.clone();
+    let mut next_batch_id = starting_batch_id;
+    for (transaction_index, records) in transaction_records.iter().enumerate() {
+        let commit_lsn = commit_lsns[transaction_index];
+        superblock = BlinkSuperblock {
+            generation: superblock
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("experimental generation exhausted"))?,
+            ..superblock
+        };
+        let dirty = records
+            .iter()
+            .map(|(result_index, _)| results[*result_index as usize].leaf_id)
+            .collect::<BTreeSet<_>>();
+        let next_lsn_after = Lsn::new(
+            commit_lsn
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
+        );
+        let following_batch_id = next_batch_id
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("experimental batch id exhausted"))?;
+        executed.push(ExecutedPlanTransaction {
+            batch_id: next_batch_id,
+            result: TransactionResult { commit_lsn },
+            dirty,
+            images: Vec::new(),
+            superblock: superblock.clone(),
+            slot: active_slot,
+            superblock_image_emitted: false,
+            next_revision: Revision::from(next_lsn_after),
+            next_lsn: next_lsn_after,
+            next_batch_id: following_batch_id,
+        });
+        next_batch_id = following_batch_id;
+    }
+    metrics.parallel_collect_nanos = metrics
+        .parallel_collect_nanos
+        .saturating_add(elapsed_nanos(collect_started));
+    metrics.parallel_groups = metrics.parallel_groups.saturating_add(1);
     metrics.parallel_leaf_jobs = metrics
         .parallel_leaf_jobs
-        .saturating_add(outcomes.len() as u64);
+        .saturating_add(results.len() as u64);
+    metrics.parallel_job_operations = metrics
+        .parallel_job_operations
+        .saturating_add(boundary_count);
     metrics.parallel_transactions = metrics
         .parallel_transactions
-        .saturating_add(plan.transactions.len() as u64);
+        .saturating_add(transaction_count as u64);
     metrics.parallel_mutations = metrics.parallel_mutations.saturating_add(
         plan.transactions
             .iter()
             .map(|transaction| transaction.mutations.len() as u64)
             .sum::<u64>(),
     );
-    metrics.parallel_groups = metrics.parallel_groups.saturating_add(1);
-    metrics.leaf_encodes = metrics
-        .leaf_encodes
-        .saturating_add(plan.transactions.len() as u64);
-
-    let mut by_fifo = Vec::<(usize, PageId, [u8; PAGE_SIZE])>::new();
-    let mut final_pages = BTreeMap::new();
-    for outcome in outcomes {
-        let ParallelLeafJobOutcome::Prepared(result) = outcome else {
-            return Err(Error::invariant("parallel fallback escaped validation"));
-        };
-        final_pages.insert(result.leaf_id, result.final_page);
-        for boundary in result.boundaries {
-            by_fifo.push((boundary.fifo_position, result.leaf_id, boundary.page_image));
-        }
-    }
-    let mut working = WorkingBlinkState::new(state, allow_page_reuse);
-    for (leaf_id, page) in final_pages {
-        working.insert_page(leaf_id, page);
-    }
-    let executed = assemble_parallel_transactions(
-        plan,
-        by_fifo,
-        current_superblock,
-        active_slot,
-        starting_lsn,
-        starting_batch_id,
-    )?;
-    Ok(Some(PlannedExecutionPreparation { working, executed }))
-}
-
-fn run_parallel_leaf_job(job: ParallelLeafJob) -> Result<ParallelLeafJobOutcome> {
-    let mut page = job.initial_page;
-    let mut boundaries = Vec::with_capacity(job.steps.len());
-    let mut pending_steps = job.steps.into_iter().peekable();
-    while let Some((fifo_position, _, _, commit_lsn)) = pending_steps.peek() {
-        let fifo_position = *fifo_position;
-        let commit_lsn = *commit_lsn;
-        while pending_steps
-            .peek()
-            .is_some_and(|(pending_fifo_position, _, _, _)| *pending_fifo_position == fifo_position)
-        {
-            let (_, _, mutation, _) = pending_steps
-                .next()
-                .ok_or_else(|| Error::invariant("parallel leaf transaction step disappeared"))?;
-            if let Some(reason) = apply_parallel_leaf_mutation(&mut page, &mutation, commit_lsn)? {
-                return Ok(ParallelLeafJobOutcome::Fallback { reason });
-            }
-        }
-        let page_image = encode_blink_page(job.leaf_id, &page)?;
-        boundaries.push(ParallelLeafBoundary {
-            fifo_position,
-            page_image,
-        });
-    }
-    Ok(ParallelLeafJobOutcome::Prepared(ParallelLeafJobResult {
-        leaf_id: job.leaf_id,
-        boundaries,
-        final_page: page,
+    metrics.leaf_encodes = metrics.leaf_encodes.saturating_add(boundary_count);
+    Ok(Some(PlannedExecutionPreparation {
+        working,
+        executed,
+        parallel_redo: Some(LeafParallelRedo {
+            results,
+            transaction_records,
+        }),
     }))
 }
 
-fn apply_parallel_leaf_mutation(
+fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
+    #[cfg(test)]
+    match job.fault {
+        Some(ParallelWorkerFault::Error { .. }) => {
+            return Err(Error::invariant("injected parallel leaf worker failure"));
+        }
+        Some(ParallelWorkerFault::Panic { .. }) => {
+            panic!("injected parallel leaf worker panic");
+        }
+        None => {}
+    }
+    let mut timing = LeafChainTiming::default();
+    let leaf_id = job.leaf_id;
+    let mut page = job.initial_page;
+    let base_started = Instant::now();
+    let mut base = match job.chain_entry {
+        None => None,
+        Some((chain_lsn, chain_crc)) => {
+            let image = match job.base_image {
+                Some(image) => image,
+                None => Box::new(encode_blink_page(leaf_id, &page)?),
+            };
+            let image_crc = crc32c::crc32c(&image[..]);
+            if blink_image_lsn(&image) != chain_lsn || image_crc != chain_crc {
+                return Err(Error::invariant(format!(
+                    "page {leaf_id} parallel delta base does not match the WAL page chain"
+                )));
+            }
+            Some((image, chain_lsn, image_crc))
+        }
+    };
+    timing.base_nanos = elapsed_nanos(base_started);
+    let plan = &*job.plan;
+    let mut boundaries = Vec::with_capacity(job.steps.len());
+    let mut step_position = 0usize;
+    while step_position < job.steps.len() {
+        let transaction_index = job.steps[step_position].0 as usize;
+        let commit_lsn = *job
+            .commit_lsns
+            .get(transaction_index)
+            .ok_or_else(|| Error::invariant("parallel transaction LSN is missing"))?;
+        let transaction = plan
+            .transactions
+            .get(transaction_index)
+            .ok_or_else(|| Error::invariant("parallel leaf references unknown transaction"))?;
+        let mutation_started = Instant::now();
+        while step_position < job.steps.len()
+            && job.steps[step_position].0 as usize == transaction_index
+        {
+            let planned_mutation = transaction
+                .mutations
+                .get(job.steps[step_position].1 as usize)
+                .ok_or_else(|| Error::invariant("parallel leaf references unknown mutation"))?;
+            if let Some(reason) =
+                apply_leaf_chain_mutation(&mut page, planned_mutation, commit_lsn)?
+            {
+                return Ok(LeafChainOutcome::Fallback { reason });
+            }
+            step_position += 1;
+        }
+        let BlinkPage::Leaf { lsn, .. } = &mut page else {
+            return Err(Error::corruption("parallel Blink candidate is not a leaf"));
+        };
+        *lsn = commit_lsn;
+        timing.mutation_nanos = timing
+            .mutation_nanos
+            .saturating_add(elapsed_nanos(mutation_started));
+
+        let encode_started = Instant::now();
+        let image = encode_blink_page(leaf_id, &page)?;
+        timing.encode_nanos = timing
+            .encode_nanos
+            .saturating_add(elapsed_nanos(encode_started));
+
+        let delta_started = Instant::now();
+        let image_crc = crc32c::crc32c(&image[..]);
+        let redo = match &base {
+            None => LeafChainRedo::Image(Box::new(image)),
+            Some((base_image, base_lsn, base_crc)) => {
+                let payload = encode_page_delta(leaf_id, base_image, &image)?;
+                if payload.len() >= PAGE_IMAGE_PAYLOAD_SIZE {
+                    LeafChainRedo::Image(Box::new(image))
+                } else {
+                    let view = decode_page_delta(&payload)?;
+                    if apply_page_delta(base_image, &view)? != image {
+                        return Err(Error::invariant(format!(
+                            "page {leaf_id} parallel delta does not rebuild its after-image"
+                        )));
+                    }
+                    let spans = view.spans.len() as u64;
+                    let changed_bytes = view.changed_bytes() as u64;
+                    drop(view);
+                    LeafChainRedo::Delta {
+                        payload,
+                        base_lsn: *base_lsn,
+                        base_crc: *base_crc,
+                        spans,
+                        changed_bytes,
+                    }
+                }
+            }
+        };
+        match &mut base {
+            Some((base_image, base_lsn, base_crc)) => {
+                **base_image = image;
+                *base_lsn = commit_lsn;
+                *base_crc = image_crc;
+            }
+            None => base = Some((Box::new(image), commit_lsn, image_crc)),
+        }
+        timing.delta_nanos = timing
+            .delta_nanos
+            .saturating_add(elapsed_nanos(delta_started));
+        boundaries.push(LeafChainBoundary {
+            transaction_index,
+            commit_lsn,
+            image_crc,
+            redo,
+        });
+    }
+    let (final_image, _, _) =
+        base.ok_or_else(|| Error::invariant("parallel leaf chain produced no image"))?;
+    Ok(LeafChainOutcome::Prepared(LeafChainResult {
+        leaf_id,
+        boundaries,
+        final_page: page,
+        final_image,
+        timing,
+    }))
+}
+
+fn blink_image_lsn(image: &[u8; PAGE_SIZE]) -> Lsn {
+    let mut lsn_bytes = [0u8; 8];
+    lsn_bytes.copy_from_slice(&image[16..24]);
+    Lsn::new(u64::from_le_bytes(lsn_bytes))
+}
+
+/// Applies one planned mutation in place, with the same entry layout the
+/// serial executor produces after its restamp. It never changes anything
+/// outside this leaf; anything that would (a split, an overflow value, or a
+/// key that does not belong to this leaf) is reported as a fallback reason.
+fn apply_leaf_chain_mutation(
     page: &mut BlinkPage,
     planned_mutation: &PlannedMutation,
     commit_lsn: Lsn,
 ) -> Result<Option<ParallelFallbackReason>> {
     let BlinkPage::Leaf {
-        lsn: _,
         high_key,
         right_sibling,
         entries,
+        ..
     } = page
     else {
         return Err(Error::corruption("parallel Blink candidate is not a leaf"));
     };
-    if entries
-        .iter()
-        .any(|entry| matches!(entry.value, Some(BlinkValueRef::Overflow { .. })))
+    let encoded_key = planned_mutation.encoded_key.as_slice();
+    if high_key
+        .as_deref()
+        .is_some_and(|high_key| encoded_key >= high_key)
     {
-        return Ok(Some(ParallelFallbackReason::OverflowOrAllocator));
+        return Ok(Some(ParallelFallbackReason::RouteMismatch));
     }
     let value = match &planned_mutation.mutation {
         TransactionMutation::Put { value, .. } if value.len() <= INLINE_VALUE_LIMIT => {
@@ -3133,137 +3553,27 @@ fn apply_parallel_leaf_mutation(
         }
         TransactionMutation::Delete { .. } => None,
     };
-    let mut next_entries = entries.clone();
-    match next_entries.binary_search_by(|entry| {
-        entry
-            .key
-            .as_ref()
-            .cmp(planned_mutation.encoded_key.as_slice())
-    }) {
+    let entry = LeafEntry {
+        key: Arc::from(encoded_key),
+        revision: Revision::from(commit_lsn),
+        value,
+    };
+    match entries.binary_search_by(|existing| existing.key.as_ref().cmp(encoded_key)) {
         Ok(entry_index) => {
             if matches!(
-                next_entries[entry_index].value,
+                entries[entry_index].value,
                 Some(BlinkValueRef::Overflow { .. })
             ) {
                 return Ok(Some(ParallelFallbackReason::OverflowOrAllocator));
             }
-            next_entries[entry_index] = LeafEntry {
-                key: Arc::from(planned_mutation.encoded_key.as_slice()),
-                revision: Revision::from(commit_lsn),
-                value,
-            };
+            entries[entry_index] = entry;
         }
-        Err(entry_index) => next_entries.insert(
-            entry_index,
-            LeafEntry {
-                key: Arc::from(planned_mutation.encoded_key.as_slice()),
-                revision: Revision::from(commit_lsn),
-                value,
-            },
-        ),
+        Err(entry_index) => entries.insert(entry_index, entry),
     }
-    if !leaf_fits(&next_entries, high_key.as_deref(), *right_sibling) {
+    if !leaf_fits(entries, high_key.as_deref(), *right_sibling) {
         return Ok(Some(ParallelFallbackReason::Structural));
     }
-    *page = BlinkPage::Leaf {
-        lsn: commit_lsn,
-        high_key: high_key.clone(),
-        right_sibling: *right_sibling,
-        entries: next_entries,
-    };
     Ok(None)
-}
-
-fn assemble_parallel_transactions(
-    plan: &BatchPlan,
-    page_images: Vec<(usize, PageId, [u8; PAGE_SIZE])>,
-    current_superblock: &BlinkSuperblock,
-    active_slot: SuperblockSlot,
-    starting_lsn: Lsn,
-    starting_batch_id: u64,
-) -> Result<Vec<ExecutedPlanTransaction>> {
-    let mut images_by_fifo = BTreeMap::new();
-    for (fifo_position, leaf_id, image) in page_images {
-        if images_by_fifo
-            .insert(fifo_position, (leaf_id, image))
-            .is_some()
-        {
-            return Err(Error::invariant(
-                "parallel transaction changed multiple leaves",
-            ));
-        }
-    }
-    let mut executed = Vec::with_capacity(plan.transactions.len());
-    let mut superblock = current_superblock.clone();
-    let slot = active_slot;
-    let mut next_lsn = starting_lsn;
-    let mut next_batch_id = starting_batch_id;
-    for transaction in &plan.transactions {
-        let commit_lsn = Lsn::new(
-            next_lsn
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
-        );
-        let (leaf_id, leaf_image) = images_by_fifo
-            .remove(&transaction.fifo_position)
-            .ok_or_else(|| Error::invariant("parallel transaction image is missing"))?;
-        let page_lsn =
-            Lsn::new(u64::from_le_bytes(leaf_image[16..24].try_into().map_err(
-                |_| Error::invariant("parallel leaf image LSN is invalid"),
-            )?));
-        if page_lsn != commit_lsn {
-            return Err(Error::invariant(
-                "parallel leaf image LSN does not match commit",
-            ));
-        }
-        superblock = BlinkSuperblock {
-            generation: superblock
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("experimental generation exhausted"))?,
-            root_page_id: superblock.root_page_id,
-            free_list_head: superblock.free_list_head,
-            high_water_page_id: superblock.high_water_page_id,
-            ..superblock
-        };
-        let mut dirty = BTreeSet::new();
-        dirty.insert(leaf_id);
-        let images = vec![WalPageImage {
-            page_id: leaf_id,
-            image: leaf_image,
-        }];
-        let next_lsn_after = Lsn::new(
-            commit_lsn
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
-        );
-        executed.push(ExecutedPlanTransaction {
-            batch_id: next_batch_id,
-            result: TransactionResult { commit_lsn },
-            dirty,
-            images,
-            superblock: superblock.clone(),
-            slot,
-            superblock_image_emitted: false,
-            next_revision: Revision::from(next_lsn_after),
-            next_lsn: next_lsn_after,
-            next_batch_id: next_batch_id
-                .checked_add(1)
-                .ok_or_else(|| Error::invariant("experimental batch id exhausted"))?,
-        });
-        next_lsn = next_lsn_after;
-        next_batch_id = next_batch_id
-            .checked_add(1)
-            .ok_or_else(|| Error::invariant("experimental batch id exhausted"))?;
-    }
-    if !images_by_fifo.is_empty() {
-        return Err(Error::invariant(
-            "parallel result has unknown transaction images",
-        ));
-    }
-    Ok(executed)
 }
 
 fn prepare_planned_serial_execution<'a>(
@@ -3403,7 +3713,11 @@ fn prepare_planned_serial_execution<'a>(
             .checked_add(1)
             .ok_or_else(|| Error::invariant("experimental batch id exhausted"))?;
     }
-    Ok(PlannedExecutionPreparation { working, executed })
+    Ok(PlannedExecutionPreparation {
+        working,
+        executed,
+        parallel_redo: None,
+    })
 }
 
 fn apply_planned_mutation(
@@ -6749,10 +7063,34 @@ mod tests {
     #[test]
     fn persistent_parallel_pool_reuses_worker_threads_across_execute_cycles() {
         let pool = ParallelWorkerPool::new(2).unwrap();
+        let key = DocumentKey::new(b"pool".to_vec(), b"key".to_vec());
+        let plan = Arc::new(BatchPlan {
+            transactions: vec![PhysicalTransactionPlan {
+                fifo_position: 0,
+                provisional_revision: ProvisionalRevisionToken {
+                    transaction_position: 0,
+                    ordinal: 1,
+                },
+                mutations: vec![PlannedMutation {
+                    mutation: TransactionMutation::Put {
+                        key: key.clone(),
+                        value: b"value".to_vec(),
+                    },
+                    encoded_key: key.encode(),
+                    route_hint: RouteHint {
+                        leaf_id: PageId::new(2),
+                    },
+                }],
+                mutated_key_set: BTreeSet::new(),
+                dependency_metadata: DependencyMetadata::default(),
+            }],
+            ..BatchPlan::default()
+        });
+        let commit_lsns: Arc<[Lsn]> = vec![Lsn::new(1)].into();
         let make_buckets = || {
             (0..2)
                 .map(|worker_index| {
-                    vec![ParallelLeafJob {
+                    vec![LeafChainJob {
                         leaf_id: PageId::new(2 + worker_index as u64),
                         initial_page: BlinkPage::Leaf {
                             lsn: Lsn::ZERO,
@@ -6760,7 +7098,12 @@ mod tests {
                             right_sibling: None,
                             entries: Vec::new(),
                         },
-                        steps: Vec::new(),
+                        base_image: None,
+                        chain_entry: None,
+                        steps: vec![(0, 0)],
+                        plan: Arc::clone(&plan),
+                        commit_lsns: Arc::clone(&commit_lsns),
+                        fault: None,
                     }]
                 })
                 .collect::<Vec<_>>()
@@ -8442,7 +8785,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_multi_leaf_transaction_falls_back_atomically() {
+    fn parallel_multi_leaf_transaction_runs_on_leaf_workers() {
         let mut serial = planned_store();
         let mut parallel = parallel_store();
         for index in 0..120u64 {
@@ -8452,7 +8795,7 @@ mod tests {
         }
         serial.enable_planned_execution();
         let first = wide_key(0);
-        let last = wide_key(10_000);
+        let last = wide_key(119);
         let request = TransactionRequest::new(
             Vec::new(),
             vec![
@@ -8471,7 +8814,17 @@ mod tests {
         assert_eq!(parallel_result, serial_result);
         assert_eq!(parallel.get(&first).unwrap(), serial.get(&first).unwrap());
         assert_eq!(parallel.get(&last).unwrap(), serial.get(&last).unwrap());
-        assert_eq!(parallel.batch_metrics().parallel_fallback_multi_leaf, 1);
+        assert_eq!(
+            parallel.batch_metrics().parallel_groups,
+            1,
+            "{:?}",
+            parallel.batch_metrics()
+        );
+        assert_eq!(parallel.batch_metrics().parallel_fallback_groups, 0);
+        assert_eq!(
+            parallel.wal.as_mut().unwrap().committed_batches_on_disk(),
+            serial.wal.as_mut().unwrap().committed_batches_on_disk()
+        );
         assert_eq!(
             parallel.wal.as_ref().unwrap().last_commit_lsn().unwrap(),
             parallel_result.commit_lsn
@@ -8480,7 +8833,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_cross_leaf_dependency_falls_back_serially() {
+    fn parallel_cross_leaf_condition_dependency_keeps_fifo_results() {
         let mut serial = planned_store();
         let mut parallel = parallel_store();
         for index in 0..120u64 {
@@ -8490,7 +8843,7 @@ mod tests {
         }
         serial.enable_planned_execution();
         let first = wide_key(0);
-        let last = wide_key(10_000);
+        let last = wide_key(119);
         let requests = vec![
             TransactionRequest::new(
                 Vec::new(),
@@ -8513,7 +8866,13 @@ mod tests {
             successful_commit_lsns(&parallel_results),
             successful_commit_lsns(&serial_results)
         );
-        assert_eq!(parallel.batch_metrics().parallel_fallback_dependency, 1);
+        assert_eq!(
+            parallel.batch_metrics().parallel_groups,
+            1,
+            "{:?}",
+            parallel.batch_metrics()
+        );
+        assert_eq!(parallel.batch_metrics().parallel_fallback_groups, 0);
         assert_eq!(parallel.get(&first).unwrap(), serial.get(&first).unwrap());
         assert_eq!(parallel.get(&last).unwrap(), serial.get(&last).unwrap());
     }
@@ -8585,65 +8944,6 @@ mod tests {
         assert!(parallel.split_metrics().leaf_splits > split_metrics_before.leaf_splits);
         parallel.check_invariants().unwrap();
         serial.check_invariants().unwrap();
-    }
-
-    #[test]
-    fn parallel_worker_completion_order_does_not_change_wal_order() {
-        let page = |leaf_id: PageId, commit_lsn: Lsn| {
-            encode_blink_page(
-                leaf_id,
-                &BlinkPage::Leaf {
-                    lsn: commit_lsn,
-                    high_key: None,
-                    right_sibling: None,
-                    entries: Vec::new(),
-                },
-            )
-            .unwrap()
-        };
-        let plan = BatchPlan {
-            transactions: (0..3)
-                .map(|fifo_position| PhysicalTransactionPlan {
-                    fifo_position,
-                    provisional_revision: ProvisionalRevisionToken {
-                        transaction_position: fifo_position,
-                        ordinal: fifo_position as u64 + 1,
-                    },
-                    mutations: Vec::new(),
-                    mutated_key_set: BTreeSet::new(),
-                    dependency_metadata: DependencyMetadata::default(),
-                })
-                .collect(),
-            ..BatchPlan::default()
-        };
-        let reversed_images = vec![
-            (2, PageId::new(4), page(PageId::new(4), Lsn::new(5))),
-            (1, PageId::new(3), page(PageId::new(3), Lsn::new(3))),
-            (0, PageId::new(2), page(PageId::new(2), Lsn::new(1))),
-        ];
-        let executed = assemble_parallel_transactions(
-            &plan,
-            reversed_images,
-            &BlinkSuperblock::new(&DatabaseConfig::default(), PageId::new(FIRST_DATA_PAGE)),
-            SuperblockSlot::B,
-            Lsn::ZERO,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            executed
-                .iter()
-                .map(|transaction| transaction.result.commit_lsn)
-                .collect::<Vec<_>>(),
-            vec![Lsn::new(1), Lsn::new(3), Lsn::new(5)]
-        );
-        assert_eq!(
-            executed
-                .iter()
-                .map(|transaction| transaction.batch_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
     }
 
     #[test]
@@ -11395,5 +11695,713 @@ mod tests {
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         value ^ (value >> 31)
+    }
+
+    fn phase_d_store(
+        workers: usize,
+        keys: u64,
+    ) -> (BlinkStore<MemoryFile, MemoryFile>, BTreeMap<u64, Vec<u8>>) {
+        let (mut store, expected) = page_delta_store(keys);
+        if workers > 0 {
+            store.enable_parallel_execution(workers).unwrap();
+        }
+        (store, expected)
+    }
+
+    fn keys_on_distinct_leaves(
+        store: &BlinkStore<MemoryFile, MemoryFile>,
+        keys: u64,
+        count: usize,
+    ) -> Vec<(u64, PageId)> {
+        let mut seen = BTreeSet::new();
+        let mut chosen = Vec::new();
+        for index in 0..keys {
+            let leaf_id = leaf_of_key(store, &b0_key(index));
+            if seen.insert(leaf_id) {
+                chosen.push((index, leaf_id));
+                if chosen.len() == count {
+                    break;
+                }
+            }
+        }
+        assert_eq!(chosen.len(), count, "not enough distinct leaves");
+        chosen
+    }
+
+    fn put_request(writes: &[(u64, Vec<u8>)]) -> TransactionRequest {
+        TransactionRequest::new(
+            Vec::new(),
+            writes
+                .iter()
+                .map(|(index, value)| TransactionMutation::Put {
+                    key: b0_key(*index),
+                    value: value.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    fn assert_same_physical_state(
+        left: &BlinkStore<MemoryFile, MemoryFile>,
+        right: &BlinkStore<MemoryFile, MemoryFile>,
+        label: &str,
+    ) {
+        assert_eq!(left.state.pages, right.state.pages, "{label}: pages");
+        assert_eq!(left.state.root_page_id, right.state.root_page_id, "{label}");
+        assert_eq!(
+            left.state.high_water_page_id, right.state.high_water_page_id,
+            "{label}"
+        );
+        assert_eq!(left.dirty_pages, right.dirty_pages, "{label}: dirty pages");
+        assert_eq!(left.dirty_superblock, right.dirty_superblock, "{label}");
+        assert_eq!(left.current_superblock, right.current_superblock, "{label}");
+        assert_eq!(left.active_slot, right.active_slot, "{label}");
+        assert_eq!(left.next_lsn, right.next_lsn, "{label}");
+        assert_eq!(left.next_revision, right.next_revision, "{label}");
+        assert_eq!(left.next_batch_id, right.next_batch_id, "{label}");
+        assert_eq!(
+            left.wal.as_ref().unwrap().next_lsn(),
+            right.wal.as_ref().unwrap().next_lsn(),
+            "{label}"
+        );
+    }
+
+    fn result_signature(results: &[Result<TransactionResult>]) -> Vec<String> {
+        results
+            .iter()
+            .map(|result| match result {
+                Ok(result) => format!("ok {}", result.commit_lsn),
+                Err(error) => format!("err {error:?}"),
+            })
+            .collect()
+    }
+
+    fn all_documents(store: &mut BlinkStore<MemoryFile, MemoryFile>) -> Vec<Document> {
+        let mut documents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = store.scan(cursor.as_ref(), 97).unwrap();
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = Some(last.key.clone());
+            documents.extend(page);
+        }
+        documents
+    }
+
+    /// Runs the same groups on the serial planned executor and on the
+    /// leaf-parallel executor, then checks results, in-memory pages, dirty
+    /// images and the raw WAL bytes.
+    fn run_serial_and_parallel(
+        keys: u64,
+        workers: usize,
+        groups: &[Vec<TransactionRequest>],
+    ) -> (
+        BlinkStore<MemoryFile, MemoryFile>,
+        BlinkStore<MemoryFile, MemoryFile>,
+    ) {
+        let (mut serial, _) = phase_d_store(0, keys);
+        let (mut parallel, _) = phase_d_store(workers, keys);
+        for (group_index, group) in groups.iter().enumerate() {
+            let serial_results = serial.apply_transaction_group(group).unwrap();
+            let parallel_results = parallel.apply_transaction_group(group).unwrap();
+            assert_eq!(
+                result_signature(&serial_results),
+                result_signature(&parallel_results),
+                "group {group_index}"
+            );
+            assert_same_physical_state(&serial, &parallel, &format!("group {group_index}"));
+        }
+        (serial, parallel)
+    }
+
+    fn assert_same_files(
+        serial: BlinkStore<MemoryFile, MemoryFile>,
+        parallel: BlinkStore<MemoryFile, MemoryFile>,
+    ) {
+        let (serial_data, serial_wal) = serial.into_files();
+        let (parallel_data, parallel_wal) = parallel.into_files();
+        assert!(serial_data.0 == parallel_data.0, "data files differ");
+        assert!(
+            serial_wal.unwrap().0 == parallel_wal.unwrap().0,
+            "WAL bytes differ"
+        );
+    }
+
+    #[test]
+    fn phase_d_independent_sixteen_leaf_transaction_matches_serial() {
+        let (probe, _) = phase_d_store(0, 600);
+        let chosen = keys_on_distinct_leaves(&probe, 600, 16);
+        drop(probe);
+        let writes = chosen
+            .iter()
+            .map(|(index, _)| (*index, b0_value(*index, 70)))
+            .collect::<Vec<_>>();
+        let groups = vec![vec![put_request(&writes)]];
+        for workers in [1, 2] {
+            let (mut serial, _) = phase_d_store(0, 600);
+            let (mut parallel, _) = phase_d_store(workers, 600);
+            let metrics_before = parallel.batch_metrics();
+            let serial_results = serial.apply_transaction_group(&groups[0]).unwrap();
+            let parallel_results = parallel.apply_transaction_group(&groups[0]).unwrap();
+            assert_eq!(
+                result_signature(&serial_results),
+                result_signature(&parallel_results)
+            );
+            assert_same_physical_state(&serial, &parallel, "sixteen leaves");
+            let metrics = parallel.batch_metrics();
+            assert_eq!(metrics.parallel_groups, 1, "{metrics:?}");
+            assert_eq!(metrics.parallel_leaf_jobs, 16);
+            assert_eq!(metrics.parallel_job_operations, 16);
+            assert_eq!(metrics.parallel_fallback_groups, 0);
+            assert_eq!(
+                metrics.physical_mutation_nanos,
+                metrics_before.physical_mutation_nanos
+            );
+            assert_eq!(
+                metrics.physical_page_encode_nanos,
+                metrics_before.physical_page_encode_nanos
+            );
+            assert!(metrics.parallel_worker_encode_nanos > 0);
+            let batches = parallel.wal.as_mut().unwrap().committed_batches_on_disk();
+            let last = batches.last().unwrap();
+            assert_eq!(last.pages.len(), 16);
+            assert!(
+                last.redo_kinds
+                    .iter()
+                    .all(|kind| *kind == crate::wal::WalRedoKind::PageDelta)
+            );
+            for (index, value) in &writes {
+                assert_eq!(
+                    parallel.get(&b0_key(*index)).unwrap().value(),
+                    Some(value.as_slice())
+                );
+            }
+            parallel.check_invariants().unwrap();
+            assert_same_files(serial, parallel);
+        }
+    }
+
+    #[test]
+    fn phase_d_same_leaf_chain_keeps_fifo_and_delta_bases() {
+        let (probe, _) = phase_d_store(0, 600);
+        let chosen = keys_on_distinct_leaves(&probe, 600, 2);
+        let leaf_one = chosen[0].1;
+        let same_leaf_keys = (0..600u64)
+            .filter(|index| leaf_of_key(&probe, &b0_key(*index)) == leaf_one)
+            .take(2)
+            .collect::<Vec<_>>();
+        drop(probe);
+        let first_key = same_leaf_keys[0];
+        let second_key = same_leaf_keys[1];
+        let group = vec![
+            put_request(&[(first_key, b0_value(first_key, 81))]),
+            put_request(&[(second_key, b0_value(second_key, 82))]),
+            put_request(&[(first_key, b0_value(first_key, 83))]),
+            put_request(&[(chosen[1].0, b0_value(chosen[1].0, 84))]),
+        ];
+        let (serial, mut parallel) = run_serial_and_parallel(600, 2, &[group]);
+        let metrics = parallel.batch_metrics();
+        assert_eq!(metrics.parallel_groups, 1, "{metrics:?}");
+        assert_eq!(metrics.parallel_leaf_jobs, 2);
+        assert_eq!(metrics.parallel_job_operations, 4);
+        let batches = parallel.wal.as_mut().unwrap().committed_batches_on_disk();
+        let group_batches = &batches[batches.len() - 4..];
+        let chain = group_batches[..3]
+            .iter()
+            .map(|batch| {
+                assert_eq!(batch.pages.len(), 1);
+                assert_eq!(batch.pages[0].page_id, leaf_one);
+                assert_eq!(batch.redo_kinds[0], crate::wal::WalRedoKind::PageDelta);
+                batch.commit_lsn
+            })
+            .collect::<Vec<_>>();
+        assert!(chain.windows(2).all(|pair| pair[0] < pair[1]));
+        let first_revision = parallel.get(&b0_key(first_key)).unwrap();
+        assert_eq!(
+            first_revision.value(),
+            Some(b0_value(first_key, 83).as_slice())
+        );
+        assert_eq!(first_revision.revision(), Revision::from(chain[2]));
+        assert_eq!(
+            parallel.get(&b0_key(second_key)).unwrap().revision(),
+            Revision::from(chain[1])
+        );
+        assert_same_files(serial, parallel);
+    }
+
+    #[test]
+    fn phase_d_mixed_leaf_chains_match_serial() {
+        let (probe, _) = phase_d_store(0, 600);
+        let leaves = keys_on_distinct_leaves(&probe, 600, 4);
+        drop(probe);
+        let key = |slot: usize, round: u64| (leaves[slot].0, b0_value(leaves[slot].0, round));
+        let group = vec![
+            put_request(&[key(0, 91), key(1, 92)]),
+            put_request(&[key(1, 93), key(2, 94)]),
+            put_request(&[key(3, 95)]),
+        ];
+        let (serial, parallel) = run_serial_and_parallel(600, 2, &[group.clone(), group]);
+        let metrics = parallel.batch_metrics();
+        assert_eq!(metrics.parallel_groups, 2, "{metrics:?}");
+        assert_eq!(metrics.parallel_leaf_jobs, 8);
+        assert_eq!(metrics.parallel_job_operations, 10);
+        assert_same_files(serial, parallel);
+    }
+
+    #[test]
+    fn phase_d_worker_failure_is_atomic_and_leaves_store_usable() {
+        for fault in [
+            ParallelWorkerFault::Error {
+                leaf_group_index: 5,
+            },
+            ParallelWorkerFault::Panic {
+                leaf_group_index: 5,
+            },
+        ] {
+            let (mut store, mut expected) = phase_d_store(2, 600);
+            let chosen = keys_on_distinct_leaves(&store, 600, 16);
+            let writes = chosen
+                .iter()
+                .map(|(index, _)| (*index, b0_value(*index, 101)))
+                .collect::<Vec<_>>();
+            let wal_before = store.wal_metrics().unwrap().unwrap();
+            let lsn_before = store.wal.as_ref().unwrap().next_lsn();
+            let pages_before = store.state.pages.clone();
+            let dirty_before = store.dirty_pages.clone();
+            store.parallel_worker_fault = Some(fault);
+            let result = store.apply_transaction_group(&[put_request(&writes)]);
+            assert!(result.is_err(), "{fault:?}");
+            assert!(store.broken.is_none(), "{fault:?}");
+            let wal_after = store.wal_metrics().unwrap().unwrap();
+            assert_eq!(wal_after.wal_bytes, wal_before.wal_bytes);
+            assert_eq!(wal_after.wal_syncs, wal_before.wal_syncs);
+            assert_eq!(store.wal.as_ref().unwrap().next_lsn(), lsn_before);
+            assert!(store.state.pages == pages_before);
+            assert!(store.dirty_pages == dirty_before);
+            assert_store_values(&mut store, &expected);
+            let handle = store.versioned_read_handle();
+            for (index, value) in &expected {
+                assert_eq!(
+                    handle.get(&b0_key(*index)).unwrap().value(),
+                    Some(value.as_slice())
+                );
+            }
+            store.parallel_worker_fault = None;
+            let results = store
+                .apply_transaction_group(&[put_request(&writes)])
+                .unwrap();
+            assert!(results[0].is_ok());
+            for (index, value) in &writes {
+                expected.insert(*index, value.clone());
+            }
+            assert_store_values(&mut store, &expected);
+            let (data, wal) = store.into_files();
+            let mut reopened = reopen_memory_store(data, wal.unwrap());
+            assert_store_values(&mut reopened, &expected);
+        }
+    }
+
+    #[test]
+    fn phase_d_parallel_wal_recovers_like_serial() {
+        let mut state = 0x5eed_d00du64;
+        let mut groups = Vec::new();
+        for _ in 0..40 {
+            let transactions = 1 + (splitmix_for_test(state) % 20) as usize;
+            state = state.wrapping_add(1);
+            let mut group = Vec::new();
+            for _ in 0..transactions {
+                let width = 1 + (splitmix_for_test(state) % 16) as usize;
+                state = state.wrapping_add(1);
+                let mut indices = BTreeSet::new();
+                while indices.len() < width {
+                    indices.insert(splitmix_for_test(state) % 600);
+                    state = state.wrapping_add(1);
+                }
+                let writes = indices
+                    .into_iter()
+                    .map(|index| (index, b0_value(index, state)))
+                    .collect::<Vec<_>>();
+                group.push(put_request(&writes));
+            }
+            groups.push(group);
+        }
+        let (mut serial, mut parallel) = run_serial_and_parallel(600, 2, &groups);
+        assert!(parallel.batch_metrics().parallel_groups >= 30);
+        let serial_documents = all_documents(&mut serial);
+        assert_eq!(serial_documents, all_documents(&mut parallel));
+        let (serial_data, serial_wal) = serial.into_files();
+        let (parallel_data, parallel_wal) = parallel.into_files();
+        let serial_wal = serial_wal.unwrap();
+        let parallel_wal = parallel_wal.unwrap();
+        assert!(serial_wal.0 == parallel_wal.0, "WAL bytes differ");
+        let mut serial_reopened = reopen_memory_store(serial_data, serial_wal);
+        let mut parallel_reopened = reopen_memory_store(parallel_data, parallel_wal);
+        parallel_reopened.enable_parallel_execution(2).unwrap();
+        assert_eq!(all_documents(&mut serial_reopened), serial_documents);
+        assert_eq!(all_documents(&mut parallel_reopened), serial_documents);
+        serial_reopened.check_invariants().unwrap();
+        parallel_reopened.check_invariants().unwrap();
+        assert!(serial_reopened.state.pages == parallel_reopened.state.pages);
+        let more = groups[..5].to_vec();
+        for group in &more {
+            let serial_results = serial_reopened.apply_transaction_group(group).unwrap();
+            let parallel_results = parallel_reopened.apply_transaction_group(group).unwrap();
+            assert_eq!(
+                result_signature(&serial_results),
+                result_signature(&parallel_results)
+            );
+        }
+        assert!(parallel_reopened.batch_metrics().parallel_groups >= 4);
+        assert_same_files(serial_reopened, parallel_reopened);
+    }
+
+    #[test]
+    fn phase_d_fault_matrix_keeps_acknowledged_durability() {
+        let points = [
+            "before_parallel_leaf_dispatch",
+            "after_parallel_leaf_join",
+            "before_wal_append",
+            "during_wal_header_write",
+            "during_page_delta_header_write",
+            "during_wal_payload_write",
+            "during_page_delta_payload_write",
+            "during_wal_trailer_write",
+            "after_page_delta_record",
+            "after_page_images_written",
+            "before_commit_record",
+            "after_commit_record_write",
+            "after_group_records_written",
+            "before_wal_sync",
+            "during_wal_sync",
+            "after_wal_sync",
+            "before_generation_publication",
+        ];
+        let (probe, _) = phase_d_store(0, 600);
+        let leaves = keys_on_distinct_leaves(&probe, 600, 32);
+        drop(probe);
+        let transaction_writes = |round: u64| {
+            [0usize, 16]
+                .iter()
+                .map(|offset| {
+                    leaves[*offset..*offset + 16]
+                        .iter()
+                        .map(|(index, _)| (*index, b0_value(*index, round)))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut cases = 0;
+        for point in points {
+            for occurrence in 1..=40usize {
+                let (mut store, mut expected) = phase_d_store(2, 600);
+                let parallel_before = store.batch_metrics().parallel_groups;
+                let (injector, fired) = fail_at(point, occurrence);
+                store.set_fault_injector(injector);
+                let writes = transaction_writes(2_000 + occurrence as u64);
+                let group = writes
+                    .iter()
+                    .map(|transaction| put_request(transaction))
+                    .collect::<Vec<_>>();
+                let result = store.apply_transaction_group(&group);
+                if !fired.load(Ordering::SeqCst) {
+                    assert!(occurrence > 1, "{point} never fired");
+                    assert!(result.is_ok());
+                    break;
+                }
+                assert!(result.is_err(), "{point} #{occurrence}");
+                if !matches!(
+                    point,
+                    "before_parallel_leaf_dispatch" | "after_parallel_leaf_join"
+                ) {
+                    assert_eq!(
+                        store.batch_metrics().parallel_groups,
+                        parallel_before + 1,
+                        "{point}"
+                    );
+                }
+                cases += 1;
+                let handle = store.versioned_read_handle();
+                for (index, value) in &expected {
+                    assert_eq!(
+                        handle.get(&b0_key(*index)).unwrap().value(),
+                        Some(value.as_slice()),
+                        "{point} #{occurrence}: failed group became visible"
+                    );
+                }
+                let (data, wal) = store.into_files();
+                let mut reopened = reopen_memory_store(data, wal.unwrap());
+                let applied = writes
+                    .iter()
+                    .map(|transaction| {
+                        let applied = transaction.iter().all(|(index, value)| {
+                            reopened.get(&b0_key(*index)).unwrap().value() == Some(value.as_slice())
+                        });
+                        let untouched = transaction.iter().all(|(index, _)| {
+                            reopened.get(&b0_key(*index)).unwrap().value()
+                                == Some(expected[index].as_slice())
+                        });
+                        assert!(
+                            applied ^ untouched,
+                            "{point} #{occurrence}: partial transaction"
+                        );
+                        applied
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !(applied[1] && !applied[0]),
+                    "{point} #{occurrence}: later transaction without earlier one"
+                );
+                if matches!(
+                    point,
+                    "before_parallel_leaf_dispatch"
+                        | "after_parallel_leaf_join"
+                        | "before_wal_append"
+                ) {
+                    assert_eq!(applied, vec![false, false], "{point}");
+                }
+                if matches!(
+                    point,
+                    "after_group_records_written"
+                        | "before_wal_sync"
+                        | "during_wal_sync"
+                        | "after_wal_sync"
+                        | "before_generation_publication"
+                ) {
+                    assert_eq!(applied, vec![true, true], "{point}");
+                }
+                for (transaction, transaction_applied) in writes.iter().zip(&applied) {
+                    if *transaction_applied {
+                        for (index, value) in transaction {
+                            expected.insert(*index, value.clone());
+                        }
+                    }
+                }
+                assert_store_values(&mut reopened, &expected);
+                reopened.enable_parallel_execution(2).unwrap();
+                let followup = transaction_writes(9_999);
+                reopened
+                    .apply_transaction_group(
+                        &followup
+                            .iter()
+                            .map(|transaction| put_request(transaction))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                assert!(reopened.batch_metrics().parallel_groups >= 1, "{point}");
+                for transaction in followup {
+                    for (index, value) in transaction {
+                        expected.insert(index, value);
+                    }
+                }
+                let (data, wal) = reopened.into_files();
+                let mut again = reopen_memory_store(data, wal.unwrap());
+                assert_store_values(&mut again, &expected);
+            }
+        }
+        assert!(cases >= 60, "{cases}");
+    }
+
+    fn differential_request(
+        state: &mut u64,
+        keys: u64,
+        allow_overflow: bool,
+    ) -> TransactionRequest {
+        let mut next = || {
+            *state = state.wrapping_add(1);
+            splitmix_for_test(*state)
+        };
+        let width = 1 + (next() % 16) as usize;
+        let mut indices = BTreeSet::new();
+        while indices.len() < width {
+            indices.insert(next() % (keys + keys / 4));
+        }
+        let mut mutations = Vec::new();
+        for index in indices {
+            let choice = next() % 100;
+            let mutation = if choice < 8 {
+                TransactionMutation::Delete { key: b0_key(index) }
+            } else if allow_overflow && choice < 10 {
+                TransactionMutation::Put {
+                    key: b0_key(index),
+                    value: vec![(index % 251) as u8; 700],
+                }
+            } else {
+                TransactionMutation::Put {
+                    key: b0_key(index),
+                    value: b0_value(index, next()),
+                }
+            };
+            mutations.push(mutation);
+        }
+        if next() % 100 < 2 {
+            let duplicate = mutations[0].clone();
+            mutations.push(duplicate);
+        }
+        let mut conditions = Vec::new();
+        let condition_choice = next() % 100;
+        if condition_choice < 6 {
+            conditions.push(TransactionCondition::Exists {
+                key: b0_key(next() % (keys + keys / 4)),
+            });
+        } else if condition_choice < 9 {
+            conditions.push(TransactionCondition::RevisionEquals {
+                key: b0_key(next() % keys),
+                expected_revision: Revision::new(next() % 4),
+            });
+        }
+        TransactionRequest::new(conditions, mutations)
+    }
+
+    #[test]
+    fn phase_d_randomized_differential_serial_one_and_two_workers() {
+        for seed in [11u64, 29, 47] {
+            let keys = 500u64;
+            let mut stores = [0usize, 1, 2].map(|workers| phase_d_store(workers, keys).0);
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for group_index in 0..80usize {
+                let transactions = 1 + (splitmix_for_test(state ^ 0xabc) % 24) as usize;
+                state = state.wrapping_add(7);
+                let group = (0..transactions)
+                    .map(|_| differential_request(&mut state, keys, group_index % 8 == 3))
+                    .collect::<Vec<_>>();
+                let signatures = stores
+                    .iter_mut()
+                    .map(|store| match store.apply_transaction_group(&group) {
+                        Ok(results) => result_signature(&results),
+                        Err(error) => vec![format!("group error {error:?}")],
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    signatures[0], signatures[1],
+                    "seed {seed} group {group_index}"
+                );
+                assert_eq!(
+                    signatures[0], signatures[2],
+                    "seed {seed} group {group_index}"
+                );
+                for store in &stores[1..] {
+                    assert_same_physical_state(
+                        &stores[0],
+                        store,
+                        &format!("seed {seed} group {group_index}"),
+                    );
+                }
+                if group_index == 30 {
+                    for store in &mut stores {
+                        store.flush().unwrap();
+                    }
+                }
+                if group_index == 55 {
+                    for store in &mut stores {
+                        store.checkpoint().unwrap();
+                    }
+                }
+            }
+            for store in &stores[1..] {
+                let metrics = store.batch_metrics();
+                eprintln!(
+                    "phase-d differential seed {seed} workers {}: parallel groups {}, fallback groups {} (overflow {}, structural {}, route {}, after dispatch {}), single-leaf {}, leaf jobs {}, operations {}",
+                    store.parallel_workers,
+                    metrics.parallel_groups,
+                    metrics.parallel_fallback_groups,
+                    metrics.parallel_fallback_overflow,
+                    metrics.parallel_fallback_structural,
+                    metrics.parallel_fallback_route,
+                    metrics.parallel_fallback_after_dispatch,
+                    metrics.parallel_skipped_single_leaf,
+                    metrics.parallel_leaf_jobs,
+                    metrics.parallel_job_operations
+                );
+                assert!(metrics.parallel_groups >= 20, "seed {seed}: {metrics:?}");
+                assert!(
+                    metrics.parallel_fallback_groups >= 1,
+                    "seed {seed}: {metrics:?}"
+                );
+            }
+            let documents = all_documents(&mut stores[0]);
+            for store in &mut stores {
+                assert_eq!(all_documents(store), documents, "seed {seed}");
+                store.check_invariants().unwrap();
+            }
+            let [serial, one_worker, two_workers] = stores;
+            let (serial_data, serial_wal) = serial.into_files();
+            let serial_wal = serial_wal.unwrap();
+            for store in [one_worker, two_workers] {
+                let (data, wal) = store.into_files();
+                let wal = wal.unwrap();
+                assert!(data.0 == serial_data.0, "seed {seed}: data file differs");
+                assert!(wal.0 == serial_wal.0, "seed {seed}: WAL bytes differ");
+                let mut reopened = reopen_memory_store(data, wal);
+                assert_eq!(all_documents(&mut reopened), documents, "seed {seed}");
+                reopened.check_invariants().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn phase_d_prepared_redo_with_wrong_chain_base_writes_nothing() {
+        let (mut store, _) = phase_d_store(0, 200);
+        let key = b0_key(7);
+        let leaf_id = leaf_of_key(&store, &key);
+        let base = store.dirty_pages[&leaf_id];
+        let base_lsn = blink_image_lsn(&base);
+        let base_crc = crc32c::crc32c(&base);
+        let wal = store.wal.as_mut().unwrap();
+        let commit_lsn = Lsn::new(wal.next_lsn().get() + 1);
+        let mut page = decode_blink_page(&base, leaf_id).unwrap();
+        if let BlinkPage::Leaf { lsn, .. } = &mut page {
+            *lsn = commit_lsn;
+        }
+        let image = encode_blink_page(leaf_id, &page).unwrap();
+        let payload = encode_page_delta(leaf_id, &base, &image).unwrap();
+        let view = decode_page_delta(&payload).unwrap();
+        let spans = view.spans.len() as u64;
+        let changed_bytes = view.changed_bytes() as u64;
+        drop(view);
+        let wal_bytes = wal.metrics().unwrap().wal_bytes;
+        let next_batch_id = wal.next_batch_id();
+        for (wrong_lsn, wrong_crc) in [
+            (base_lsn, base_crc ^ 1),
+            (Lsn::new(base_lsn.get() + 1), base_crc),
+        ] {
+            let commit = PreparedWalCommit {
+                batch_id: next_batch_id,
+                commit_lsn,
+                records: vec![PreparedWalRecord {
+                    page_id: leaf_id,
+                    page_lsn: commit_lsn,
+                    image_crc: crc32c::crc32c(&image),
+                    redo: PreparedWalRedo::Delta {
+                        payload: &payload,
+                        base_lsn: wrong_lsn,
+                        base_crc: wrong_crc,
+                        spans,
+                        changed_bytes,
+                    },
+                }],
+            };
+            assert!(wal.append_group_prepared(&[commit], None).is_err());
+            assert_eq!(wal.metrics().unwrap().wal_bytes, wal_bytes);
+        }
+        let commit = PreparedWalCommit {
+            batch_id: next_batch_id,
+            commit_lsn,
+            records: vec![PreparedWalRecord {
+                page_id: leaf_id,
+                page_lsn: commit_lsn,
+                image_crc: crc32c::crc32c(&image),
+                redo: PreparedWalRedo::Delta {
+                    payload: &payload,
+                    base_lsn,
+                    base_crc,
+                    spans,
+                    changed_bytes,
+                },
+            }],
+        };
+        wal.append_group_prepared(&[commit], None).unwrap();
+        assert!(wal.metrics().unwrap().wal_bytes > wal_bytes);
     }
 }
