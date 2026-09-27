@@ -12250,6 +12250,7 @@ mod tests {
                 assert_store_values(&mut again, &expected);
             }
         }
+        eprintln!("phase-d fault matrix: {cases} injected failures over {} points", points.len());
         assert!(cases >= 60, "{cases}");
     }
 
