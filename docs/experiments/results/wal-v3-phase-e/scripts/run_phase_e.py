@@ -433,12 +433,12 @@ def main():
                 run_core_one("counters", scenario_index, repetition_index, variant)
     elif PHASE == "step":
         candidate = PHASE_ARGUMENTS[0]
-        baseline = PHASE_ARGUMENTS[1] if len(PHASE_ARGUMENTS) > 1 else "phase-d"
+        variants = tuple(PHASE_ARGUMENTS) if len(PHASE_ARGUMENTS) > 1 else (candidate, "phase-d")
         label = f"step{candidate}"
         for repetition_index in range(REPETITIONS):
             for sync_mode, scenario_index in (("disabled", 9), ("real", 9), ("real", 6)):
                 SYNC_MODE[0] = sync_mode
-                for variant in rotated((baseline, candidate), repetition_index, scenario_index + (sync_mode == "real")):
+                for variant in rotated(variants, repetition_index, scenario_index + (sync_mode == "real")):
                     run_core_one(label, scenario_index, repetition_index, variant)
     elif PHASE == "cpu-gate":
         SYNC_MODE[0] = "disabled"

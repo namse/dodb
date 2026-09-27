@@ -6,7 +6,7 @@
 //! use for optimistic reads and parallel execution.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,8 +109,14 @@ pub struct RouteHint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlannedWrite {
+    Put(Arc<[u8]>),
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedMutation {
-    pub mutation: TransactionMutation,
+    pub write: PlannedWrite,
     pub encoded_key: Vec<u8>,
     pub route_hint: RouteHint,
 }
@@ -782,7 +788,6 @@ enum LogicalRevision {
 #[derive(Clone, Debug)]
 struct LogicalEntry {
     present: bool,
-    value: Option<Vec<u8>>,
     revision: LogicalRevision,
     originating_transaction_position: usize,
 }
@@ -2795,7 +2800,6 @@ impl<'a> LogicalOverlay<'a> {
                 entry.originating_transaction_position,
                 token.transaction_position
             );
-            let _ = entry.value.as_ref();
             let revision = Revision::new(token.ordinal);
             return Ok(if entry.present {
                 ObservedState::present(revision)
@@ -2839,15 +2843,11 @@ impl<'a> LogicalOverlay<'a> {
             ));
         }
         for (mutation, encoded_key) in request.mutations.iter().zip(encoded_mutation_keys) {
-            let (present, value) = match mutation {
-                TransactionMutation::Put { value, .. } => (true, Some(value.clone())),
-                TransactionMutation::Delete { .. } => (false, None),
-            };
+            let present = matches!(mutation, TransactionMutation::Put { .. });
             self.entries.insert(
                 encoded_key.clone(),
                 LogicalEntry {
                     present,
-                    value,
                     revision: LogicalRevision::Provisional(token),
                     originating_transaction_position: token.transaction_position,
                 },
@@ -2886,11 +2886,24 @@ fn plan_batch(
     admitted: &[AdmittedTransaction<'_>],
     metrics: &mut BlinkBatchMetrics,
 ) -> Result<BatchPlan> {
-    let mut plan = BatchPlan::default();
-    let mut last_key_writer = BTreeMap::<Vec<u8>, usize>::new();
-    let mut last_leaf_writer = BTreeMap::<PageId, usize>::new();
-    let mut leaf_group_indices = BTreeMap::<PageId, usize>::new();
-    let mut transaction_groups = BTreeMap::<usize, BTreeSet<usize>>::new();
+    let mutation_count = admitted
+        .iter()
+        .map(|transaction| transaction.encoded_mutation_keys.len())
+        .sum::<usize>();
+    let fifo_limit = admitted
+        .iter()
+        .map(|transaction| transaction.fifo_position + 1)
+        .max()
+        .unwrap_or(0);
+    let mut plan = BatchPlan {
+        transactions: Vec::with_capacity(admitted.len()),
+        leaf_groups: Vec::with_capacity(mutation_count),
+        dependencies: Vec::new(),
+    };
+    let mut last_key_writer = HashMap::<&[u8], usize>::with_capacity(mutation_count);
+    let mut last_leaf_writer = HashMap::<PageId, usize>::with_capacity(mutation_count);
+    let mut leaf_group_indices = HashMap::<PageId, usize>::with_capacity(mutation_count);
+    let mut transaction_groups = vec![Vec::<usize>::new(); fifo_limit];
 
     for transaction in admitted {
         let mut dependency_metadata = DependencyMetadata::default();
@@ -2898,7 +2911,7 @@ fn plan_batch(
         for condition in &transaction.request.conditions {
             let encoded = condition.key().encode();
             validate_encoded_key(&encoded)?;
-            if let Some(predecessor) = last_key_writer.get(&encoded).copied() {
+            if let Some(predecessor) = last_key_writer.get(encoded.as_slice()).copied() {
                 dependency_metadata
                     .condition_key_predecessors
                     .push(predecessor);
@@ -2941,16 +2954,20 @@ fn plan_batch(
                 .planner_route_right_link_hops
                 .saturating_add(route_corrections);
             let route_hint = RouteHint { leaf_id };
-            churn::add(ChurnCounter::PlannerMutationClones, 1);
-            churn::add(ChurnCounter::PlannerKeyCopies, 2);
-            churn::add(ChurnCounter::PlannerMapInserts, 3);
+            churn::add(ChurnCounter::PlannerKeyCopies, 1);
             mutations.push(PlannedMutation {
-                mutation: mutation.clone(),
+                write: match mutation {
+                    TransactionMutation::Put { value, .. } => {
+                        churn::add(ChurnCounter::PayloadArcsCreated, 1);
+                        PlannedWrite::Put(Arc::from(value.as_slice()))
+                    }
+                    TransactionMutation::Delete { .. } => PlannedWrite::Delete,
+                },
                 encoded_key: encoded_key.clone(),
                 route_hint,
             });
             metrics.routes_calculated = metrics.routes_calculated.saturating_add(1);
-            if let Some(predecessor) = last_key_writer.get(encoded_key).copied() {
+            if let Some(predecessor) = last_key_writer.get(encoded_key.as_slice()).copied() {
                 dependency_metadata.same_key_predecessors.push(predecessor);
                 plan.dependencies.push(DependencyEdge {
                     predecessor,
@@ -2976,7 +2993,7 @@ fn plan_batch(
                     kind: DependencyKind::StructuralRoute,
                 });
             }
-            last_key_writer.insert(encoded_key.clone(), transaction.fifo_position);
+            last_key_writer.insert(encoded_key.as_slice(), transaction.fifo_position);
             last_leaf_writer.insert(leaf_id, transaction.fifo_position);
             let leaf_group_index = *leaf_group_indices.entry(leaf_id).or_insert_with(|| {
                 let index = plan.leaf_groups.len();
@@ -2989,10 +3006,10 @@ fn plan_batch(
             plan.leaf_groups[leaf_group_index]
                 .mutations
                 .push((transaction.fifo_position, mutation_index));
-            transaction_groups
-                .entry(transaction.fifo_position)
-                .or_default()
-                .insert(leaf_group_index);
+            let groups = &mut transaction_groups[transaction.fifo_position];
+            if !groups.contains(&leaf_group_index) {
+                groups.push(leaf_group_index);
+            }
         }
         let same_transaction_positions = if mutations.len() > 1 {
             vec![transaction.fifo_position; mutations.len()]
@@ -3000,7 +3017,7 @@ fn plan_batch(
             Vec::new()
         };
         churn::add(ChurnCounter::PlannerKeyCopies, mutations.len() as u64);
-        churn::add(ChurnCounter::PlannerMapInserts, mutations.len() as u64 + 1);
+        churn::add(ChurnCounter::PlannerMapInserts, mutations.len() as u64);
         let mutated_key_set = mutations
             .iter()
             .map(|mutation| mutation.encoded_key.clone())
@@ -3047,30 +3064,34 @@ fn plan_batch(
     metrics.dependency_edges = metrics
         .dependency_edges
         .saturating_add(plan.dependencies.len() as u64);
-    let mut dependent_group_indices = BTreeSet::new();
-    for groups in transaction_groups.values() {
+    let mut dependent_group = vec![false; plan.leaf_groups.len()];
+    for groups in &transaction_groups {
         if groups.len() > 1 {
-            dependent_group_indices.extend(groups.iter().copied());
+            for group in groups {
+                dependent_group[*group] = true;
+            }
         }
     }
     for dependency in &plan.dependencies {
-        let Some(predecessor_groups) = transaction_groups.get(&dependency.predecessor) else {
+        let Some(predecessor_groups) = transaction_groups.get(dependency.predecessor) else {
             continue;
         };
-        let Some(successor_groups) = transaction_groups.get(&dependency.successor) else {
+        let Some(successor_groups) = transaction_groups.get(dependency.successor) else {
             continue;
         };
         for predecessor_group in predecessor_groups {
             for successor_group in successor_groups {
                 if predecessor_group != successor_group {
-                    churn::add(ChurnCounter::PlannerMapInserts, 2);
-                    dependent_group_indices.insert(*predecessor_group);
-                    dependent_group_indices.insert(*successor_group);
+                    dependent_group[*predecessor_group] = true;
+                    dependent_group[*successor_group] = true;
                 }
             }
         }
     }
-    let dependent_groups = dependent_group_indices.len() as u64;
+    let dependent_groups = dependent_group
+        .iter()
+        .filter(|dependent| **dependent)
+        .count() as u64;
     metrics.independent_leaf_groups = metrics
         .independent_leaf_groups
         .saturating_add((plan.leaf_groups.len() as u64).saturating_sub(dependent_groups));
@@ -3400,12 +3421,11 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
                 record_counts[transaction_index as usize] += 1;
                 previous_transaction = Some(transaction_index);
             }
-            if let TransactionMutation::Put { value, .. } = &plan.transactions
-                [transaction_index as usize]
+            if let PlannedWrite::Put(value) = &plan.transactions[transaction_index as usize]
                 .mutations
                 .get(*mutation_index)
                 .ok_or_else(|| Error::invariant("parallel leaf references unknown mutation"))?
-                .mutation
+                .write
                 && value.len() > INLINE_VALUE_LIMIT
             {
                 record_parallel_fallback(metrics, ParallelFallbackReason::OverflowOrAllocator);
@@ -3855,14 +3875,14 @@ fn apply_leaf_chain_mutation(
     {
         return Ok(Some(ParallelFallbackReason::RouteMismatch));
     }
-    let value = match &planned_mutation.mutation {
-        TransactionMutation::Put { value, .. } if value.len() <= INLINE_VALUE_LIMIT => {
-            Some(BlinkValueRef::Inline(Arc::from(value.as_slice())))
+    let value = match &planned_mutation.write {
+        PlannedWrite::Put(value) if value.len() <= INLINE_VALUE_LIMIT => {
+            Some(BlinkValueRef::Inline(Arc::clone(value)))
         }
-        TransactionMutation::Put { .. } => {
+        PlannedWrite::Put(_) => {
             return Ok(Some(ParallelFallbackReason::OverflowOrAllocator));
         }
-        TransactionMutation::Delete { .. } => None,
+        PlannedWrite::Delete => None,
     };
     let entry = LeafEntry {
         key: LeafKey::from(encoded_key),
@@ -4148,14 +4168,13 @@ fn apply_cached_leaf_mutation(
     planned_mutation: &PlannedMutation,
     revision: Revision,
 ) -> Result<bool> {
-    let value = match &planned_mutation.mutation {
-        TransactionMutation::Put { value, .. } => Some(value.as_slice()),
-        TransactionMutation::Delete { .. } => None,
-    };
     let encoded = &planned_mutation.encoded_key;
-    let value_ref = match value {
-        Some(bytes) => Some(allocate_value(state, dirty, bytes)?),
-        None => None,
+    let value_ref = match &planned_mutation.write {
+        PlannedWrite::Put(value) if value.len() <= INLINE_VALUE_LIMIT => {
+            Some(BlinkValueRef::Inline(Arc::clone(value)))
+        }
+        PlannedWrite::Put(value) => Some(allocate_value(state, dirty, value)?),
+        PlannedWrite::Delete => None,
     };
     let mut old_value = None;
     let mut split_required = false;
@@ -7432,10 +7451,7 @@ mod tests {
                     ordinal: 1,
                 },
                 mutations: vec![PlannedMutation {
-                    mutation: TransactionMutation::Put {
-                        key: key.clone(),
-                        value: b"value".to_vec(),
-                    },
+                    write: PlannedWrite::Put(Arc::from(&b"value"[..])),
                     encoded_key: key.encode(),
                     route_hint: RouteHint {
                         leaf_id: PageId::new(2),

@@ -58,7 +58,7 @@ impl DocumentKey {
     /// terminator is `00 00`. This makes both arbitrary binary data and empty
     /// components order-preserving under bytewise lexicographic comparison.
     pub fn encode(&self) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(self.pk.0.len() + self.sk.0.len() + 4);
+        let mut encoded = Vec::with_capacity(self.encoded_len());
         encode_component(&self.pk.0, &mut encoded);
         encode_component(&self.sk.0, &mut encoded);
         encoded
