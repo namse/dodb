@@ -549,3 +549,141 @@ The leaf-parallel code stays behind `--parallel-workers` (off by default). Wheth
 ### Files
 
 `results/wal-v3-phase-d/`: `design.md`, `correctness.md`, `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `raw/` (36 sync-disabled gate rows, 36 real-sync gate rows, 2 perf rows, logs), `tables.md`, `analysis.json`, `perf/` (`perf.data`, flat / children / dso / comm reports, `copy-alloc-refcount.txt`), `iteration-d1/` (the D1 sync-disabled gate), `scripts/run_phase_d.py`, `scripts/analyze_phase_d.py`, `scripts/perf_categories.py`, `SHA256SUMS`.
+
+## Phase E — copy/allocation/refcount elimination
+
+Question: with the algorithm, the durability rules, the page format and the WAL format unchanged, and the Phase D parallel executor kept (2 lanes), how much of the width-16 CPU cost goes away if unnecessary copies, temporary allocations and reference-count churn are removed? Answer: **64w width 16 uniform 1.423× Phase D with real sync** (strong success by the plan's bar), 1.417× with sync disabled, and 22% fewer cycles per transaction. But 16w width 1 is still 0.972× Phase C, below the 0.98 bar, so the full matrix and the RocksDB rerun were skipped as the plan says.
+
+Code (branch `experiment/wal-v3-compact-redo`, not merged). Each step has its own commit and its own OCI run:
+
+| Commit | Step |
+|---|---|
+| `b783686` blink: count ownership churn behind the churn-counters feature | E0 counters (off in timed builds) |
+| `ef99cdb` blink: move leaf page images instead of copying them | E1 |
+| `df2ce35` blink: share committed pages between the state and the catalog | E2a (+ pinned-generation test) |
+| `db6499f` blink: keep short leaf keys inside the entry | E2b, measured, then reverted |
+| `b445043` blink: cut planner and admission temporaries | E3 |
+| `4ead3de` Revert "blink: keep short leaf keys inside the entry" | final Phase E = E1 + E2a + E3 |
+
+Raw results, counters, perf and scripts: `results/wal-v3-phase-e/`. Design details: `results/wal-v3-phase-e/design.md`. Correctness: `results/wal-v3-phase-e/correctness.md`.
+
+### E0 — where the churn came from (Phase D, 64w width 16 uniform)
+
+Counters (feature `churn-counters`: per-thread stage tags, a counting global allocator in the benchmark, and counters at every clone / drop / 4 KiB copy site; sync disabled, 2 runs, per committed transaction) and cycles (perf of the Phase D build, real sync):
+
+| Source | Counters per transaction | Share of all cycles |
+|---|---|---|
+| **1. Whole-leaf clone and drop, with per-entry Arc counts** | 29.8 leaf clones (2 per touched leaf: lane and catalog), 452 entry clones, 468 entry drops, ≈ 1,840 atomic count changes on key/value payloads | Arc atomics 10%, 70% of them in `Vec<LeafEntry>` clone/drop and `BlinkPage` drop; plus the clone/drop allocations |
+| **2. Planner and admission temporaries** | 162 planner and 86 admission allocations, 1,283 planner `BTreeSet`/`BTreeMap` inserts (1,219 of them building the "dependent leaf groups" metric), 3 key copies and 1 full `TransactionMutation` clone per mutation | `plan_batch` self 10–12%, planner malloc ≈ 2–3%, dropping the plan ≈ 2% |
+| **3. 4 KiB page-image copies** | 62 copies = 255 KB per transaction: dispatch base copy, delta-check rebuild, chain-base copy, dirty-map insert | dispatch copy 3.1%, lane copies 2.3%, `BTreeMap<PageId, [u8; 4096]>::insert` 2.3%, delta rebuild 0.5% |
+
+The benchmark harness itself (request generation and its per-group `request.clone()`) makes 166 of the 643 allocations per transaction and about 8–10% of cycles in malloc/free; it is outside the store and was not changed. WAL assembly copies were already gone in Phase D. Per-site tables: `results/wal-v3-phase-e/counters/`.
+
+### Steps
+
+Each step ran against Phase D (and the previous step) in the same session, interleaved, 3 runs each: 64w width 16 uniform with sync disabled and with real sync, and 64w width 1 uniform with real sync. Counters: 64w width 16 uniform, sync disabled, per transaction.
+
+| Step | What changed | Counter change | disabled w16 / D | real w16 / D | real w1 / D |
+|---|---|---|---|---|---|
+| E1 | dirty map holds `Arc<[u8; 4096]>`; job borrows its base; lane encodes into a new heap image and moves it along the chain and into the dirty map; delta check in place | 4 KiB copies 62 → 0.3, bytes 255 KB → 1.3 KB | 1.072 | 1.079 | 1.021 |
+| E2a | one `Arc<BlinkPage>` shared by committed state and catalog | leaf clones 29.8 → 15.0; entry clones 452 → 227; entry drops 468 → 243 | 1.166 | 1.143 | 1.077 |
+| E2b (reverted) | keys ≤ 62 bytes inline in the entry | key Arc clones/drops 227/243 → 0 | 1.171 | 1.205 | 1.096 |
+| E3 (on E2b) | planner/admission temporaries | planner allocs 162 → 103, admission 86 → 70, map inserts 1,283 → 16, mutation clones 16 → 0 | 1.299 | 1.488 | 1.096 |
+| final (E3 without E2b) | | allocations 477 → 360 per transaction (harness excluded) | **1.363** | **1.423** | 1.063 |
+
+Ratios are from each step's own session (Phase D varied 2,358–2,468 tx/s with real sync between sessions). Step effects in the same session: E2a over E1 1.066 / 1.059 / 1.077; E3 over E2b 1.093 / 1.216 / 1.002.
+
+**E1.** Same WAL records, same dirty images; the delta check now compares base, payload spans and after-image in place (same validation function as `apply_page_delta`, randomized equivalence test). Dispatch fell from 44 to 26 µs/tx; lane time did not change, because the base image and the new image are now read from and written to heap memory that is cold in the lane instead of a hot stack copy.
+
+**E2.** Phase D cloned each touched leaf twice (lane; catalog `prepare_delta`) and dropped it twice (state install; retired generation), each time changing the count of every key and inline value. With one shared page object the lane's copy-on-write clone is the only clone and the retiring generation's drop the only drop. Committed and published pages are never written in place (`Arc::make_mut` copies a shared page); the new pinned-generation test checks page objects, entry payload pointers, bytes, images and scans across later parallel and serial writes, splits and a checkpoint.
+
+The remaining per-entry counts (one clone and one drop per unchanged entry of each touched leaf) are what E2b tried to remove, by storing short keys inside the entry. Key counts went to zero, but throughput did not change (GM 1.156 vs 1.151 for E2a) and lane time rose 137 → 156 µs/tx: 96-byte entries made each lane clone and page encode read and copy twice the memory. That is the "move the cost elsewhere" case the plan warns against, so E2b was reverted. Removing the value counts too would need entries without a reference each (a per-leaf byte arena), which changes every entry accessor; not attempted.
+
+**E3.** The biggest single item turned out to be the planner's "independent leaf groups" metric: for each dependency edge it inserted every (predecessor group, successor group) pair into a `BTreeSet`, about 1,200 inserts per width-16 transaction. It is now a `bool` vector (same count). The last-writer maps borrow the admitted keys, the planned mutation carries its value once as `Arc<[u8]>` that the lane shares as the entry value, the admission overlay stops copying values it never reads, and `DocumentKey::encode` reserves its exact escaped length (16 reallocations per transaction were zero-byte escapes). Planner + admission time fell from about 97 to 49 µs/tx at width 16.
+
+### Phase D vs Phase E
+
+CPU gate (sync disabled, 3 runs, same session):
+
+| 64w width 16 | Phase D tx/s | Phase E tx/s | E / D |
+|---|---|---|---|
+| uniform | 2,696 | 3,821 | **1.417** |
+| compact | 15,836 | 18,416 | 1.163 |
+| spread | 8,474 | 10,485 | 1.237 |
+
+Coordinator time per transaction, 64w width 16 uniform, sync disabled:
+
+| µs / tx | Phase D | Phase E |
+|---|---|---|
+| **coordinator total** | **331.8** | **224.2** |
+| planner (admission + planning) | 99.6 | 48.4 |
+| leaf jobs run on the coordinator lane | 69.4 | 71.6 |
+| dispatch + wait + collect | 42.4 | 28.8 |
+| catalog / publication / install / dirty tracking | 76.3 | 46.3 |
+| WAL CPU | 18.0 | 17.7 |
+| unattributed | 26.1 | 11.4 |
+| all lanes busy (coordinator lane + worker thread) | 138.8 | 147.6 |
+
+Perf, same classification as Phase D (`scripts/perf_categories.py`, self time), real sync, 64w width 16 uniform, frame-pointer builds with the repository's `+crc` target feature, same session (Phase D 2,279 tx/s, Phase E 3,032 tx/s under perf):
+
+| Category | Phase D share | Phase D cycles/tx | Phase E share | Phase E cycles/tx |
+|---|---|---|---|---|
+| memcpy / memmove | 14.5% | 188,999 | 5.3% | 54,418 |
+| malloc / free (incl. allocator atomics) | 26.8% | 350,570 | 27.2% | 278,227 |
+| Arc refcount atomics (`ldadd8`) | 10.0% | 130,615 | 17.1% | 174,608 |
+| memcmp | 5.1% | 67,136 | 6.6% | 67,920 |
+| **copy / allocation / refcount** | **56.5%** | **737,320** | **56.2%** | **575,172** |
+| CRC32C | 4.4% | 57,470 | 6.6% | 67,715 |
+| planner (`plan_batch` self) | 11.5% | 150,599 | 3.7% | 37,438 |
+| PageDelta | 4.0% | 52,376 | 4.7% | 48,383 |
+| **all cycles per transaction** | | **1,305,974** | | **1,022,892** |
+
+Copy/allocation/refcount cycles per transaction fell 22% (737k → 575k) and all cycles 22% (1.31M → 1.02M); the share stayed at 56% because the rest shrank too (mostly the planner). About 100k cycles/tx of malloc/free in both columns are the benchmark harness.
+
+The Arc atomics went **up** per transaction although the number of count changes halved. By caller: `Vec<LeafEntry>` clone 63k cycles/tx in both (Phase D: two clones, Phase E: one), and the page drop 39k → 57k. Phase D's second clone (catalog) and first drop (install) ran on the coordinator right after the lane had touched the same payloads, so their cache lines were already there; the ones left in Phase E are the lane clone and the retired-generation drop, each of which pulls the payload's cache line from another core or from memory. So these atomics are cache-miss bound: about 120k cycles/tx (≈ 12% of all cycles) are spent changing the counts of entries that did not change.
+
+A first perf pair was built with `RUSTFLAGS=-C force-frame-pointers=yes`, which silently replaces the repository's `+crc` flag; CRC32C then took 12–15% of cycles in both builds. Those files are kept (`*-fp-*`, `copy-alloc-refcount.txt`) but the table above uses the `+crc` pair (`*-fpcrc-*`, `copy-alloc-refcount-crc-enabled.txt`).
+
+### Durable gate (OCI A1 2 OCPU, ZFS, real sync)
+
+`--engine planned-blink --sync-mode real`, 100,000 rows, 2 s warmup, 5 s measure, 3 runs, Phase C (`b6c74b1c…`), Phase D (`fbb70d7c…`) and Phase E (`6670b610…`) interleaved in one session; every row checked for engine, sync mode, WAL syncs, page deltas, `parallel_workers` and parallel groups.
+
+| Scenario | Phase C tx/s | Phase D tx/s | Phase E tx/s | **E / D** | E / C | p99 µs C → D → E |
+|---|---|---|---|---|---|---|
+| 16w w1 uniform | 8,342 | 7,976 | 8,112 | 1.017 | **0.972** | 3,410 → 3,278 → 3,387 |
+| 16w w16 uniform | 1,947 | 2,293 | 2,666 | 1.163 | 1.369 | 15,920 → 13,350 → 11,917 |
+| 64w w1 uniform | 23,906 | 26,272 | 28,901 | 1.100 | 1.209 | 5,576 → 4,914 → 4,728 |
+| 64w w16 uniform | 2,058 | 2,423 | 3,449 | **1.423** | 1.676 | 57,027 → 48,028 → 38,098 |
+| 64w w16 compact | 10,762 | 11,935 | 13,232 | 1.109 | 1.230 | 9,811 → 8,847 → 8,174 |
+| 64w w16 spread | 5,842 | 6,427 | 7,606 | 1.183 | 1.302 | 24,374 → 18,845 → 15,542 |
+
+GM over the six: E / D **1.159**, E / C 1.276 (D / C 1.101 in this session). WAL bytes per transaction and transactions per sync are unchanged (for example 2,611 → 2,616 B/tx and 61.5 → 60.2 tx/sync at 64w width 16 uniform).
+
+**16w width 1.** Phase E is 1.7% above Phase D and 2.8% below Phase C (the three runs: C 8,300–8,416, E 8,027–8,178). Coordinator CPU outside the sync is lower than Phase C's (26.7 vs 29.5 µs/tx), but WAL sync time per transaction is higher (93.3 vs 87.4 µs) at slightly fewer transactions per sync (8.0 vs 8.4). This is the Phase D effect: with 8-transaction groups the second lane competes with ZFS's sync work for the two cores. Phase E did not remove it.
+
+**Gates.** 64w width 16 uniform E / D = 1.423 ≥ 1.10, but 16w width 1 E / C = 0.972 < 0.98, so the full 14-scenario matrix and the RocksDB rerun were not run.
+
+### Should the Phase D executor stay?
+
+Same session, Phase C against Phase E with the serial executor (`--parallel-workers 0`, same binary) and with 2 lanes:
+
+| Scenario | Phase C | E serial | E 2 lanes | E serial / C | E 2 lanes / C | 2 lanes / serial |
+|---|---|---|---|---|---|---|
+| 16w w1 uniform | 8,289 | 7,879 | 7,692 | 0.950 | 0.928 | 0.976 |
+| 16w w16 uniform | 1,861 | 2,111 | 2,601 | 1.134 | 1.397 | 1.232 |
+| 64w w1 uniform | 23,209 | 23,625 | 27,417 | 1.018 | 1.181 | 1.161 |
+| 64w w16 uniform | 1,999 | 2,587 | 3,421 | 1.294 | 1.711 | 1.322 |
+| 64w w16 compact | 10,608 | 11,587 | 12,955 | 1.092 | 1.221 | 1.118 |
+| 64w w16 spread | 5,922 | 6,742 | 7,509 | 1.139 | 1.268 | 1.114 |
+
+(Phase C's 16w width 1 runs were 9,384, 7,769 and 7,714 here; without the first run the three variants are within 1.3% of each other.)
+
+On top of Phase E the parallel executor is worth 1.11–1.32× everywhere except 16w width 1, where it costs 2.4%. That is well above the "~10%" at which the plan says to revert, and the width-1 loss is small but real and limited to small groups. **Recommendation: keep the Phase D executor.** Making it fall back to the serial executor for groups with few leaf jobs is a tuning question for later, not part of this phase.
+
+### Next bottleneck
+
+**Per-entry reference counts on unchanged leaf entries.** After Phase E the lane's copy-on-write clone and the retired generation's drop still change the count of every key and inline value in each touched leaf: about 120k cycles per width-16 transaction, 12% of all cycles, the largest item the store itself owns. They are not many (about 950 count changes per transaction: a clone and a drop of each key and value) but each one misses cache, because the counts live in separate payload allocations last touched on another core. Inlining keys (E2b) showed that simply making entries bigger moves the cost into copying. The direction is a leaf representation whose entries hold no reference each (for example one shared byte arena per leaf with offsets in the entries, so a lane clone copies a plain vector and bumps one count), keeping the same page encoding and the same copy-on-write rule for published pages.
+
+### Files
+
+`results/wal-v3-phase-e/`: `design.md`, `correctness.md` (+ `correctness/` logs, `crossver/` Phase D vs Phase E byte-for-byte check), `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `raw/` (counter rows, step rows, CPU gate, durable gate, retention, perf rows), `counters/` (per-site tables and `steps.md`), `tables.md`, `analysis.json`, `perf/` (`perf.data`, reports, `copy-alloc-refcount*.txt`, `sources-*.json`), `scripts/` (`run_phase_e.py`, `analyze_phase_e.py`, `churn_summary.py`, `perf_categories.py`, `perf_sources.py`), `SHA256SUMS`.

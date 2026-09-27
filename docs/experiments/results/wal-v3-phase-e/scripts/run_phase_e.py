@@ -454,6 +454,13 @@ def main():
             for scenario_index in DURABLE_GATE_SCENARIOS:
                 for variant in rotated(variants, repetition_index, scenario_index):
                     run_core_one("gate", scenario_index, repetition_index, variant)
+    elif PHASE == "retention":
+        SYNC_MODE[0] = "real"
+        variants = tuple(PHASE_ARGUMENTS)
+        for repetition_index in range(REPETITIONS):
+            for scenario_index in DURABLE_GATE_SCENARIOS:
+                for variant in rotated(variants, repetition_index, scenario_index):
+                    run_core_one("retention", scenario_index, repetition_index, variant)
     elif PHASE == "matrix":
         SYNC_MODE[0] = "real"
         variants = tuple(PHASE_ARGUMENTS)
