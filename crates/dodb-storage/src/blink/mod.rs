@@ -386,84 +386,9 @@ enum BlinkValueRef {
     Overflow { head: PageId, length: u64 },
 }
 
-const LEAF_KEY_INLINE_CAPACITY: usize = 62;
-
-#[derive(Clone)]
-enum LeafKey {
-    Inline {
-        length: u8,
-        bytes: [u8; LEAF_KEY_INLINE_CAPACITY],
-    },
-    Shared(Arc<[u8]>),
-}
-
-impl LeafKey {
-    fn is_shared(&self) -> bool {
-        matches!(self, Self::Shared(_))
-    }
-}
-
-impl From<&[u8]> for LeafKey {
-    fn from(key: &[u8]) -> Self {
-        if key.len() <= LEAF_KEY_INLINE_CAPACITY {
-            let mut bytes = [0u8; LEAF_KEY_INLINE_CAPACITY];
-            bytes[..key.len()].copy_from_slice(key);
-            Self::Inline {
-                length: key.len() as u8,
-                bytes,
-            }
-        } else {
-            Self::Shared(Arc::from(key))
-        }
-    }
-}
-
-impl From<Vec<u8>> for LeafKey {
-    fn from(key: Vec<u8>) -> Self {
-        Self::from(key.as_slice())
-    }
-}
-
-impl<const N: usize> From<[u8; N]> for LeafKey {
-    fn from(key: [u8; N]) -> Self {
-        Self::from(&key[..])
-    }
-}
-
-impl std::ops::Deref for LeafKey {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        match self {
-            Self::Inline { length, bytes } => &bytes[..*length as usize],
-            Self::Shared(bytes) => bytes,
-        }
-    }
-}
-
-impl AsRef<[u8]> for LeafKey {
-    fn as_ref(&self) -> &[u8] {
-        self
-    }
-}
-
-impl PartialEq for LeafKey {
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-    }
-}
-
-impl Eq for LeafKey {}
-
-impl std::fmt::Debug for LeafKey {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        (**self).fmt(formatter)
-    }
-}
-
 #[derive(Debug, Eq, PartialEq)]
 struct LeafEntry {
-    key: LeafKey,
+    key: Arc<[u8]>,
     revision: Revision,
     value: Option<BlinkValueRef>,
 }
@@ -472,15 +397,13 @@ impl Clone for LeafEntry {
     fn clone(&self) -> Self {
         if churn::ENABLED {
             churn::add(ChurnCounter::LeafEntryClones, 1);
-            if self.key.is_shared() {
-                churn::add(ChurnCounter::ArcKeyClones, 1);
-            }
+            churn::add(ChurnCounter::ArcKeyClones, 1);
             if matches!(self.value, Some(BlinkValueRef::Inline(_))) {
                 churn::add(ChurnCounter::ArcValueClones, 1);
             }
         }
         Self {
-            key: self.key.clone(),
+            key: Arc::clone(&self.key),
             revision: self.revision,
             value: self.value.clone(),
         }
@@ -491,9 +414,7 @@ impl Clone for LeafEntry {
 impl Drop for LeafEntry {
     fn drop(&mut self) {
         churn::add(ChurnCounter::LeafEntryDrops, 1);
-        if self.key.is_shared() {
-            churn::add(ChurnCounter::ArcKeyDrops, 1);
-        }
+        churn::add(ChurnCounter::ArcKeyDrops, 1);
         if matches!(self.value, Some(BlinkValueRef::Inline(_))) {
             churn::add(ChurnCounter::ArcValueDrops, 1);
         }
@@ -3885,7 +3806,7 @@ fn apply_leaf_chain_mutation(
         PlannedWrite::Delete => None,
     };
     let entry = LeafEntry {
-        key: LeafKey::from(encoded_key),
+        key: Arc::from(encoded_key),
         revision: Revision::from(commit_lsn),
         value,
     };
@@ -4197,7 +4118,7 @@ fn apply_cached_leaf_mutation(
                     std::mem::replace(
                         &mut entries[entry_index],
                         LeafEntry {
-                            key: LeafKey::from(encoded.as_slice()),
+                            key: Arc::from(encoded.as_slice()),
                             revision,
                             value: value_ref,
                         },
@@ -4216,7 +4137,7 @@ fn apply_cached_leaf_mutation(
                 entries.insert(
                     entry_index,
                     LeafEntry {
-                        key: LeafKey::from(encoded.as_slice()),
+                        key: Arc::from(encoded.as_slice()),
                         revision,
                         value: value_ref,
                     },
@@ -4734,7 +4655,7 @@ fn apply_mutation<S: BlinkMutationState>(
         Ok(index) => {
             let old = entries[index].value.clone();
             entries[index] = LeafEntry {
-                key: LeafKey::from(encoded.as_slice()),
+                key: Arc::from(encoded),
                 revision,
                 value: value_ref,
             };
@@ -4759,7 +4680,7 @@ fn apply_mutation<S: BlinkMutationState>(
             entries.insert(
                 index,
                 LeafEntry {
-                    key: LeafKey::from(encoded.as_slice()),
+                    key: Arc::from(encoded),
                     revision,
                     value: value_ref,
                 },
@@ -5708,7 +5629,7 @@ fn decode_leaf_record(bytes: &[u8], slot_key_length: usize) -> Result<LeafEntry>
     if key_end > bytes.len() {
         return Err(Error::corruption("Blink leaf key exceeds record"));
     }
-    let key = LeafKey::from(&bytes[LEAF_RECORD_HEADER_SIZE..key_end]);
+    let key = Arc::<[u8]>::from(&bytes[LEAF_RECORD_HEADER_SIZE..key_end]);
     validate_encoded_key(&key).map_err(|_| Error::corruption("Blink leaf key is not canonical"))?;
     let value = match flags {
         0 if value_length == 0 && aux == NULL_PAGE_ID && bytes.len() == key_end => None,
@@ -6604,12 +6525,12 @@ mod tests {
         let first_key = DocumentKey::new(b"shared".to_vec(), b"first".to_vec()).encode();
         let second_key = DocumentKey::new(b"shared".to_vec(), b"second".to_vec()).encode();
         let first_entry = LeafEntry {
-            key: LeafKey::from(first_key.as_slice()),
+            key: Arc::from(first_key.as_slice()),
             revision: Revision::new(11),
             value: Some(BlinkValueRef::Inline(Arc::from(&b"first-value"[..]))),
         };
         let second_entry = LeafEntry {
-            key: LeafKey::from(second_key.as_slice()),
+            key: Arc::from(second_key.as_slice()),
             revision: Revision::new(12),
             value: Some(BlinkValueRef::Inline(Arc::from(&b"second-value"[..]))),
         };
@@ -6635,7 +6556,7 @@ mod tests {
     fn leaf_page_clone_shares_key_and_inline_value_payloads() {
         let (state, page_id, _, _) = payload_sharing_test_state();
         let base_page = state.pages.get(&page_id).unwrap();
-        let cloned_page = BlinkPage::clone(base_page);
+        let cloned_page = base_page.clone();
         let BlinkPage::Leaf {
             entries: base_entries,
             ..
@@ -6646,14 +6567,13 @@ mod tests {
         let BlinkPage::Leaf {
             entries: cloned_entries,
             ..
-        } = &cloned_page
+        } = &*cloned_page
         else {
             unreachable!();
         };
         assert_eq!(base_entries.len(), 2);
         for (base_entry, cloned_entry) in base_entries.iter().zip(cloned_entries) {
-            assert!(!base_entry.key.is_shared() && !cloned_entry.key.is_shared());
-            assert_eq!(base_entry.key, cloned_entry.key);
+            assert!(Arc::ptr_eq(&base_entry.key, &cloned_entry.key));
             assert_eq!(base_entry.revision, cloned_entry.revision);
             match (&base_entry.value, &cloned_entry.value) {
                 (Some(BlinkValueRef::Inline(base)), Some(BlinkValueRef::Inline(cloned))) => {
@@ -6663,27 +6583,6 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-    }
-
-    #[test]
-    fn leaf_keys_inline_short_keys_and_share_long_keys() {
-        let short = DocumentKey::new(b"pk".to_vec(), b"sk".to_vec()).encode();
-        let long = DocumentKey::new(vec![0x41; 40], vec![0x42; 40]).encode();
-        assert_eq!(std::mem::size_of::<LeafKey>(), 64);
-        assert!(short.len() <= LEAF_KEY_INLINE_CAPACITY && long.len() > LEAF_KEY_INLINE_CAPACITY);
-        let boundary = vec![0x43; LEAF_KEY_INLINE_CAPACITY];
-        for (bytes, shared) in [(&short, false), (&long, true), (&boundary, false)] {
-            let key = LeafKey::from(bytes.as_slice());
-            let cloned = key.clone();
-            assert_eq!(key.is_shared(), shared);
-            assert_eq!(key.as_ref(), bytes.as_slice());
-            assert_eq!(cloned, key);
-            assert_eq!(format!("{key:?}"), format!("{:?}", bytes.as_slice()));
-            if let (LeafKey::Shared(left), LeafKey::Shared(right)) = (&key, &cloned) {
-                assert!(Arc::ptr_eq(left, right));
-            }
-        }
-        assert!(LeafKey::from(vec![0x43; LEAF_KEY_INLINE_CAPACITY + 1]).is_shared());
     }
 
     #[test]
@@ -6705,7 +6604,7 @@ mod tests {
         else {
             unreachable!();
         };
-        assert_eq!(base_entries[0].key, overlay_entries[0].key);
+        assert!(Arc::ptr_eq(&base_entries[0].key, &overlay_entries[0].key));
         let Some(BlinkValueRef::Inline(base_first_value)) = &base_entries[0].value else {
             unreachable!();
         };
@@ -6716,7 +6615,7 @@ mod tests {
 
         let provisional = Revision::new(99);
         let committed = Lsn::new(123);
-        let replacement_key = LeafKey::from(second_key.as_slice());
+        let replacement_key: Arc<[u8]> = Arc::from(second_key.as_slice());
         let replacement_value: Arc<[u8]> = Arc::from(&b"overlay-value"[..]);
         let BlinkPage::Leaf { entries, .. } = working.pages.get_mut(&page_id).unwrap() else {
             unreachable!();
@@ -7924,7 +7823,7 @@ mod tests {
             high_key: None,
             right_sibling: None,
             entries: vec![LeafEntry {
-                key: LeafKey::from([0xff]),
+                key: Arc::from([0xff]),
                 revision: Revision::new(1),
                 value: None,
             }],
@@ -10886,7 +10785,7 @@ mod tests {
             )))
         };
         LeafEntry {
-            key: LeafKey::from(DocumentKey::new(primary, secondary).encode().as_slice()),
+            key: Arc::from(DocumentKey::new(primary, secondary).encode().as_slice()),
             revision: Revision::new(revision),
             value,
         }
@@ -11145,7 +11044,7 @@ mod tests {
     fn delta_test_leaf(page_id: PageId, lsn: Lsn, value_byte: u8) -> [u8; PAGE_SIZE] {
         let entries = (0..8u8)
             .map(|index| LeafEntry {
-                key: LeafKey::from(
+                key: Arc::from(
                     DocumentKey::new(b"delta".to_vec(), vec![index; 4])
                         .encode()
                         .as_slice(),
