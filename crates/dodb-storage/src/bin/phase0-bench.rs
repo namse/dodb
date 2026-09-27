@@ -26,6 +26,60 @@ use dodb_storage::{
     DurableFile, ProductionFile, StorageMetrics, WalMetrics, WalRedoStats,
 };
 
+#[cfg(feature = "churn-counters")]
+mod churn_allocator {
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    struct CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            dodb_storage::churn::record_alloc(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            dodb_storage::churn::record_alloc(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            dodb_storage::churn::record_free(layout.size());
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            dodb_storage::churn::record_realloc(new_size);
+            unsafe { System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+}
+
+fn churn_delta(
+    before: &[(
+        dodb_storage::churn::ChurnSite,
+        dodb_storage::churn::ChurnCounter,
+        u64,
+    )],
+    after: &[(
+        dodb_storage::churn::ChurnSite,
+        dodb_storage::churn::ChurnCounter,
+        u64,
+    )],
+) -> Vec<(String, u64)> {
+    before
+        .iter()
+        .zip(after)
+        .filter_map(|((site, counter, before_value), (_, _, after_value))| {
+            let delta = after_value.saturating_sub(*before_value);
+            (delta > 0).then(|| (format!("churn_{}_{}", site.name(), counter.name()), delta))
+        })
+        .collect()
+}
+
 static CHECKPOINT_WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static CHECKPOINT_EVENTS: Mutex<Vec<CheckpointEvent>> = Mutex::new(Vec::new());
 
@@ -2910,6 +2964,7 @@ fn build_record(
     cpu_end: &ProcessCpuSample,
     measurement_started: Instant,
     samples: &[ResourceSample],
+    churn: &[(String, u64)],
 ) -> String {
     let mut json = JsonObject::new();
     let seconds = wall.as_secs_f64().max(f64::EPSILON);
@@ -3384,6 +3439,17 @@ fn build_record(
         "component_timing_scope",
         "existing cumulative coordinator/storage/WAL metrics; per-request component percentiles unavailable without production hot-path instrumentation",
     );
+    json.string(
+        "churn_counters",
+        if dodb_storage::churn::ENABLED {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    for (name, value) in churn {
+        json.u64(name, *value);
+    }
     if let Some(window_seconds) = args.window_seconds {
         let mut timeline = measured.window_timeline.clone();
         timeline.sort_unstable();
@@ -3608,6 +3674,7 @@ async fn run_repetition(
         ));
     }
     let before = adapter.snapshot();
+    let churn_before = dodb_storage::churn::snapshot();
     let cpu_start = ProcessCpuSample::capture();
     let started = Instant::now();
     let sampler = args.window_seconds.map(|window_seconds| {
@@ -3635,8 +3702,10 @@ async fn run_repetition(
             "measurement_end".to_string(),
         ));
     }
+    let churn_after = dodb_storage::churn::snapshot();
     let after = adapter.snapshot();
     let delta = MetricDelta::from(&before, &after);
+    let churn = churn_delta(&churn_before, &churn_after);
     print_run_summary(scenario, repetition, &measured, wall, &delta);
     let line = build_record(
         machine,
@@ -3652,6 +3721,7 @@ async fn run_repetition(
         &cpu_end,
         started,
         &samples,
+        &churn,
     );
     use std::io::Write;
     writeln!(output, "{line}")?;

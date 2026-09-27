@@ -2,6 +2,7 @@
 
 pub mod blink;
 pub mod btree;
+pub mod churn;
 pub mod durable_file;
 pub mod fault;
 pub mod page;

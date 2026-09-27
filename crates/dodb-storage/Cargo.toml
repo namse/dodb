@@ -10,5 +10,8 @@ dodb-core = { path = "../dodb-core" }
 libc.workspace = true
 tokio.workspace = true
 
+[features]
+churn-counters = []
+
 [dev-dependencies]
 proptest.workspace = true

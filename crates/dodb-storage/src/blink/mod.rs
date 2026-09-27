@@ -25,6 +25,7 @@ use crate::btree::{
     BatchRequest, BatchResponse, DatabaseConfig, Document, InvariantReport, StorageLimits,
     StorageMetrics,
 };
+use crate::churn::{self, ChurnCounter, ChurnSite};
 use crate::durable_file::{DurableFile, ProductionFile};
 use crate::fault::FaultInjector;
 #[cfg(test)]
@@ -379,11 +380,39 @@ enum BlinkValueRef {
     Overflow { head: PageId, length: u64 },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct LeafEntry {
     key: Arc<[u8]>,
     revision: Revision,
     value: Option<BlinkValueRef>,
+}
+
+impl Clone for LeafEntry {
+    fn clone(&self) -> Self {
+        if churn::ENABLED {
+            churn::add(ChurnCounter::LeafEntryClones, 1);
+            churn::add(ChurnCounter::ArcKeyClones, 1);
+            if matches!(self.value, Some(BlinkValueRef::Inline(_))) {
+                churn::add(ChurnCounter::ArcValueClones, 1);
+            }
+        }
+        Self {
+            key: Arc::clone(&self.key),
+            revision: self.revision,
+            value: self.value.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "churn-counters")]
+impl Drop for LeafEntry {
+    fn drop(&mut self) {
+        churn::add(ChurnCounter::LeafEntryDrops, 1);
+        churn::add(ChurnCounter::ArcKeyDrops, 1);
+        if matches!(self.value, Some(BlinkValueRef::Inline(_))) {
+            churn::add(ChurnCounter::ArcValueDrops, 1);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,7 +421,7 @@ struct InternalEntry {
     right_child: PageId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum BlinkPage {
     Leaf {
         lsn: Lsn,
@@ -418,6 +447,66 @@ enum BlinkPage {
         lsn: Lsn,
         next: Option<PageId>,
     },
+}
+
+impl Clone for BlinkPage {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Leaf {
+                lsn,
+                high_key,
+                right_sibling,
+                entries,
+            } => {
+                if churn::ENABLED {
+                    churn::add(ChurnCounter::LeafPageClones, 1);
+                    churn::add(
+                        ChurnCounter::LeafVecCapacityBytes,
+                        (entries.len() * std::mem::size_of::<LeafEntry>()) as u64,
+                    );
+                }
+                Self::Leaf {
+                    lsn: *lsn,
+                    high_key: high_key.clone(),
+                    right_sibling: *right_sibling,
+                    entries: entries.clone(),
+                }
+            }
+            Self::Internal {
+                lsn,
+                level,
+                high_key,
+                right_sibling,
+                leftmost_child,
+                entries,
+            } => {
+                churn::add(ChurnCounter::InternalPageClones, 1);
+                Self::Internal {
+                    lsn: *lsn,
+                    level: *level,
+                    high_key: high_key.clone(),
+                    right_sibling: *right_sibling,
+                    leftmost_child: *leftmost_child,
+                    entries: entries.clone(),
+                }
+            }
+            Self::Overflow {
+                lsn,
+                next,
+                total_length,
+                chunk,
+            } => Self::Overflow {
+                lsn: *lsn,
+                next: *next,
+                total_length: *total_length,
+                chunk: chunk.clone(),
+            },
+            Self::Free { lsn, next } => Self::Free {
+                lsn: *lsn,
+                next: *next,
+            },
+        }
+    }
 }
 
 impl BlinkPage {
@@ -1904,6 +1993,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 "experimental storage shard is degraded after an uncertain write",
             ));
         }
+        let _group_site = churn::enter(ChurnSite::GroupOther);
 
         self.batch_metrics.logical_groups = self.batch_metrics.logical_groups.saturating_add(1);
         self.batch_metrics.logical_transactions = self
@@ -1911,6 +2001,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .logical_transactions
             .saturating_add(requests.len() as u64);
         let admission_started = Instant::now();
+        let admission_site = churn::enter(ChurnSite::Admission);
         let committed_state = &self.state;
         let mut overlay = LogicalOverlay::new(committed_state);
         let provisional_start = self.next_revision.get();
@@ -1977,12 +2068,15 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .validation_nanos
             .saturating_add(admission_nanos);
         drop(overlay);
+        drop(admission_site);
         if admitted.is_empty() {
             return Ok(results);
         }
 
         let planning_started = Instant::now();
+        let planner_site = churn::enter(ChurnSite::Planner);
         let plan = Arc::new(plan_batch(&self.state, &admitted, &mut self.batch_metrics)?);
+        drop(planner_site);
         self.batch_metrics.planning_nanos = self
             .batch_metrics
             .planning_nanos
@@ -2014,6 +2108,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             )?,
             None => None,
         };
+        let serial_site = churn::enter(ChurnSite::SerialExecution);
         let preparation = match parallel_preparation {
             Some(preparation) => preparation,
             None => prepare_planned_serial_execution(
@@ -2028,6 +2123,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 &mut self.batch_metrics,
             )?,
         };
+        drop(serial_site);
         let PlannedExecutionPreparation {
             working,
             executed,
@@ -2051,6 +2147,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .dirty_union_nanos
             .saturating_add(elapsed_nanos(dirty_union_started));
         let catalog_started = Instant::now();
+        let catalog_site = churn::enter(ChurnSite::Catalog);
         if !working
             .pages
             .keys()
@@ -2063,6 +2160,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         let (published_generation, prepare_timing) =
             self.publisher
                 .prepare_delta(&working, &final_execution.superblock, &all_dirty)?;
+        drop(catalog_site);
         self.batch_metrics.catalog_construction_nanos = self
             .batch_metrics
             .catalog_construction_nanos
@@ -2089,11 +2187,15 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .saturating_add(prepare_timing.catalog_state_scan_nanos);
 
         let wal_assembly_started = Instant::now();
+        let wal_assembly_site = churn::enter(ChurnSite::WalAssembly);
         let mut wal_commits = Vec::with_capacity(executed.len());
         let mut final_images = BTreeMap::new();
         let mut wal_bytes = 0u64;
         for transaction in &executed {
             if self.wal.is_some() {
+                for _ in &transaction.images {
+                    count_image_copy();
+                }
                 wal_commits.push(WalCommit {
                     batch_id: transaction.batch_id,
                     commit_lsn: transaction.result.commit_lsn,
@@ -2101,6 +2203,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 });
             }
             for image in &transaction.images {
+                count_image_copy();
                 final_images.insert(image.page_id, image.image);
             }
         }
@@ -2155,6 +2258,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 .batch_metrics
                 .wal_assembly_nanos
                 .saturating_add(elapsed_nanos(prepared_assembly_started));
+            let _wal_append_site = churn::enter(ChurnSite::WalAppend);
             let reports = match wal
                 .append_group_prepared(&prepared_commits, self.fault_injector.as_deref_mut())
             {
@@ -2190,6 +2294,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             };
             // Each WAL image above comes from this execution's successful
             // encode_blink_page or encode_blink_superblock call in this process.
+            let _wal_append_site = churn::enter(ChurnSite::WalAppend);
             let reports = match wal.append_group_trusted_internal_with_page_deltas(
                 &wal_commits,
                 &mut delta_request,
@@ -2212,6 +2317,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             self.file.sync_data()?;
         }
 
+        drop(wal_assembly_site);
         if let Some(injector) = self.fault_injector.as_deref_mut()
             && let Err(error) = injector.hit("before_generation_publication")
         {
@@ -2233,6 +2339,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         }
 
         let state_install_started = Instant::now();
+        let state_install_site = churn::enter(ChurnSite::StateInstall);
         for (page_id, page) in delta.pages {
             self.state.pages.insert(page_id, page);
         }
@@ -2245,6 +2352,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         self.next_revision = final_execution.next_revision;
         self.next_lsn = final_execution.next_lsn;
         self.next_batch_id = final_execution.next_batch_id;
+        drop(state_install_site);
         self.batch_metrics.state_install_nanos = self
             .batch_metrics
             .state_install_nanos
@@ -2276,7 +2384,9 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             }
         }
         let publication_started = Instant::now();
+        let publication_site = churn::enter(ChurnSite::Publication);
         let publish_timing = self.publisher.publish(published_generation);
+        drop(publication_site);
         self.batch_metrics.generation_publication_nanos = self
             .batch_metrics
             .generation_publication_nanos
@@ -2290,9 +2400,16 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .retired_generation_drop_nanos
             .saturating_add(publish_timing.retired_generation_drop_nanos);
         let dirty_tracking_started = Instant::now();
+        let dirty_tracking_site = churn::enter(ChurnSite::DirtyTracking);
         if let Some(parallel_redo) = &parallel_redo {
             for result in &parallel_redo.results {
+                count_dirty_insert(&self.dirty_pages, result.leaf_id);
                 self.dirty_pages.insert(result.leaf_id, *result.final_image);
+            }
+        }
+        for page_id in final_images.keys() {
+            if *page_id != PageId::ZERO && *page_id != PageId::new(1) {
+                count_dirty_insert(&self.dirty_pages, *page_id);
             }
         }
         self.dirty_pages.extend(
@@ -2305,8 +2422,10 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             SuperblockSlot::A => PageId::ZERO,
             SuperblockSlot::B => PageId::new(1),
         }) {
+            count_image_copy();
             self.dirty_superblock = Some(*image);
         }
+        drop(dirty_tracking_site);
         self.batch_metrics.dirty_tracking_nanos = self
             .batch_metrics
             .dirty_tracking_nanos
@@ -2703,6 +2822,9 @@ fn plan_batch(
                 .planner_route_right_link_hops
                 .saturating_add(route_corrections);
             let route_hint = RouteHint { leaf_id };
+            churn::add(ChurnCounter::PlannerMutationClones, 1);
+            churn::add(ChurnCounter::PlannerKeyCopies, 2);
+            churn::add(ChurnCounter::PlannerMapInserts, 3);
             mutations.push(PlannedMutation {
                 mutation: mutation.clone(),
                 encoded_key: encoded_key.clone(),
@@ -2758,6 +2880,8 @@ fn plan_batch(
         } else {
             Vec::new()
         };
+        churn::add(ChurnCounter::PlannerKeyCopies, mutations.len() as u64);
+        churn::add(ChurnCounter::PlannerMapInserts, mutations.len() as u64 + 1);
         let mutated_key_set = mutations
             .iter()
             .map(|mutation| mutation.encoded_key.clone())
@@ -2820,6 +2944,7 @@ fn plan_batch(
         for predecessor_group in predecessor_groups {
             for successor_group in successor_groups {
                 if predecessor_group != successor_group {
+                    churn::add(ChurnCounter::PlannerMapInserts, 2);
                     dependent_group_indices.insert(*predecessor_group);
                     dependent_group_indices.insert(*successor_group);
                 }
@@ -3073,6 +3198,7 @@ fn shutdown_parallel_workers(workers: &mut [ParallelWorkerSlot]) {
 }
 
 fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerCommand>) {
+    let _worker_site = churn::enter(ChurnSite::WorkerThread);
     let thread_id = thread::current().id();
     while let Ok(command) = receiver.recv() {
         match command {
@@ -3122,6 +3248,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
         return Ok(None);
     };
     let dispatch_started = Instant::now();
+    let dispatch_site = churn::enter(ChurnSite::Dispatch);
     let transaction_count = plan.transactions.len();
     let fifo_limit = plan
         .transactions
@@ -3209,10 +3336,15 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
         }
         let chain_entry = wal.page_chain_entry(leaf_id);
         let base_image = if chain_entry.is_some() {
-            dirty_pages.get(&leaf_id).map(|image| Box::new(*image))
+            dirty_pages.get(&leaf_id).map(|image| {
+                count_image_copy();
+                churn::add(ChurnCounter::PageImageBuffers, 1);
+                Box::new(*image)
+            })
         } else {
             None
         };
+        churn::add(ChurnCounter::JobsBuilt, 1);
         jobs.push(LeafChainJob {
             leaf_id,
             initial_page,
@@ -3242,6 +3374,8 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     }
 
     let worker_run = worker_pool.execute(jobs)?;
+    drop(dispatch_site);
+    let _collect_site = churn::enter(ChurnSite::Collect);
     if worker_run.worker_threads.len() as u64 + 1 != worker_run.lanes {
         return Err(Error::invariant(
             "parallel Blink worker dispatch result count is inconsistent",
@@ -3423,6 +3557,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
 }
 
 fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
+    let _lane_site = churn::enter(ChurnSite::Lane);
     #[cfg(test)]
     match job.fault {
         Some(ParallelWorkerFault::Error { .. }) => {
@@ -3443,7 +3578,12 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
         Some((chain_lsn, chain_crc)) => {
             let image = match job.base_image {
                 Some(image) => image,
-                None => Box::new(encode_blink_page(leaf_id, &page)?),
+                None => {
+                    churn::add(ChurnCounter::PageEncodes, 1);
+                    count_image_copy();
+                    churn::add(ChurnCounter::PageImageBuffers, 1);
+                    Box::new(encode_blink_page(leaf_id, &page)?)
+                }
             };
             let image_crc = crc32c::crc32c(&image[..]);
             if blink_image_lsn(&image) != chain_lsn || image_crc != chain_crc {
@@ -3492,6 +3632,7 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
             .saturating_add(elapsed_nanos(mutation_started));
 
         let encode_started = Instant::now();
+        churn::add(ChurnCounter::PageEncodes, 1);
         let image = encode_blink_page(leaf_id, &page)?;
         timing.encode_nanos = timing
             .encode_nanos
@@ -3500,10 +3641,16 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
         let delta_started = Instant::now();
         let image_crc = crc32c::crc32c(&image[..]);
         let redo = match &base {
-            None => LeafChainRedo::Image(Box::new(image)),
+            None => {
+                count_image_copy();
+                churn::add(ChurnCounter::PageImageBuffers, 1);
+                LeafChainRedo::Image(Box::new(image))
+            }
             Some((base_image, base_lsn, base_crc)) => {
                 let payload = encode_page_delta(leaf_id, base_image, &image)?;
                 if payload.len() >= PAGE_IMAGE_PAYLOAD_SIZE {
+                    count_image_copy();
+                    churn::add(ChurnCounter::PageImageBuffers, 1);
                     LeafChainRedo::Image(Box::new(image))
                 } else {
                     let view = decode_page_delta(&payload)?;
@@ -3525,13 +3672,17 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
                 }
             }
         };
+        count_image_copy();
         match &mut base {
             Some((base_image, base_lsn, base_crc)) => {
                 **base_image = image;
                 *base_lsn = commit_lsn;
                 *base_crc = image_crc;
             }
-            None => base = Some((Box::new(image), commit_lsn, image_crc)),
+            None => {
+                churn::add(ChurnCounter::PageImageBuffers, 1);
+                base = Some((Box::new(image), commit_lsn, image_crc))
+            }
         }
         timing.delta_nanos = timing
             .delta_nanos
@@ -3552,6 +3703,25 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
         final_image,
         timing,
     }))
+}
+
+fn count_image_copy() {
+    if churn::ENABLED {
+        churn::add(ChurnCounter::PageImageCopies, 1);
+        churn::add(ChurnCounter::PageImageBytesCopied, PAGE_SIZE as u64);
+    }
+}
+
+fn count_dirty_insert<V>(dirty_pages: &BTreeMap<PageId, V>, page_id: PageId) {
+    if churn::ENABLED {
+        if dirty_pages.contains_key(&page_id) {
+            churn::add(ChurnCounter::DirtyPageReplaces, 1);
+        } else {
+            churn::add(ChurnCounter::DirtyPageInserts, 1);
+        }
+        churn::add(ChurnCounter::DirtyPageBytesCopied, PAGE_SIZE as u64);
+        count_image_copy();
+    }
 }
 
 fn blink_image_lsn(image: &[u8; PAGE_SIZE]) -> Lsn {
@@ -3707,6 +3877,7 @@ fn prepare_planned_serial_execution<'a>(
             if matches!(page, BlinkPage::Leaf { .. }) {
                 batch_metrics.leaf_encodes = batch_metrics.leaf_encodes.saturating_add(1);
             }
+            churn::add(ChurnCounter::PageEncodes, 1);
             images.push(WalPageImage {
                 page_id: *page_id,
                 image: encode_blink_page(*page_id, page)?,
@@ -3912,7 +4083,8 @@ fn apply_cached_leaf_mutation(
                             value: value_ref,
                         },
                     )
-                    .value,
+                    .value
+                    .take(),
                 );
                 if !leaf_fits(entries, high_key.as_deref(), *right_sibling) {
                     return Err(Error::invalid_input(
@@ -12250,7 +12422,10 @@ mod tests {
                 assert_store_values(&mut again, &expected);
             }
         }
-        eprintln!("phase-d fault matrix: {cases} injected failures over {} points", points.len());
+        eprintln!(
+            "phase-d fault matrix: {cases} injected failures over {} points",
+            points.len()
+        );
         assert!(cases >= 60, "{cases}");
     }
 

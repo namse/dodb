@@ -2620,6 +2620,13 @@ pub(crate) fn encode_page_delta(
         .fold(PAGE_DELTA_HEADER_SIZE, |length, (start, end)| {
             length + PAGE_DELTA_SPAN_HEADER_SIZE + (end - start)
         });
+    if crate::churn::ENABLED {
+        crate::churn::add(crate::churn::ChurnCounter::DeltaPayloadBuffers, 2);
+        crate::churn::add(
+            crate::churn::ChurnCounter::DeltaPayloadBytes,
+            payload_length as u64,
+        );
+    }
     let mut payload = Vec::with_capacity(payload_length);
     payload.extend_from_slice(&page_id.get().to_le_bytes());
     payload.extend_from_slice(&page_lsn_of(base).get().to_le_bytes());
@@ -2718,6 +2725,14 @@ pub(crate) fn apply_page_delta(
             delta.base_page_lsn,
             page_lsn_of(base)
         )));
+    }
+    if crate::churn::ENABLED {
+        crate::churn::add(crate::churn::ChurnCounter::DeltaVerifyImages, 1);
+        crate::churn::add(crate::churn::ChurnCounter::PageImageCopies, 1);
+        crate::churn::add(
+            crate::churn::ChurnCounter::PageImageBytesCopied,
+            PAGE_SIZE as u64,
+        );
     }
     let mut rebuilt = *base;
     for (offset, bytes) in &delta.spans {

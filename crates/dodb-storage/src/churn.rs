@@ -1,0 +1,277 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ChurnSite {
+    Harness = 0,
+    GroupOther,
+    Admission,
+    Planner,
+    SerialExecution,
+    Dispatch,
+    Lane,
+    WorkerThread,
+    Collect,
+    Catalog,
+    WalAssembly,
+    WalAppend,
+    StateInstall,
+    Publication,
+    DirtyTracking,
+}
+
+pub const CHURN_SITES: [ChurnSite; 15] = [
+    ChurnSite::Harness,
+    ChurnSite::GroupOther,
+    ChurnSite::Admission,
+    ChurnSite::Planner,
+    ChurnSite::SerialExecution,
+    ChurnSite::Dispatch,
+    ChurnSite::Lane,
+    ChurnSite::WorkerThread,
+    ChurnSite::Collect,
+    ChurnSite::Catalog,
+    ChurnSite::WalAssembly,
+    ChurnSite::WalAppend,
+    ChurnSite::StateInstall,
+    ChurnSite::Publication,
+    ChurnSite::DirtyTracking,
+];
+
+impl ChurnSite {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::GroupOther => "group_other",
+            Self::Admission => "admission",
+            Self::Planner => "planner",
+            Self::SerialExecution => "serial_execution",
+            Self::Dispatch => "dispatch",
+            Self::Lane => "lane",
+            Self::WorkerThread => "worker_thread",
+            Self::Collect => "collect",
+            Self::Catalog => "catalog",
+            Self::WalAssembly => "wal_assembly",
+            Self::WalAppend => "wal_append",
+            Self::StateInstall => "state_install",
+            Self::Publication => "publication",
+            Self::DirtyTracking => "dirty_tracking",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ChurnCounter {
+    AllocCalls = 0,
+    AllocBytes,
+    FreeCalls,
+    FreeBytes,
+    ReallocCalls,
+    ReallocBytes,
+    LeafEntryClones,
+    LeafEntryDrops,
+    ArcKeyClones,
+    ArcValueClones,
+    ArcKeyDrops,
+    ArcValueDrops,
+    PayloadArcsCreated,
+    LeafPageClones,
+    LeafVecCapacityBytes,
+    InternalPageClones,
+    BlinkPageArcClones,
+    PageImageCopies,
+    PageImageBytesCopied,
+    PageImageBuffers,
+    PageEncodes,
+    DirtyPageInserts,
+    DirtyPageReplaces,
+    DirtyPageBytesCopied,
+    DeltaPayloadBuffers,
+    DeltaPayloadBytes,
+    DeltaVerifyImages,
+    PlannerMapInserts,
+    PlannerKeyCopies,
+    PlannerMutationClones,
+    JobsBuilt,
+}
+
+pub const CHURN_COUNTERS: [ChurnCounter; 31] = [
+    ChurnCounter::AllocCalls,
+    ChurnCounter::AllocBytes,
+    ChurnCounter::FreeCalls,
+    ChurnCounter::FreeBytes,
+    ChurnCounter::ReallocCalls,
+    ChurnCounter::ReallocBytes,
+    ChurnCounter::LeafEntryClones,
+    ChurnCounter::LeafEntryDrops,
+    ChurnCounter::ArcKeyClones,
+    ChurnCounter::ArcValueClones,
+    ChurnCounter::ArcKeyDrops,
+    ChurnCounter::ArcValueDrops,
+    ChurnCounter::PayloadArcsCreated,
+    ChurnCounter::LeafPageClones,
+    ChurnCounter::LeafVecCapacityBytes,
+    ChurnCounter::InternalPageClones,
+    ChurnCounter::BlinkPageArcClones,
+    ChurnCounter::PageImageCopies,
+    ChurnCounter::PageImageBytesCopied,
+    ChurnCounter::PageImageBuffers,
+    ChurnCounter::PageEncodes,
+    ChurnCounter::DirtyPageInserts,
+    ChurnCounter::DirtyPageReplaces,
+    ChurnCounter::DirtyPageBytesCopied,
+    ChurnCounter::DeltaPayloadBuffers,
+    ChurnCounter::DeltaPayloadBytes,
+    ChurnCounter::DeltaVerifyImages,
+    ChurnCounter::PlannerMapInserts,
+    ChurnCounter::PlannerKeyCopies,
+    ChurnCounter::PlannerMutationClones,
+    ChurnCounter::JobsBuilt,
+];
+
+impl ChurnCounter {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AllocCalls => "alloc_calls",
+            Self::AllocBytes => "alloc_bytes",
+            Self::FreeCalls => "free_calls",
+            Self::FreeBytes => "free_bytes",
+            Self::ReallocCalls => "realloc_calls",
+            Self::ReallocBytes => "realloc_bytes",
+            Self::LeafEntryClones => "leaf_entry_clones",
+            Self::LeafEntryDrops => "leaf_entry_drops",
+            Self::ArcKeyClones => "arc_key_clones",
+            Self::ArcValueClones => "arc_value_clones",
+            Self::ArcKeyDrops => "arc_key_drops",
+            Self::ArcValueDrops => "arc_value_drops",
+            Self::PayloadArcsCreated => "payload_arcs_created",
+            Self::LeafPageClones => "leaf_page_clones",
+            Self::LeafVecCapacityBytes => "leaf_vec_capacity_bytes",
+            Self::InternalPageClones => "internal_page_clones",
+            Self::BlinkPageArcClones => "blink_page_arc_clones",
+            Self::PageImageCopies => "page_image_copies",
+            Self::PageImageBytesCopied => "page_image_bytes_copied",
+            Self::PageImageBuffers => "page_image_buffers",
+            Self::PageEncodes => "page_encodes",
+            Self::DirtyPageInserts => "dirty_page_inserts",
+            Self::DirtyPageReplaces => "dirty_page_replaces",
+            Self::DirtyPageBytesCopied => "dirty_page_bytes_copied",
+            Self::DeltaPayloadBuffers => "delta_payload_buffers",
+            Self::DeltaPayloadBytes => "delta_payload_bytes",
+            Self::DeltaVerifyImages => "delta_verify_images",
+            Self::PlannerMapInserts => "planner_map_inserts",
+            Self::PlannerKeyCopies => "planner_key_copies",
+            Self::PlannerMutationClones => "planner_mutation_clones",
+            Self::JobsBuilt => "jobs_built",
+        }
+    }
+}
+
+#[cfg(feature = "churn-counters")]
+mod enabled {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{CHURN_COUNTERS, CHURN_SITES, ChurnCounter, ChurnSite};
+
+    const SITE_COUNT: usize = CHURN_SITES.len();
+    const COUNTER_COUNT: usize = CHURN_COUNTERS.len();
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ROW: [AtomicU64; COUNTER_COUNT] = [ZERO; COUNTER_COUNT];
+    static COUNTS: [[AtomicU64; COUNTER_COUNT]; SITE_COUNT] = [ROW; SITE_COUNT];
+
+    thread_local! {
+        static CURRENT_SITE: Cell<u8> = const { Cell::new(0) };
+    }
+
+    pub struct SiteGuard {
+        previous: u8,
+    }
+
+    impl Drop for SiteGuard {
+        fn drop(&mut self) {
+            let previous = self.previous;
+            let _ = CURRENT_SITE.try_with(|site| site.set(previous));
+        }
+    }
+
+    pub fn enter(site: ChurnSite) -> SiteGuard {
+        let previous = CURRENT_SITE
+            .try_with(|current| current.replace(site as u8))
+            .unwrap_or(0);
+        SiteGuard { previous }
+    }
+
+    fn current_site() -> usize {
+        CURRENT_SITE
+            .try_with(|site| site.get() as usize)
+            .unwrap_or(0)
+    }
+
+    pub fn add(counter: ChurnCounter, amount: u64) {
+        COUNTS[current_site()][counter as usize].fetch_add(amount, Ordering::Relaxed);
+    }
+
+    pub fn record_alloc(bytes: usize) {
+        let row = &COUNTS[current_site()];
+        row[ChurnCounter::AllocCalls as usize].fetch_add(1, Ordering::Relaxed);
+        row[ChurnCounter::AllocBytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_free(bytes: usize) {
+        let row = &COUNTS[current_site()];
+        row[ChurnCounter::FreeCalls as usize].fetch_add(1, Ordering::Relaxed);
+        row[ChurnCounter::FreeBytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_realloc(bytes: usize) {
+        let row = &COUNTS[current_site()];
+        row[ChurnCounter::ReallocCalls as usize].fetch_add(1, Ordering::Relaxed);
+        row[ChurnCounter::ReallocBytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn snapshot() -> Vec<(ChurnSite, ChurnCounter, u64)> {
+        let mut values = Vec::with_capacity(SITE_COUNT * COUNTER_COUNT);
+        for site in CHURN_SITES {
+            for counter in CHURN_COUNTERS {
+                values.push((
+                    site,
+                    counter,
+                    COUNTS[site as usize][counter as usize].load(Ordering::Relaxed),
+                ));
+            }
+        }
+        values
+    }
+}
+
+#[cfg(feature = "churn-counters")]
+pub use enabled::{SiteGuard, add, enter, record_alloc, record_free, record_realloc, snapshot};
+
+#[cfg(not(feature = "churn-counters"))]
+pub struct SiteGuard;
+
+#[cfg(not(feature = "churn-counters"))]
+impl Drop for SiteGuard {
+    #[inline(always)]
+    fn drop(&mut self) {}
+}
+
+#[cfg(not(feature = "churn-counters"))]
+#[inline(always)]
+pub fn enter(_site: ChurnSite) -> SiteGuard {
+    SiteGuard
+}
+
+#[cfg(not(feature = "churn-counters"))]
+#[inline(always)]
+pub fn add(_counter: ChurnCounter, _amount: u64) {}
+
+#[cfg(not(feature = "churn-counters"))]
+pub fn snapshot() -> Vec<(ChurnSite, ChurnCounter, u64)> {
+    Vec::new()
+}
+
+pub const ENABLED: bool = cfg!(feature = "churn-counters");
