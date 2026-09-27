@@ -429,3 +429,123 @@ Order of what follows, from the same data: B planner (21%, growing faster than l
 ### Files
 
 `results/wal-v3-phase-c/`: `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `raw/` (36 attribution rows, 6 dodb and 6 RocksDB confirmation rows, 2 perf rows, logs), `tables.md`, `analysis.json`, `perf/`, `scripts/run_phase_c.py`, `scripts/analyze_phase_c.py`, `scripts/summarize_perf.py`, `SHA256SUMS`.
+
+## Phase D — leaf-partitioned parallel physical execution
+
+Question: if the per-leaf work of a WAL group (leaf mutation, page encode, PageDelta diff) runs on 2 lanes instead of the single coordinator, how much does durable width-16 throughput go up on 2 OCPU? Answer: **64w width 16 uniform 1.190× Phase C with real sync** (1.230× with sync disabled). That is just under the 1.20× bar, and 16w width 1 lost 3%, so the full matrix and the RocksDB rerun were skipped as the plan says.
+
+Code (branch `experiment/wal-v3-compact-redo`, not merged):
+
+| Commit | Content |
+|---|---|
+| `a917c84` blink: execute independent leaf chains in parallel | leaf-chain jobs, fallback rules, `WalLog::append_group_prepared`, tests (iteration D1) |
+| `9932f93` bench: measure parallel leaf execution | `--parallel-workers` for `planned-blink` (0 = serial executor, default), new counters |
+| `df8b8f4` blink: run leaf jobs on the coordinator lane and clone leaves in workers | iteration D2, the measured version |
+
+Raw results, tables and perf data: `results/wal-v3-phase-d/`. Full design: `results/wal-v3-phase-d/design.md`. Correctness details: `results/wal-v3-phase-d/correctness.md`.
+
+### Design
+
+- The coordinator keeps logical admission and `plan_batch` unchanged. It then partitions the **whole WAL group** by target leaf, not one transaction at a time: leaf L gets the mutations of every transaction that routes to L, in transaction FIFO order (A → B → C on the same leaf, independent leaves in parallel).
+- **Commit LSNs are fixed before any lane starts.** For an eligible transaction the redo record count is the number of distinct leaves it touches, known from the planner's routes, so `commit_lsn = next_lsn + distinct_leaves` — the same formula as the serial executor with no superblock image. There is no circular dependency. After the lanes finish, the coordinator checks that every transaction got exactly one boundary per leaf, each with its precomputed commit LSN.
+- Each job carries the committed leaf (`Arc<BlinkPage>` from the published generation), the leaf's WAL page-chain entry, the current dirty image as delta base, and shared `Arc`s to the plan and the commit-LSN array. The lane clones the leaf once, applies the mutations in place per transaction (revision = page LSN = commit LSN), encodes the page, computes the image CRC, and produces a full image (first touch after a WAL reset, or delta not smaller) or the canonical PageDelta against the previous committed image of that leaf (pre-group image first, then the previous transaction's image). The delta is applied back and must rebuild the image, the check the WAL did in Phase B.
+- `parallel_workers = n` means n lanes: the coordinator plus n − 1 persistent threads draining one job queue in chunks. The primary configuration is 2 lanes.
+- The coordinator puts the final pages into the working overlay (move), builds each transaction's record list in page-ID order, and calls `WalLog::append_group_prepared`, which re-checks batch IDs, commit LSNs, page LSNs, record order, and the page-chain rule (each delta's base LSN and base CRC must be the latest committed image of that page) before writing a byte. One write, one sync. Lanes never touch the WAL. Publication, state install and dirty tracking are unchanged; the dirty map gets only each leaf's final image.
+- **Eligibility is all-or-nothing per group:** at least 2 target leaves, a page-delta WAL, all put values inline, every target a leaf, every key below its leaf's high key, no mutated key holding an overflow value, and every leaf still fits after every mutation. So no split, root/internal change, allocator, free-list, overflow or page-reuse change, and no superblock image. Anything else runs the unchanged serial executor with the same plan. Every fallback is decided before the WAL append; a lane error or panic becomes a group error with nothing written.
+
+Iteration D1 (`a917c84`) had the coordinator clone each leaf while building jobs, split jobs statically over 2 worker threads, and only wait. Its sync-disabled gate gave 1.104× at 64w width 16 uniform: job building cost 48 µs/tx on the coordinator, and the two threads plus the waiting coordinator on 2 OCPU reached only 1.49 effective parallelism. D2 moved the clone to the lanes and made the coordinator a lane. D1 raw data: `results/wal-v3-phase-d/iteration-d1/`.
+
+### Correctness
+
+`cargo test --workspace --release` and `cargo test -p dodb-storage` (debug, which adds full page validation on the prepared WAL path and checks each published leaf against the committed state): all pass (storage lib 142 passed, 1 ignored). New tests:
+
+- one transaction on 16 distinct existing leaves: same results, pages, dirty images, counters and **byte-identical data and WAL files** as serial, for 1 and 2 lanes;
+- same-leaf chain A → B → C: FIFO values and revisions, three PageDeltas on that leaf with increasing commit LSNs, WAL identical to serial;
+- mixed A → L1 L2, B → L2 L3, C → L4: byte-identical to serial;
+- lane error and lane panic inside a 16-leaf transaction: group error, nothing written, no visible change, store not broken, next group succeeds, reopen correct;
+- 40 random groups: WAL identical, reopen without checkpoint gives the same documents as serial, further groups stay identical;
+- fault matrix over 17 points (`before_parallel_leaf_dispatch`, `after_parallel_leaf_join`, every WAL write point, before/during/after sync, `before_generation_publication`) at every occurrence, 212 injected failures: nothing acknowledged or visible for the failed group, each transaction all-or-nothing after reopen, no later transaction without the earlier one, both present once both commit frames were written;
+- WAL prepared path rejects a delta with the wrong base LSN or CRC and writes nothing.
+
+Differential: three seeds × 80 random groups (width 1–16, inserts, deletes, overflow values in every 8th group, splits, conflicts, rejected requests, a `flush()` and a checkpoint), run on the serial executor, 1 lane and 2 lanes. After every group: identical results and commit LSNs (or the same group error), pages, dirty images, superblock and counters. At the end: identical scans, invariants, data file, **byte-identical WAL**, identical reopen. 47–57 of 80 groups ran in parallel per seed; 21–33 fell back (overflow or structural). The WAL is byte-identical because the lane makes the same image-or-delta choice the WAL made in Phase B and records are in page order.
+
+### Sync-disabled CPU gate (OCI A1 2 OCPU, ZFS, D2)
+
+`phase-c` = binary `cb7fb54` (SHA256 `b6c74b1c…`), Phase D binary `df8b8f4` (SHA256 `fbb70d7c…`) with `--parallel-workers 0 / 1 / 2`. 3 repetitions, order rotated. Not durable throughput.
+
+| 64w width 16 | Phase C | Phase D serial | 1 lane | 2 lanes | 2 lanes / Phase C | 2 lanes / serial (same binary) | D1 2 threads / Phase C |
+|---|---|---|---|---|---|---|---|
+| uniform | 2,249 | 2,236 | 2,313 | 2,765 | **1.230** | 1.237 | 1.104 |
+| compact | 14,145 | 14,350 | 15,019 | 15,765 | 1.115 | 1.099 | 1.101 |
+| spread | 7,915 | 7,895 | 8,087 | 8,664 | 1.095 | 1.097 | 1.057 |
+
+The serial executor in the Phase D binary matches Phase C (0.99–1.01). One lane (all leaf work on the coordinator, new path) is 1.02–1.06× from doing less copying (in-place mutation, no image copies before the WAL); the second lane adds the rest.
+
+### Real-sync durable gate (ZFS)
+
+`--engine planned-blink --sync-mode real`, 100,000 rows, 2 s warmup, 5 s measure, 3 repetitions, order rotated. Every row checked for engine, sync mode, WAL syncs, page deltas, `parallel_workers` and parallel groups.
+
+| Scenario | Phase C tx/s | Phase D 2 lanes tx/s | ratio | p99 µs Phase C → D | parallel groups | leaf jobs / group | operations / job |
+|---|---|---|---|---|---|---|---|
+| 16w w1 uniform | 7,830 | 7,593 | **0.970** | 3,496 → 3,754 | 94.7% | 8.5 | 1.00 |
+| 16w w16 uniform | 1,933 | 2,177 | 1.126 | 15,874 → 14,282 | 99.7% | 223 | 1.02 |
+| 64w w1 uniform | 23,275 | 25,650 | 1.102 | 5,374 → 5,021 | 99.2% | 61 | 1.01 |
+| 64w w16 uniform | 2,031 | 2,417 | **1.190** | 58,693 → 48,987 | 99.3% | 905 | 1.08 |
+| 64w w16 compact | 10,673 | 11,788 | 1.105 | 9,412 → 8,774 | 100% | 4.8 | 17.5 |
+| 64w w16 spread | 5,996 | 6,376 | 1.063 | 19,754 → 19,068 | 100% | 118 | 1.00 |
+
+GM over the six: 1.091. Fallbacks: 7 groups at 16w width 16 and 4 at 64w width 16 (all structural: a leaf split, found by a lane after dispatch); single-leaf groups (serial) are 5.3% of groups at 16w width 1, 0.8% at 64w width 1. WAL bytes per transaction and transactions per sync are unchanged (for example 2,612 → 2,611 B/tx and 61.2 → 61.0 tx/sync at 64w width 16 uniform).
+
+**Width 1 control.** 64w width 1 gains 10%. 16w width 1 loses 3% and the repetitions do not overlap (7,746–7,927 against 7,526–7,644). Coordinator time outside the sync is the same (29.8 vs 30.1 µs/tx); the difference is WAL sync time per transaction (+3.7%, mean sync 0.78 → 0.80 ms) at the same 8 transactions per sync. With 8-transaction groups the parallel section is short (effective parallelism 1.31) and the extra thread takes CPU on a host whose ZFS sync also needs CPU; that last point is a likely explanation, not measured.
+
+### Where the time went (64w width 16 uniform, real sync, coordinator ns per transaction)
+
+| Component | Phase C | Phase D | Note |
+|---|---|---|---|
+| admission + planning | 94,622 | 97,979 | unchanged work |
+| leaf physical on the coordinator (serial mutation, restamp, encode, other) | 100,488 | 1,884 | moved to lanes |
+| WAL assembly + redo plan (Phase C: delta encode) | 84,562 | 4,751 | delta encode moved to lanes; WAL now only checks the chain |
+| job building (dispatch) | — | 27,788 | leaf lookups, base-image copy, chain lookups |
+| leaf jobs run by the coordinator lane | — | 64,087 | half the leaf work |
+| waiting for the worker thread + result collection | — | 7,769 | |
+| WAL frame encode + write | 13,746 | 12,025 | |
+| catalog / publication / state install / dirty tracking / union | 76,383 | 76,209 | unchanged |
+| WAL sync | 55,195 | 55,915 | |
+| unattributed | 27,216 | 28,259 | |
+| **total** | **452,210** | **376,666** | 1.20× |
+
+Lane side per transaction: base image + chain check 27.0 µs, mutation 23.6, page encode 34.1, delta encode + verify + CRC 36.3; all lanes busy 129.4 µs (coordinator lane 64.1, worker thread ~65.3), idle inside the parallel section 5.1 µs; effective parallelism 1.92. In the perf profile the worker thread has 14.6% of all samples.
+
+**Amdahl.** The leaf-local stage (Phase C: physical + WAL assembly + delta encode = 185 µs/tx) now costs the coordinator 106 µs/tx (dispatch 28 + its own lane 64 + wait/collect 8 + leftovers 6): **1.74× faster**, close to the 2-lane limit once job building is counted. It was 41% of Phase C coordinator time, so the whole coordinator gets 1.20× and throughput 1.19×. The other 59% (planning 21%, catalog/publication/install 17%, sync 12%, WAL framing 3%, unattributed 6%) did not change and now caps the gain: even a free leaf stage would give at most 452 / 267 ≈ 1.69×. As shares of the Phase D coordinator time: planner 26.0%, catalog/publication 20.2%, sync 14.8%, leaf work on the coordinator lane 17.0%, dispatch/wait/collect 9.4%, WAL CPU 4.5%.
+
+### Copy / allocation / refcount (perf, 64w width 16 uniform, real sync)
+
+Frame-pointer builds of both binaries (Phase C `0db4bd76…`, Phase D `990ba79a…`), `perf record -F 499 -g` for 15 s of a 20 s measurement, same session. Self-time symbols grouped the same way for both (`results/wal-v3-phase-d/perf/copy-alloc-refcount.txt`); this grouping also counts `memmove`, `realloc` and the allocator's own lock atomics, so it is wider than the "≈45%" in Phase C.
+
+| Category | Phase C share | Phase C cycles/tx | Phase D share | Phase D cycles/tx |
+|---|---|---|---|---|
+| memcpy / memmove | 15.8% | 215,949 | 14.4% | 186,938 |
+| malloc / free (incl. allocator atomics) | 25.2% | 344,536 | 26.2% | 339,841 |
+| Arc refcount atomics (`ldadd8`) | 10.1% | 137,596 | 10.7% | 138,742 |
+| memcmp | 5.3% | 73,030 | 5.0% | 65,214 |
+| **total** | **56.5%** | **771,111** | **56.2%** | **730,735** |
+| all cycles per transaction | | 1,365,040 | | 1,299,085 |
+
+The parallel path did not add copy or allocation work: per transaction it is 5% lower, and the share is unchanged. It still is more than half of all cycles. Where it comes from in Phase D (callers): `LeafEntry` vector clone and drop (the lane's leaf clone, the catalog's page clone, dropping retired generations' pages) for most of the `Arc` atomics; the 4 KiB dirty base image copied into each job (3.1% of samples) and `BTreeMap<PageId, [u8; 4096]>::insert` in dirty tracking (2.3%); `PhysicalTransactionPlan` / `TransactionRequest` drops and `TransactionMutation` vector growth (the latter in the benchmark's group collection, 2–4%); `plan_batch` itself is 11.7% self time.
+
+### Decision
+
+Phase D gives 1.19× at 64w width 16 uniform — below 1.20× — and a 3% width-1 loss at 16 writers. **Parallel execution is not the main answer on 2 OCPU.** The leaf stage itself runs 1.74× faster, but it was only 41% of the coordinator, and more than half of all cycles are still copying, allocating and refcounting.
+
+Recommended next direction: **copy / allocation / refcount elimination**, measured per source before changing anything:
+
+- `Arc` churn from cloning and dropping `Vec<LeafEntry>` (lane leaf clone, catalog `prepare_delta` clone, retired-generation drop);
+- 4 KiB image copies: the dirty base image copied into each job and the `BTreeMap<PageId, [u8; 4096]>` dirty map insertion;
+- temporary allocations in the planner (`PlannedMutation` copies of mutations and keys, per-group `BTreeMap`/`BTreeSet`s) and the benchmark's mutation vectors;
+- WAL assembly copies are already gone on the parallel path (28 → 1 µs/tx) and need no further work.
+
+The leaf-parallel code stays behind `--parallel-workers` (off by default). Whether to keep it on for width 16 and off for small width-1 groups is a later tuning question, not part of this phase.
+
+### Files
+
+`results/wal-v3-phase-d/`: `design.md`, `correctness.md`, `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `raw/` (36 sync-disabled gate rows, 36 real-sync gate rows, 2 perf rows, logs), `tables.md`, `analysis.json`, `perf/` (`perf.data`, flat / children / dso / comm reports, `copy-alloc-refcount.txt`), `iteration-d1/` (the D1 sync-disabled gate), `scripts/run_phase_d.py`, `scripts/analyze_phase_d.py`, `scripts/perf_categories.py`, `SHA256SUMS`.
