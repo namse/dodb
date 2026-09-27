@@ -547,7 +547,7 @@ impl BlinkPage {
 
 #[derive(Clone, Debug)]
 struct BlinkState {
-    pages: BTreeMap<PageId, BlinkPage>,
+    pages: BTreeMap<PageId, Arc<BlinkPage>>,
     root_page_id: PageId,
     free_list_head: Option<PageId>,
     high_water_page_id: PageId,
@@ -589,10 +589,16 @@ impl BlinkMutationState for BlinkState {
         self.allow_page_reuse
     }
     fn page(&self, page_id: PageId) -> Option<&BlinkPage> {
-        self.pages.get(&page_id)
+        self.pages.get(&page_id).map(|page| &**page)
     }
     fn insert_page(&mut self, page_id: PageId, page: BlinkPage) {
-        self.pages.insert(page_id, page);
+        self.pages.insert(page_id, Arc::new(page));
+    }
+}
+
+impl BlinkState {
+    fn page_ref(&self, page_id: PageId) -> Option<&BlinkPage> {
+        self.pages.get(&page_id).map(|page| &**page)
     }
 }
 
@@ -627,8 +633,7 @@ impl<'a> WorkingBlinkState<'a> {
         }
         let page = self
             .base
-            .pages
-            .get(&page_id)
+            .page_ref(page_id)
             .cloned()
             .ok_or_else(|| Error::corruption("planned Blink page is missing"))?;
         self.pages.insert(page_id, page);
@@ -637,7 +642,11 @@ impl<'a> WorkingBlinkState<'a> {
 
     fn into_delta(self) -> BlinkStateDelta {
         BlinkStateDelta {
-            pages: self.pages,
+            pages: self
+                .pages
+                .into_iter()
+                .map(|(page_id, page)| (page_id, Arc::new(page)))
+                .collect(),
             root_page_id: self.root_page_id,
             free_list_head: self.free_list_head,
             high_water_page_id: self.high_water_page_id,
@@ -671,7 +680,7 @@ impl BlinkMutationState for WorkingBlinkState<'_> {
     fn page(&self, page_id: PageId) -> Option<&BlinkPage> {
         self.pages
             .get(&page_id)
-            .or_else(|| self.base.pages.get(&page_id))
+            .or_else(|| self.base.page_ref(page_id))
     }
     fn insert_page(&mut self, page_id: PageId, page: BlinkPage) {
         self.pages.insert(page_id, page);
@@ -679,7 +688,7 @@ impl BlinkMutationState for WorkingBlinkState<'_> {
 }
 
 struct BlinkStateDelta {
-    pages: BTreeMap<PageId, BlinkPage>,
+    pages: BTreeMap<PageId, Arc<BlinkPage>>,
     root_page_id: PageId,
     free_list_head: Option<PageId>,
     high_water_page_id: PageId,
@@ -871,7 +880,7 @@ impl GenerationPublisher {
                 chunks[chunk_index].entries[slot_index] = Some(Arc::new(PageCell {
                     version: PageVersion {
                         epoch,
-                        page: Arc::new(page.clone()),
+                        page: Arc::clone(page),
                     },
                     metrics: Arc::clone(&metrics),
                 }));
@@ -938,7 +947,7 @@ impl GenerationPublisher {
             superblock.high_water_page_id,
             superblock.generation,
             &dirty_or_missing,
-            |page_id| state.pages.get(&page_id).cloned(),
+            |page_id| state.pages.get(&page_id).map(Arc::clone),
             false,
         )?;
         Ok((
@@ -952,6 +961,7 @@ impl GenerationPublisher {
         ))
     }
 
+    #[cfg(test)]
     fn prepare_delta<S: BlinkMutationState>(
         &self,
         state: &S,
@@ -965,7 +975,7 @@ impl GenerationPublisher {
             state.high_water_page_id(),
             superblock.generation,
             dirty,
-            |page_id| state.page(page_id).cloned(),
+            |page_id| state.page(page_id).cloned().map(Arc::new),
             true,
         )?;
         Ok((
@@ -973,6 +983,40 @@ impl GenerationPublisher {
                 epoch: superblock.generation,
                 root_page_id: state.root_page_id(),
                 high_water_page_id: state.high_water_page_id(),
+                catalog: Arc::new(catalog),
+            }),
+            timing,
+        ))
+    }
+
+    fn prepare_shared_delta(
+        &self,
+        delta: &BlinkStateDelta,
+        base: &BlinkState,
+        superblock: &BlinkSuperblock,
+        dirty: &BTreeSet<PageId>,
+    ) -> Result<(Arc<PublishedGeneration>, PublicationPrepareTiming)> {
+        let published = self.pin();
+        let (catalog, timing) = self.prepare_catalog_delta(
+            &published.generation.catalog,
+            published.generation.high_water_page_id,
+            delta.high_water_page_id,
+            superblock.generation,
+            dirty,
+            |page_id| {
+                delta
+                    .pages
+                    .get(&page_id)
+                    .or_else(|| base.pages.get(&page_id))
+                    .map(Arc::clone)
+            },
+            true,
+        )?;
+        Ok((
+            Arc::new(PublishedGeneration {
+                epoch: superblock.generation,
+                root_page_id: delta.root_page_id,
+                high_water_page_id: delta.high_water_page_id,
                 catalog: Arc::new(catalog),
             }),
             timing,
@@ -990,7 +1034,7 @@ impl GenerationPublisher {
         validate_extension: bool,
     ) -> Result<(PageCatalog, PublicationPrepareTiming)>
     where
-        F: FnMut(PageId) -> Option<BlinkPage>,
+        F: FnMut(PageId) -> Option<Arc<BlinkPage>>,
     {
         let directory_clone_started = Instant::now();
         let mut chunks = base.chunks.clone();
@@ -1042,10 +1086,7 @@ impl GenerationPublisher {
                 let page = page_for(page_id)
                     .ok_or_else(|| Error::invariant("dirty planned page is missing"))?;
                 next_chunk.entries[slot_index] = Some(Arc::new(PageCell {
-                    version: PageVersion {
-                        epoch,
-                        page: Arc::new(page),
-                    },
+                    version: PageVersion { epoch, page },
                     metrics: Arc::clone(&self.metrics),
                 }));
                 self.metrics
@@ -1406,12 +1447,12 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         let state = BlinkState {
             pages: BTreeMap::from([(
                 root,
-                BlinkPage::Leaf {
+                Arc::new(BlinkPage::Leaf {
                     lsn: Lsn::ZERO,
                     high_key: None,
                     right_sibling: None,
                     entries: Vec::new(),
-                },
+                }),
             )]),
             root_page_id: root,
             free_list_head: None,
@@ -1420,7 +1461,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         };
         let sb = BlinkSuperblock::new(&config, root);
         let sb_bytes = encode_blink_superblock(&sb)?;
-        let root_bytes = encode_blink_page(root, state.pages.get(&root).unwrap())?;
+        let root_bytes = encode_blink_page(root, state.page_ref(root).unwrap())?;
         file.set_len((FIRST_DATA_PAGE + 1) * PAGE_SIZE as u64)?;
         write_all_at(&mut file, 0, &sb_bytes)?;
         write_all_at(&mut file, PAGE_SIZE as u64, &sb_bytes)?;
@@ -1488,7 +1529,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         for id in FIRST_DATA_PAGE..=sb.high_water_page_id.get() {
             let page_id = PageId::new(id);
             let bytes = read_exact_at(&mut file, id * PAGE_SIZE as u64, PAGE_SIZE)?;
-            pages.insert(page_id, decode_blink_page(&bytes, page_id)?);
+            pages.insert(page_id, Arc::new(decode_blink_page(&bytes, page_id)?));
         }
         let state = BlinkState {
             pages,
@@ -1834,11 +1875,13 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                     .ok_or_else(|| Error::invariant("experimental LSN exhausted"))?,
             );
             for page_id in &dirty {
-                candidate
-                    .pages
-                    .get_mut(page_id)
-                    .ok_or_else(|| Error::invariant("dirty experimental page disappeared"))?
-                    .restamp(provisional, commit_lsn, &mutated_keys);
+                Arc::make_mut(
+                    candidate
+                        .pages
+                        .get_mut(page_id)
+                        .ok_or_else(|| Error::invariant("dirty experimental page disappeared"))?,
+                )
+                .restamp(provisional, commit_lsn, &mutated_keys);
             }
             working_sb = BlinkSuperblock {
                 generation: working_sb
@@ -2157,9 +2200,13 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 "working overlay contains a non-dirty page",
             ));
         }
-        let (published_generation, prepare_timing) =
-            self.publisher
-                .prepare_delta(&working, &final_execution.superblock, &all_dirty)?;
+        let delta = working.into_delta();
+        let (published_generation, prepare_timing) = self.publisher.prepare_shared_delta(
+            &delta,
+            &self.state,
+            &final_execution.superblock,
+            &all_dirty,
+        )?;
         drop(catalog_site);
         self.batch_metrics.catalog_construction_nanos = self
             .batch_metrics
@@ -2214,7 +2261,6 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .batch_metrics
             .wal_assembly_nanos
             .saturating_add(elapsed_nanos(wal_assembly_started));
-        let delta = working.into_delta();
         if let Some(parallel_redo) = &parallel_redo {
             let wal = self
                 .wal
@@ -2366,7 +2412,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                     .dirty
                     .iter()
                     .filter(|page_id| {
-                        matches!(self.state.pages.get(page_id), Some(BlinkPage::Leaf { .. }))
+                        matches!(self.state.page_ref(**page_id), Some(BlinkPage::Leaf { .. }))
                     })
                     .count();
                 record_histogram(
@@ -2629,8 +2675,7 @@ impl ReadPageSource for BlinkState {
     fn page(&self, page_id: PageId) -> Result<Arc<BlinkPage>> {
         self.pages
             .get(&page_id)
-            .cloned()
-            .map(Arc::new)
+            .map(Arc::clone)
             .ok_or_else(|| Error::corruption("Blink page is missing"))
     }
 }
@@ -3324,7 +3369,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
             return Ok(None);
         }
         #[cfg(debug_assertions)]
-        if state.pages.get(&leaf_id) != Some(&*initial_page) {
+        if state.page_ref(leaf_id) != Some(&*initial_page) {
             return Err(Error::invariant(
                 "published Blink leaf differs from the committed working state",
             ));
@@ -4416,8 +4461,7 @@ fn find_leaf_in_blink_state_borrowed(
             return Err(Error::corruption("Blink tree route contains a cycle"));
         }
         let page = state
-            .pages
-            .get(&page_id)
+            .page_ref(page_id)
             .ok_or_else(|| Error::corruption("Blink page is missing"))?;
         *page_visits = page_visits.saturating_add(1);
         let (high_key, right_sibling) = match page {
@@ -5961,7 +6005,7 @@ fn count_free_pages(state: &BlinkState) -> Result<u64> {
         if !visited.insert(page_id) {
             return Err(Error::corruption("Blink free list cycle"));
         }
-        let Some(BlinkPage::Free { next, .. }) = state.pages.get(&page_id) else {
+        let Some(BlinkPage::Free { next, .. }) = state.page_ref(page_id) else {
             return Err(Error::corruption(
                 "Blink free list points to a non-free page",
             ));
@@ -5992,7 +6036,7 @@ fn check_state(state: &BlinkState) -> Result<InvariantReport> {
     )?;
     let mut overflow_owned = BTreeSet::new();
     for leaf_id in &leaves {
-        let BlinkPage::Leaf { entries, .. } = state.pages.get(leaf_id).unwrap() else {
+        let BlinkPage::Leaf { entries, .. } = state.page_ref(*leaf_id).unwrap() else {
             unreachable!()
         };
         for entry in entries {
@@ -6013,8 +6057,7 @@ fn check_state(state: &BlinkState) -> Result<InvariantReport> {
                         chunk,
                         ..
                     } = state
-                        .pages
-                        .get(&id)
+                        .page_ref(id)
                         .ok_or_else(|| Error::corruption("Blink overflow page is missing"))?
                     else {
                         return Err(Error::corruption(
@@ -6044,7 +6087,7 @@ fn check_state(state: &BlinkState) -> Result<InvariantReport> {
                 "Blink free list cycles or overlaps reachable pages",
             ));
         }
-        let Some(BlinkPage::Free { next, .. }) = state.pages.get(&id) else {
+        let Some(BlinkPage::Free { next, .. }) = state.page_ref(id) else {
             return Err(Error::corruption(
                 "Blink free list points to a non-free page",
             ));
@@ -6085,8 +6128,7 @@ fn walk_tree(
         ));
     }
     let page = state
-        .pages
-        .get(&page_id)
+        .page_ref(page_id)
         .ok_or_else(|| Error::corruption("Blink tree points outside the file"))?;
     match page {
         BlinkPage::Leaf {
@@ -6187,7 +6229,7 @@ fn check_sibling_links(state: &BlinkState, leaves: &[PageId]) -> Result<()> {
             ));
         }
         chain.push(id);
-        current = match state.pages.get(&id) {
+        current = match state.page_ref(id) {
             Some(BlinkPage::Leaf { right_sibling, .. }) => *right_sibling,
             _ => return Err(Error::corruption("Blink leaf chain points to non-leaf")),
         };
@@ -6203,7 +6245,7 @@ fn check_sibling_links(state: &BlinkState, leaves: &[PageId]) -> Result<()> {
             high_key,
             entries,
             ..
-        }) = state.pages.get(id)
+        }) = state.page_ref(*id)
         else {
             unreachable!()
         };
@@ -6216,7 +6258,7 @@ fn check_sibling_links(state: &BlinkState, leaves: &[PageId]) -> Result<()> {
             let Some(BlinkPage::Leaf {
                 entries: next_entries,
                 ..
-            }) = state.pages.get(next)
+            }) = state.page_ref(*next)
             else {
                 unreachable!()
             };
@@ -6244,7 +6286,7 @@ fn check_sibling_links(state: &BlinkState, leaves: &[PageId]) -> Result<()> {
             right_sibling,
             high_key,
             ..
-        } = page
+        } = &**page
         else {
             continue;
         };
@@ -6255,7 +6297,7 @@ fn check_sibling_links(state: &BlinkState, leaves: &[PageId]) -> Result<()> {
                 }
                 let Some(BlinkPage::Internal {
                     level: next_level, ..
-                }) = state.pages.get(next)
+                }) = state.page_ref(*next)
                 else {
                     return Err(Error::corruption(
                         "Blink internal right link targets non-internal",
@@ -6450,6 +6492,15 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
 mod tests {
     use super::*;
 
+    fn shared_pages<const N: usize>(
+        pages: [(PageId, BlinkPage); N],
+    ) -> BTreeMap<PageId, Arc<BlinkPage>> {
+        pages
+            .into_iter()
+            .map(|(page_id, page)| (page_id, Arc::new(page)))
+            .collect()
+    }
+
     fn payload_sharing_test_state() -> (BlinkState, PageId, Vec<u8>, Vec<u8>) {
         let page_id = PageId::new(FIRST_DATA_PAGE);
         let first_key = DocumentKey::new(b"shared".to_vec(), b"first".to_vec()).encode();
@@ -6465,7 +6516,7 @@ mod tests {
             value: Some(BlinkValueRef::Inline(Arc::from(&b"second-value"[..]))),
         };
         let state = BlinkState {
-            pages: BTreeMap::from([(
+            pages: shared_pages([(
                 page_id,
                 BlinkPage::Leaf {
                     lsn: Lsn::new(12),
@@ -6490,14 +6541,14 @@ mod tests {
         let BlinkPage::Leaf {
             entries: base_entries,
             ..
-        } = base_page
+        } = &**base_page
         else {
             unreachable!();
         };
         let BlinkPage::Leaf {
             entries: cloned_entries,
             ..
-        } = &cloned_page
+        } = &*cloned_page
         else {
             unreachable!();
         };
@@ -6521,7 +6572,7 @@ mod tests {
         let BlinkPage::Leaf {
             entries: base_entries,
             ..
-        } = base.pages.get(&page_id).unwrap()
+        } = &**base.pages.get(&page_id).unwrap()
         else {
             unreachable!();
         };
@@ -6565,7 +6616,7 @@ mod tests {
         let BlinkPage::Leaf {
             entries: base_entries_after,
             ..
-        } = base.pages.get(&page_id).unwrap()
+        } = &**base.pages.get(&page_id).unwrap()
         else {
             unreachable!();
         };
@@ -7136,10 +7187,10 @@ mod tests {
                 .map(|raw_page_id| {
                     (
                         PageId::new(raw_page_id),
-                        BlinkPage::Free {
+                        Arc::new(BlinkPage::Free {
                             lsn: Lsn::ZERO,
                             next: None,
-                        },
+                        }),
                     )
                 })
                 .collect(),
@@ -7183,10 +7234,10 @@ mod tests {
         let changed_page_id = PageId::new(65);
         updated.pages.insert(
             changed_page_id,
-            BlinkPage::Free {
+            Arc::new(BlinkPage::Free {
                 lsn: Lsn::new(2),
                 next: None,
-            },
+            }),
         );
         let dirty = BTreeSet::from([changed_page_id]);
         let (generation, timing) = publisher
@@ -7216,10 +7267,10 @@ mod tests {
         for page_id in same_chunk_ids {
             updated.pages.insert(
                 page_id,
-                BlinkPage::Free {
+                Arc::new(BlinkPage::Free {
                     lsn: Lsn::new(2),
                     next: None,
-                },
+                }),
             );
         }
         let dirty = same_chunk_ids.into_iter().collect::<BTreeSet<_>>();
@@ -7244,10 +7295,10 @@ mod tests {
         for raw_page_id in 64..=65 {
             extended.pages.insert(
                 PageId::new(raw_page_id),
-                BlinkPage::Free {
+                Arc::new(BlinkPage::Free {
                     lsn: Lsn::ZERO,
                     next: None,
-                },
+                }),
             );
         }
         extended.high_water_page_id = PageId::new(65);
@@ -7428,7 +7479,7 @@ mod tests {
         let left_key = DocumentKey::new(b"p".to_vec(), b"a".to_vec()).encode();
         let right_key = key.encode();
         let state = BlinkState {
-            pages: BTreeMap::from([
+            pages: shared_pages([
                 (
                     left,
                     BlinkPage::Leaf {
@@ -7495,7 +7546,7 @@ mod tests {
         let page_id = |value| PageId::new(value);
         let single_leaf_id = page_id(2);
         let single_leaf_state = BlinkState {
-            pages: BTreeMap::from([(
+            pages: shared_pages([(
                 single_leaf_id,
                 BlinkPage::Leaf {
                     lsn: Lsn::ZERO,
@@ -7549,7 +7600,7 @@ mod tests {
                 entries: Vec::new(),
             };
         let state = BlinkState {
-            pages: BTreeMap::from([
+            pages: shared_pages([
                 (
                     leaf_ids[0],
                     make_leaf(Some(keys[1].clone()), Some(leaf_ids[1])),
@@ -7661,7 +7712,7 @@ mod tests {
 
         let cyclic_page_id = page_id(9);
         let cyclic_state = BlinkState {
-            pages: BTreeMap::from([(
+            pages: shared_pages([(
                 cyclic_page_id,
                 BlinkPage::Leaf {
                     lsn: Lsn::ZERO,
@@ -7700,12 +7751,12 @@ mod tests {
         let mut corrupt_state = state;
         corrupt_state.pages.insert(
             root_id,
-            BlinkPage::Overflow {
+            Arc::new(BlinkPage::Overflow {
                 lsn: Lsn::ZERO,
                 next: None,
                 total_length: 0,
                 chunk: Vec::new(),
-            },
+            }),
         );
         let mut generic_corrections = 0;
         let mut generic_visits = 0;
@@ -10232,7 +10283,7 @@ mod tests {
             .iter()
             .find_map(|(id, page)| {
                 matches!(
-                    page,
+                    &**page,
                     BlinkPage::Leaf {
                         right_sibling: Some(_),
                         ..
@@ -10242,14 +10293,18 @@ mod tests {
             })
             .unwrap();
         let mut cycle = store.state.clone();
-        if let Some(BlinkPage::Leaf { right_sibling, .. }) = cycle.pages.get_mut(&leaf_id) {
+        if let Some(BlinkPage::Leaf { right_sibling, .. }) =
+            cycle.pages.get_mut(&leaf_id).map(Arc::make_mut)
+        {
             *right_sibling = Some(leaf_id);
         }
         assert!(check_state(&cycle).is_err());
 
         let mut wrong_level = store.state.clone();
         let root = wrong_level.root_page_id;
-        if let Some(BlinkPage::Leaf { right_sibling, .. }) = wrong_level.pages.get_mut(&leaf_id) {
+        if let Some(BlinkPage::Leaf { right_sibling, .. }) =
+            wrong_level.pages.get_mut(&leaf_id).map(Arc::make_mut)
+        {
             *right_sibling = Some(root);
         }
         assert!(check_state(&wrong_level).is_err());
@@ -10259,12 +10314,14 @@ mod tests {
             .pages
             .iter()
             .find_map(|(id, page)| {
-                matches!(page, BlinkPage::Internal { entries, .. } if entries.len() > 1)
+                matches!(&**page, BlinkPage::Internal { entries, .. } if entries.len() > 1)
                     .then_some(*id)
             })
             .unwrap();
         let mut unordered = store.state.clone();
-        if let Some(BlinkPage::Internal { entries, .. }) = unordered.pages.get_mut(&internal_id) {
+        if let Some(BlinkPage::Internal { entries, .. }) =
+            unordered.pages.get_mut(&internal_id).map(Arc::make_mut)
+        {
             entries.swap(0, 1);
         }
         assert!(check_state(&unordered).is_err());
@@ -10571,7 +10628,7 @@ mod tests {
             .state
             .pages
             .values()
-            .filter(|page| matches!(page, BlinkPage::Leaf { .. }))
+            .filter(|page| matches!(&***page, BlinkPage::Leaf { .. }))
             .count();
         println!("B0 {{\"setup_keys\":{KEYS},\"leaf_pages\":{leaf_count}}}");
         let mut state = 0xb0b0u64;
@@ -11576,7 +11633,7 @@ mod tests {
             .state
             .pages
             .iter()
-            .find(|(_, page)| match page {
+            .find(|(_, page)| match &***page {
                 BlinkPage::Leaf { entries, .. } => entries
                     .iter()
                     .any(|entry| entry.key.as_ref() == encoded.as_slice()),
@@ -11984,6 +12041,162 @@ mod tests {
             store.enable_parallel_execution(workers).unwrap();
         }
         (store, expected)
+    }
+
+    struct PinnedPageSnapshot {
+        page_id: PageId,
+        page: Arc<BlinkPage>,
+        contents: BlinkPage,
+        image: [u8; PAGE_SIZE],
+        payloads: Vec<(*const u8, Vec<u8>, Option<(*const u8, Vec<u8>)>)>,
+    }
+
+    fn snapshot_pinned_generation(pin: &GenerationPin) -> Vec<PinnedPageSnapshot> {
+        (FIRST_DATA_PAGE..=pin.generation.high_water_page_id.get())
+            .map(|raw_page_id| {
+                let page_id = PageId::new(raw_page_id);
+                let page = pin.page(page_id).unwrap();
+                let payloads = match &*page {
+                    BlinkPage::Leaf { entries, .. } => entries
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.key.as_ptr(),
+                                entry.key.to_vec(),
+                                match &entry.value {
+                                    Some(BlinkValueRef::Inline(value)) => {
+                                        Some((value.as_ptr(), value.to_vec()))
+                                    }
+                                    _ => None,
+                                },
+                            )
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                PinnedPageSnapshot {
+                    page_id,
+                    contents: BlinkPage::clone(&page),
+                    image: encode_blink_page(page_id, &page).unwrap(),
+                    page,
+                    payloads,
+                }
+            })
+            .collect()
+    }
+
+    fn assert_pinned_generation_unchanged(
+        pin: &GenerationPin,
+        snapshots: &[PinnedPageSnapshot],
+        documents: &[Document],
+        label: &str,
+    ) {
+        for snapshot in snapshots {
+            let page = pin.page(snapshot.page_id).unwrap();
+            assert!(
+                Arc::ptr_eq(&page, &snapshot.page),
+                "{label}: pinned page {} was replaced",
+                snapshot.page_id
+            );
+            assert_eq!(
+                *page, snapshot.contents,
+                "{label}: page {}",
+                snapshot.page_id
+            );
+            assert_eq!(
+                encode_blink_page(snapshot.page_id, &page).unwrap(),
+                snapshot.image,
+                "{label}: image {}",
+                snapshot.page_id
+            );
+            if let BlinkPage::Leaf { entries, .. } = &*page {
+                assert_eq!(entries.len(), snapshot.payloads.len());
+                for (entry, (key_pointer, key, value)) in entries.iter().zip(&snapshot.payloads) {
+                    assert_eq!(entry.key.as_ptr(), *key_pointer, "{label}: key moved");
+                    assert_eq!(entry.key.as_ref(), key.as_slice(), "{label}: key bytes");
+                    match (&entry.value, value) {
+                        (Some(BlinkValueRef::Inline(bytes)), Some((pointer, expected))) => {
+                            assert_eq!(bytes.as_ptr(), *pointer, "{label}: value moved");
+                            assert_eq!(bytes.as_ref(), expected.as_slice(), "{label}: value bytes");
+                        }
+                        (Some(BlinkValueRef::Inline(_)), None) | (_, Some(_)) => {
+                            panic!("{label}: entry value kind changed")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let mut corrections = 0;
+        assert_eq!(
+            scan_state(pin, None, usize::MAX, &mut corrections).unwrap(),
+            documents,
+            "{label}: pinned scan"
+        );
+    }
+
+    #[test]
+    fn pinned_generation_pages_entries_and_values_survive_later_writes() {
+        for workers in [0usize, 2] {
+            let (mut store, _) = phase_d_store(workers, 400);
+            let pin = store.publisher.pin();
+            let snapshots = snapshot_pinned_generation(&pin);
+            let mut corrections = 0;
+            let documents = scan_state(&pin, None, usize::MAX, &mut corrections).unwrap();
+            assert_eq!(documents.len(), 400);
+            let label = format!("workers {workers}");
+            let distinct = keys_on_distinct_leaves(&store, 400, 16);
+            for round in 2..6u64 {
+                let wide = distinct
+                    .iter()
+                    .map(|(index, _)| (*index, b0_value(*index, round)))
+                    .collect::<Vec<_>>();
+                let chain = (0..3)
+                    .map(|step| put_request(&[(distinct[0].0, b0_value(step, round + 10))]))
+                    .collect::<Vec<_>>();
+                let mut group = vec![put_request(&wide)];
+                group.extend(chain);
+                store.apply_transaction_group(&group).unwrap();
+                assert_pinned_generation_unchanged(&pin, &snapshots, &documents, &label);
+            }
+            let inserts = (1_000..1_300u64)
+                .map(|index| put_request(&[(index, b0_value(index, 7))]))
+                .collect::<Vec<_>>();
+            for chunk in inserts.chunks(32) {
+                store.apply_transaction_group(chunk).unwrap();
+            }
+            store
+                .apply_transaction_group(&[
+                    TransactionRequest::new(
+                        Vec::new(),
+                        vec![TransactionMutation::Delete { key: b0_key(3) }],
+                    ),
+                    TransactionRequest::new(
+                        Vec::new(),
+                        vec![TransactionMutation::Put {
+                            key: b0_key(5),
+                            value: vec![0xa5; 2 * INLINE_VALUE_LIMIT],
+                        }],
+                    ),
+                ])
+                .unwrap();
+            store.checkpoint().unwrap();
+            assert!(store.split_metrics().leaf_splits > 0);
+            assert_pinned_generation_unchanged(&pin, &snapshots, &documents, &label);
+            if workers > 0 {
+                assert!(store.batch_metrics().parallel_groups >= 4);
+            }
+            let current = store.publisher.pin();
+            for (page_id, page) in &store.state.pages {
+                assert!(
+                    Arc::ptr_eq(page, &current.page(*page_id).unwrap()),
+                    "{label}: committed page {page_id} is not the published page object"
+                );
+            }
+            drop(current);
+            drop(pin);
+            store.check_invariants().unwrap();
+        }
     }
 
     fn keys_on_distinct_leaves(
