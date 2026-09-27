@@ -1589,6 +1589,7 @@ struct MetricDelta {
     parallel_dispatch_nanos: u64,
     parallel_collect_nanos: u64,
     parallel_worker_slot_nanos: u64,
+    parallel_coordinator_lane_nanos: u64,
     parallel_worker_base_nanos: u64,
     parallel_worker_mutation_nanos: u64,
     parallel_worker_encode_nanos: u64,
@@ -2037,6 +2038,10 @@ impl MetricDelta {
             parallel_worker_slot_nanos: subtraction(
                 batch_after.parallel_worker_slot_nanos,
                 batch_before.parallel_worker_slot_nanos,
+            ),
+            parallel_coordinator_lane_nanos: subtraction(
+                batch_after.parallel_coordinator_lane_nanos,
+                batch_before.parallel_coordinator_lane_nanos,
             ),
             parallel_worker_base_nanos: subtraction(
                 batch_after.parallel_worker_base_nanos,
@@ -3313,6 +3318,10 @@ fn build_record(
     json.u64(
         "parallel_worker_slot_nanos_total",
         delta.parallel_worker_slot_nanos,
+    );
+    json.u64(
+        "parallel_coordinator_lane_nanos_total",
+        delta.parallel_coordinator_lane_nanos,
     );
     json.u64(
         "parallel_worker_base_nanos_total",

@@ -11,7 +11,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Instant;
 
@@ -208,6 +208,7 @@ pub struct BlinkBatchMetrics {
     pub parallel_dispatch_nanos: u64,
     pub parallel_collect_nanos: u64,
     pub parallel_worker_slot_nanos: u64,
+    pub parallel_coordinator_lane_nanos: u64,
     pub parallel_worker_base_nanos: u64,
     pub parallel_worker_mutation_nanos: u64,
     pub parallel_worker_encode_nanos: u64,
@@ -1137,7 +1138,7 @@ enum ParallelWorkerFault {
 /// transaction that routes to this leaf, in transaction FIFO order.
 struct LeafChainJob {
     leaf_id: PageId,
-    initial_page: BlinkPage,
+    initial_page: Arc<BlinkPage>,
     base_image: Option<Box<[u8; PAGE_SIZE]>>,
     chain_entry: Option<(Lsn, u32)>,
     steps: Vec<(u32, u32)>,
@@ -1465,13 +1466,13 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         if self
             .parallel_worker_pool
             .as_ref()
-            .is_some_and(|pool| pool.workers.len() == worker_count)
+            .is_some_and(|pool| pool.workers.len() + 1 == worker_count)
         {
             self.planned_execution = true;
             self.parallel_workers = worker_count;
             return Ok(());
         }
-        let worker_pool = ParallelWorkerPool::new(worker_count)?;
+        let worker_pool = ParallelWorkerPool::new(worker_count - 1)?;
         self.planned_execution = true;
         self.parallel_workers = worker_count;
         self.parallel_worker_pool = Some(worker_pool);
@@ -1996,6 +1997,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         let parallel_preparation = match self.parallel_worker_pool.as_ref() {
             Some(worker_pool) => prepare_leaf_parallel_execution(
                 &self.state,
+                &self.publisher.pin(),
                 &plan,
                 worker_pool,
                 self.wal.as_ref(),
@@ -2852,6 +2854,9 @@ fn record_parallel_fallback(metrics: &mut BlinkBatchMetrics, reason: ParallelFal
     }
 }
 
+/// Worker threads for leaf jobs. The coordinator is one more lane: after it
+/// hands the queue to the threads it drains the same queue itself, so
+/// `parallel_workers = n` runs n lanes on n - 1 threads plus the coordinator.
 struct ParallelWorkerPool {
     workers: Vec<ParallelWorkerSlot>,
 }
@@ -2861,9 +2866,25 @@ struct ParallelWorkerSlot {
     handle: Option<JoinHandle<()>>,
 }
 
+struct LeafChainQueue {
+    jobs: Mutex<Vec<LeafChainJob>>,
+    chunk: usize,
+}
+
+impl LeafChainQueue {
+    fn take(&self) -> Vec<LeafChainJob> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keep = jobs.len().saturating_sub(self.chunk);
+        jobs.split_off(keep)
+    }
+}
+
 enum ParallelWorkerCommand {
     Execute {
-        jobs: Vec<LeafChainJob>,
+        queue: Arc<LeafChainQueue>,
         results: Sender<ParallelWorkerResult>,
     },
     Shutdown,
@@ -2872,23 +2893,47 @@ enum ParallelWorkerCommand {
 struct ParallelWorkerResult {
     worker_index: usize,
     thread_id: ThreadId,
+    lane: LaneOutput,
+}
+
+struct LaneOutput {
     outcomes: Vec<Result<LeafChainOutcome>>,
-    worker_panicked: bool,
+    panicked: bool,
     busy_nanos: u64,
 }
 
 struct ParallelWorkerRun {
     outcomes: Vec<LeafChainOutcome>,
     worker_nanos: u64,
+    coordinator_lane_nanos: u64,
     join_nanos: u64,
-    worker_dispatches: u64,
+    lanes: u64,
     worker_threads: Vec<(usize, ThreadId)>,
 }
 
+fn drain_leaf_chain_queue(queue: &LeafChainQueue) -> LaneOutput {
+    let busy_started = Instant::now();
+    let mut outcomes = Vec::new();
+    let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            let jobs = queue.take();
+            if jobs.is_empty() {
+                break;
+            }
+            outcomes.extend(jobs.into_iter().map(run_leaf_chain_job));
+        }
+    }));
+    LaneOutput {
+        outcomes,
+        panicked: executed.is_err(),
+        busy_nanos: elapsed_nanos(busy_started),
+    }
+}
+
 impl ParallelWorkerPool {
-    fn new(worker_count: usize) -> Result<Self> {
-        let mut workers = Vec::with_capacity(worker_count);
-        for worker_index in 0..worker_count {
+    fn new(thread_count: usize) -> Result<Self> {
+        let mut workers = Vec::with_capacity(thread_count);
+        for worker_index in 0..thread_count {
             let (sender, receiver) = mpsc::channel();
             let handle = match thread::Builder::new()
                 .name(format!("dodb-blink-leaf-{worker_index}"))
@@ -2908,62 +2953,65 @@ impl ParallelWorkerPool {
         Ok(Self { workers })
     }
 
-    fn execute(&self, worker_buckets: Vec<Vec<LeafChainJob>>) -> Result<ParallelWorkerRun> {
-        if worker_buckets.len() > self.workers.len() {
-            return Err(Error::invariant(
-                "parallel job partition exceeds persistent worker pool",
-            ));
-        }
+    fn execute(&self, jobs: Vec<LeafChainJob>) -> Result<ParallelWorkerRun> {
+        let lanes = self.workers.len() + 1;
+        let chunk = (jobs.len() / (lanes * 8)).max(1);
+        let threads_used = self.workers.len().min(jobs.len().saturating_sub(1));
+        let queue = Arc::new(LeafChainQueue {
+            jobs: Mutex::new(jobs),
+            chunk,
+        });
         let (result_sender, result_receiver) = mpsc::channel();
-        let dispatch_started = Instant::now();
+        let started = Instant::now();
         let mut dispatched = 0usize;
         let mut dispatch_error = false;
-        for (worker_index, jobs) in worker_buckets.into_iter().enumerate() {
-            if jobs.is_empty() {
-                continue;
-            }
+        for worker in &self.workers[..threads_used] {
             let command = ParallelWorkerCommand::Execute {
-                jobs,
+                queue: Arc::clone(&queue),
                 results: result_sender.clone(),
             };
-            if self.workers[worker_index].sender.send(command).is_err() {
+            if worker.sender.send(command).is_err() {
                 dispatch_error = true;
                 break;
             }
             dispatched += 1;
         }
         drop(result_sender);
+        let coordinator_lane = drain_leaf_chain_queue(&queue);
 
         let mut outcomes = Vec::new();
-        let mut worker_nanos = 0u64;
-        let mut worker_panicked = false;
+        let mut worker_nanos = coordinator_lane.busy_nanos;
+        let mut panicked = coordinator_lane.panicked;
         let mut worker_error = None;
         let mut worker_threads = Vec::with_capacity(dispatched);
         let mut received = 0usize;
+        let mut lanes_output = vec![coordinator_lane];
         while received < dispatched {
             match result_receiver.recv() {
                 Ok(response) => {
                     received += 1;
-                    worker_nanos = worker_nanos.saturating_add(response.busy_nanos);
-                    if response.worker_panicked {
-                        worker_panicked = true;
-                    }
                     worker_threads.push((response.worker_index, response.thread_id));
-                    for outcome in response.outcomes {
-                        match outcome {
-                            Ok(outcome) => outcomes.push(outcome),
-                            Err(error) => {
-                                if worker_error.is_none() {
-                                    worker_error = Some(error);
-                                }
-                            }
-                        }
-                    }
+                    lanes_output.push(response.lane);
                 }
                 Err(_) => break,
             }
         }
-        let join_nanos = elapsed_nanos(dispatch_started);
+        let join_nanos = elapsed_nanos(started);
+        let coordinator_lane_nanos = lanes_output[0].busy_nanos;
+        for (lane_index, lane) in lanes_output.into_iter().enumerate() {
+            if lane_index > 0 {
+                worker_nanos = worker_nanos.saturating_add(lane.busy_nanos);
+                panicked |= lane.panicked;
+            }
+            for outcome in lane.outcomes {
+                match outcome {
+                    Ok(outcome) => outcomes.push(outcome),
+                    Err(error) => {
+                        worker_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
         if dispatch_error || received != dispatched {
             return Err(Error::invariant("parallel Blink worker dispatch failed"));
         }
@@ -2980,17 +3028,28 @@ impl ParallelWorkerPool {
                 "parallel Blink pool returned duplicate worker identities",
             ));
         }
-        if worker_panicked {
+        if panicked {
             return Err(Error::invariant("parallel Blink leaf worker panicked"));
         }
         if let Some(error) = worker_error {
             return Err(error);
         }
+        if !queue
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            return Err(Error::invariant(
+                "parallel Blink leaf queue was not drained",
+            ));
+        }
         Ok(ParallelWorkerRun {
             outcomes,
             worker_nanos,
+            coordinator_lane_nanos,
             join_nanos,
-            worker_dispatches: dispatched as u64,
+            lanes: dispatched as u64 + 1,
             worker_threads,
         })
     }
@@ -3018,23 +3077,13 @@ fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerCo
     while let Ok(command) = receiver.recv() {
         match command {
             ParallelWorkerCommand::Shutdown => return,
-            ParallelWorkerCommand::Execute { jobs, results } => {
-                let busy_started = Instant::now();
-                let job_count = jobs.len();
-                let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    jobs.into_iter().map(run_leaf_chain_job).collect::<Vec<_>>()
-                }));
-                let busy_nanos = elapsed_nanos(busy_started);
-                let (outcomes, worker_panicked) = match executed {
-                    Ok(outcomes) => (outcomes, false),
-                    Err(_) => (Vec::with_capacity(job_count), true),
-                };
+            ParallelWorkerCommand::Execute { queue, results } => {
+                let lane = drain_leaf_chain_queue(&queue);
+                drop(queue);
                 let _ = results.send(ParallelWorkerResult {
                     worker_index,
                     thread_id,
-                    outcomes,
-                    worker_panicked,
-                    busy_nanos,
+                    lane,
                 });
             }
         }
@@ -3049,6 +3098,7 @@ fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerCo
 #[allow(clippy::too_many_arguments)]
 fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     state: &'a BlinkState,
+    published: &GenerationPin,
     plan: &Arc<BatchPlan>,
     worker_pool: &ParallelWorkerPool,
     wal: Option<&WalLog<W>>,
@@ -3146,13 +3196,17 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     let mut jobs = Vec::with_capacity(plan.leaf_groups.len());
     for (leaf_group, steps) in plan.leaf_groups.iter().zip(job_steps) {
         let leaf_id = leaf_group.leaf_hint;
-        let initial_page = match state.pages.get(&leaf_id) {
-            Some(page @ BlinkPage::Leaf { .. }) => page.clone(),
-            _ => {
-                record_parallel_fallback(metrics, ParallelFallbackReason::RouteMismatch);
-                return Ok(None);
-            }
-        };
+        let initial_page = published.page(leaf_id)?;
+        if !matches!(*initial_page, BlinkPage::Leaf { .. }) {
+            record_parallel_fallback(metrics, ParallelFallbackReason::RouteMismatch);
+            return Ok(None);
+        }
+        #[cfg(debug_assertions)]
+        if state.pages.get(&leaf_id) != Some(&*initial_page) {
+            return Err(Error::invariant(
+                "published Blink leaf differs from the committed working state",
+            ));
+        }
         let chain_entry = wal.page_chain_entry(leaf_id);
         let base_image = if chain_entry.is_some() {
             dirty_pages.get(&leaf_id).map(|image| Box::new(*image))
@@ -3180,21 +3234,6 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     {
         job.fault = Some(fault);
     }
-    let worker_count = worker_pool.workers.len().min(jobs.len());
-    let mut worker_buckets = (0..worker_count)
-        .map(|_| Vec::with_capacity(jobs.len() / worker_count + 1))
-        .collect::<Vec<_>>();
-    let mut bucket_weights = vec![0usize; worker_count];
-    for job in jobs {
-        let lightest = bucket_weights
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, weight)| **weight)
-            .map(|(bucket_index, _)| bucket_index)
-            .ok_or_else(|| Error::invariant("parallel worker pool is empty"))?;
-        bucket_weights[lightest] += job.steps.len() + 2;
-        worker_buckets[lightest].push(job);
-    }
     metrics.parallel_dispatch_nanos = metrics
         .parallel_dispatch_nanos
         .saturating_add(elapsed_nanos(dispatch_started));
@@ -3202,8 +3241,8 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
         injector.hit("before_parallel_leaf_dispatch")?;
     }
 
-    let worker_run = worker_pool.execute(worker_buckets)?;
-    if worker_run.worker_threads.len() as u64 != worker_run.worker_dispatches {
+    let worker_run = worker_pool.execute(jobs)?;
+    if worker_run.worker_threads.len() as u64 + 1 != worker_run.lanes {
         return Err(Error::invariant(
             "parallel Blink worker dispatch result count is inconsistent",
         ));
@@ -3211,17 +3250,18 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     metrics.parallel_join_nanos = metrics
         .parallel_join_nanos
         .saturating_add(worker_run.join_nanos);
-    metrics.parallel_worker_slot_nanos = metrics.parallel_worker_slot_nanos.saturating_add(
-        worker_run
-            .join_nanos
-            .saturating_mul(worker_run.worker_dispatches),
-    );
+    metrics.parallel_worker_slot_nanos = metrics
+        .parallel_worker_slot_nanos
+        .saturating_add(worker_run.join_nanos.saturating_mul(worker_run.lanes));
     metrics.parallel_worker_dispatches = metrics
         .parallel_worker_dispatches
-        .saturating_add(worker_run.worker_dispatches);
+        .saturating_add(worker_run.lanes);
     metrics.parallel_worker_nanos = metrics
         .parallel_worker_nanos
         .saturating_add(worker_run.worker_nanos);
+    metrics.parallel_coordinator_lane_nanos = metrics
+        .parallel_coordinator_lane_nanos
+        .saturating_add(worker_run.coordinator_lane_nanos);
     if let Some(injector) = fault_injector.as_deref_mut() {
         injector.hit("after_parallel_leaf_join")?;
     }
@@ -3395,8 +3435,9 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
     }
     let mut timing = LeafChainTiming::default();
     let leaf_id = job.leaf_id;
-    let mut page = job.initial_page;
     let base_started = Instant::now();
+    let mut page = BlinkPage::clone(&job.initial_page);
+    drop(job.initial_page);
     let mut base = match job.chain_entry {
         None => None,
         Some((chain_lsn, chain_crc)) => {
@@ -7087,38 +7128,47 @@ mod tests {
             ..BatchPlan::default()
         });
         let commit_lsns: Arc<[Lsn]> = vec![Lsn::new(1)].into();
-        let make_buckets = || {
-            (0..2)
-                .map(|worker_index| {
-                    vec![LeafChainJob {
-                        leaf_id: PageId::new(2 + worker_index as u64),
-                        initial_page: BlinkPage::Leaf {
-                            lsn: Lsn::ZERO,
-                            high_key: None,
-                            right_sibling: None,
-                            entries: Vec::new(),
-                        },
-                        base_image: None,
-                        chain_entry: None,
-                        steps: vec![(0, 0)],
-                        plan: Arc::clone(&plan),
-                        commit_lsns: Arc::clone(&commit_lsns),
-                        fault: None,
-                    }]
+        let make_jobs = || {
+            (0..64u64)
+                .map(|leaf_index| LeafChainJob {
+                    leaf_id: PageId::new(2 + leaf_index),
+                    initial_page: Arc::new(BlinkPage::Leaf {
+                        lsn: Lsn::ZERO,
+                        high_key: None,
+                        right_sibling: None,
+                        entries: Vec::new(),
+                    }),
+                    base_image: None,
+                    chain_entry: None,
+                    steps: vec![(0, 0)],
+                    plan: Arc::clone(&plan),
+                    commit_lsns: Arc::clone(&commit_lsns),
+                    fault: None,
                 })
                 .collect::<Vec<_>>()
         };
-        let first_run = pool.execute(make_buckets()).unwrap();
-        let second_run = pool.execute(make_buckets()).unwrap();
+        let first_run = pool.execute(make_jobs()).unwrap();
+        let second_run = pool.execute(make_jobs()).unwrap();
         let mut first_workers = first_run.worker_threads;
         let mut second_workers = second_run.worker_threads;
         first_workers.sort_by_key(|(worker_index, _)| *worker_index);
         second_workers.sort_by_key(|(worker_index, _)| *worker_index);
         assert_eq!(first_workers, second_workers);
-        assert_eq!(first_run.worker_dispatches, 2);
-        assert_eq!(second_run.worker_dispatches, 2);
-        assert_eq!(first_run.outcomes.len(), 2);
-        assert_eq!(second_run.outcomes.len(), 2);
+        assert_eq!(first_run.lanes, 3);
+        assert_eq!(second_run.lanes, 3);
+        assert_eq!(first_run.outcomes.len(), 64);
+        assert_eq!(second_run.outcomes.len(), 64);
+        let mut leaves = first_run
+            .outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                LeafChainOutcome::Prepared(result) => result.leaf_id,
+                LeafChainOutcome::Fallback { .. } => panic!("unexpected fallback"),
+            })
+            .collect::<Vec<_>>();
+        leaves.sort();
+        leaves.dedup();
+        assert_eq!(leaves.len(), 64);
     }
 
     fn wide_key(index: u64) -> DocumentKey {
