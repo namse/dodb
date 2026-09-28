@@ -92,9 +92,14 @@ pub enum ChurnCounter {
     PlannerKeyCopies,
     PlannerMutationClones,
     JobsBuilt,
+    LeafEntriesCopied,
+    LeafSlotBytesCopied,
+    LeafPayloadBytesCopied,
+    LeafCompactions,
+    LeafKeyComparisons,
 }
 
-pub const CHURN_COUNTERS: [ChurnCounter; 31] = [
+pub const CHURN_COUNTERS: [ChurnCounter; 36] = [
     ChurnCounter::AllocCalls,
     ChurnCounter::AllocBytes,
     ChurnCounter::FreeCalls,
@@ -126,6 +131,11 @@ pub const CHURN_COUNTERS: [ChurnCounter; 31] = [
     ChurnCounter::PlannerKeyCopies,
     ChurnCounter::PlannerMutationClones,
     ChurnCounter::JobsBuilt,
+    ChurnCounter::LeafEntriesCopied,
+    ChurnCounter::LeafSlotBytesCopied,
+    ChurnCounter::LeafPayloadBytesCopied,
+    ChurnCounter::LeafCompactions,
+    ChurnCounter::LeafKeyComparisons,
 ];
 
 impl ChurnCounter {
@@ -162,6 +172,11 @@ impl ChurnCounter {
             Self::PlannerKeyCopies => "planner_key_copies",
             Self::PlannerMutationClones => "planner_mutation_clones",
             Self::JobsBuilt => "jobs_built",
+            Self::LeafEntriesCopied => "leaf_entries_copied",
+            Self::LeafSlotBytesCopied => "leaf_slot_bytes_copied",
+            Self::LeafPayloadBytesCopied => "leaf_payload_bytes_copied",
+            Self::LeafCompactions => "leaf_compactions",
+            Self::LeafKeyComparisons => "leaf_key_comparisons",
         }
     }
 }

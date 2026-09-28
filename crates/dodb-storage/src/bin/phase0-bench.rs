@@ -2319,7 +2319,7 @@ fn process_cpu_ticks() -> Option<u64> {
         let user_micros = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
         let system_micros =
             usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
-        return Some(user_micros.saturating_add(system_micros));
+        Some(user_micros.saturating_add(system_micros))
     }
 
     #[cfg(not(target_os = "macos"))]
