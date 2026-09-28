@@ -2,37 +2,35 @@
 #[repr(u8)]
 pub enum ChurnSite {
     Harness = 0,
-    GroupOther,
+    OtherStorage,
     Admission,
     Planner,
-    SerialExecution,
-    Dispatch,
-    Lane,
-    WorkerThread,
-    Collect,
-    Catalog,
-    WalAssembly,
+    LeafJobConstruction,
+    LeafLaneExecution,
+    JobResultCollection,
+    PackedLeafMutationCow,
+    PageDeltaGeneration,
+    WalPreparation,
     WalAppend,
     StateInstall,
-    Publication,
+    CatalogPublication,
     DirtyTracking,
 }
 
-pub const CHURN_SITES: [ChurnSite; 15] = [
+pub const CHURN_SITES: [ChurnSite; 14] = [
     ChurnSite::Harness,
-    ChurnSite::GroupOther,
+    ChurnSite::OtherStorage,
     ChurnSite::Admission,
     ChurnSite::Planner,
-    ChurnSite::SerialExecution,
-    ChurnSite::Dispatch,
-    ChurnSite::Lane,
-    ChurnSite::WorkerThread,
-    ChurnSite::Collect,
-    ChurnSite::Catalog,
-    ChurnSite::WalAssembly,
+    ChurnSite::LeafJobConstruction,
+    ChurnSite::LeafLaneExecution,
+    ChurnSite::JobResultCollection,
+    ChurnSite::PackedLeafMutationCow,
+    ChurnSite::PageDeltaGeneration,
+    ChurnSite::WalPreparation,
     ChurnSite::WalAppend,
     ChurnSite::StateInstall,
-    ChurnSite::Publication,
+    ChurnSite::CatalogPublication,
     ChurnSite::DirtyTracking,
 ];
 
@@ -40,19 +38,18 @@ impl ChurnSite {
     pub fn name(self) -> &'static str {
         match self {
             Self::Harness => "harness",
-            Self::GroupOther => "group_other",
+            Self::OtherStorage => "other_storage",
             Self::Admission => "admission",
             Self::Planner => "planner",
-            Self::SerialExecution => "serial_execution",
-            Self::Dispatch => "dispatch",
-            Self::Lane => "lane",
-            Self::WorkerThread => "worker_thread",
-            Self::Collect => "collect",
-            Self::Catalog => "catalog",
-            Self::WalAssembly => "wal_assembly",
+            Self::LeafJobConstruction => "leaf_job_construction",
+            Self::LeafLaneExecution => "leaf_lane_execution",
+            Self::JobResultCollection => "job_result_collection",
+            Self::PackedLeafMutationCow => "packed_leaf_mutation_cow",
+            Self::PageDeltaGeneration => "page_delta_generation",
+            Self::WalPreparation => "wal_preparation",
             Self::WalAppend => "wal_append",
             Self::StateInstall => "state_install",
-            Self::Publication => "publication",
+            Self::CatalogPublication => "catalog_publication",
             Self::DirtyTracking => "dirty_tracking",
         }
     }
@@ -97,9 +94,19 @@ pub enum ChurnCounter {
     LeafPayloadBytesCopied,
     LeafCompactions,
     LeafKeyComparisons,
+    AllocLe16,
+    AllocLe32,
+    AllocLe64,
+    AllocLe128,
+    AllocLe256,
+    AllocLe1024,
+    AllocLe4096,
+    AllocGt4096,
+    ArenaAllocCalls,
+    ArenaAllocBytes,
 }
 
-pub const CHURN_COUNTERS: [ChurnCounter; 36] = [
+pub const CHURN_COUNTERS: [ChurnCounter; 46] = [
     ChurnCounter::AllocCalls,
     ChurnCounter::AllocBytes,
     ChurnCounter::FreeCalls,
@@ -136,6 +143,16 @@ pub const CHURN_COUNTERS: [ChurnCounter; 36] = [
     ChurnCounter::LeafPayloadBytesCopied,
     ChurnCounter::LeafCompactions,
     ChurnCounter::LeafKeyComparisons,
+    ChurnCounter::AllocLe16,
+    ChurnCounter::AllocLe32,
+    ChurnCounter::AllocLe64,
+    ChurnCounter::AllocLe128,
+    ChurnCounter::AllocLe256,
+    ChurnCounter::AllocLe1024,
+    ChurnCounter::AllocLe4096,
+    ChurnCounter::AllocGt4096,
+    ChurnCounter::ArenaAllocCalls,
+    ChurnCounter::ArenaAllocBytes,
 ];
 
 impl ChurnCounter {
@@ -177,6 +194,16 @@ impl ChurnCounter {
             Self::LeafPayloadBytesCopied => "leaf_payload_bytes_copied",
             Self::LeafCompactions => "leaf_compactions",
             Self::LeafKeyComparisons => "leaf_key_comparisons",
+            Self::AllocLe16 => "alloc_le_16",
+            Self::AllocLe32 => "alloc_le_32",
+            Self::AllocLe64 => "alloc_le_64",
+            Self::AllocLe128 => "alloc_le_128",
+            Self::AllocLe256 => "alloc_le_256",
+            Self::AllocLe1024 => "alloc_le_1024",
+            Self::AllocLe4096 => "alloc_le_4096",
+            Self::AllocGt4096 => "alloc_gt_4096",
+            Self::ArenaAllocCalls => "arena_alloc_calls",
+            Self::ArenaAllocBytes => "arena_alloc_bytes",
         }
     }
 }
@@ -233,6 +260,17 @@ mod enabled {
         let row = &COUNTS[current_site()];
         row[ChurnCounter::AllocCalls as usize].fetch_add(1, Ordering::Relaxed);
         row[ChurnCounter::AllocBytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+        let bucket = match bytes {
+            0..=16 => ChurnCounter::AllocLe16,
+            17..=32 => ChurnCounter::AllocLe32,
+            33..=64 => ChurnCounter::AllocLe64,
+            65..=128 => ChurnCounter::AllocLe128,
+            129..=256 => ChurnCounter::AllocLe256,
+            257..=1024 => ChurnCounter::AllocLe1024,
+            1025..=4096 => ChurnCounter::AllocLe4096,
+            _ => ChurnCounter::AllocGt4096,
+        };
+        row[bucket as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_free(bytes: usize) {
@@ -245,6 +283,12 @@ mod enabled {
         let row = &COUNTS[current_site()];
         row[ChurnCounter::ReallocCalls as usize].fetch_add(1, Ordering::Relaxed);
         row[ChurnCounter::ReallocBytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_arena_alloc(bytes: usize) {
+        let row = &COUNTS[current_site()];
+        row[ChurnCounter::ArenaAllocCalls as usize].fetch_add(1, Ordering::Relaxed);
+        row[ChurnCounter::ArenaAllocBytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     static LEAF_SAMPLES: std::sync::Mutex<Vec<[u32; 3]>> = std::sync::Mutex::new(Vec::new());
@@ -283,6 +327,9 @@ pub use enabled::{
     record_realloc, snapshot,
 };
 
+#[cfg(feature = "churn-counters")]
+pub use enabled::record_arena_alloc;
+
 #[cfg(not(feature = "churn-counters"))]
 pub struct SiteGuard;
 
@@ -305,6 +352,10 @@ pub fn add(_counter: ChurnCounter, _amount: u64) {}
 #[cfg(not(feature = "churn-counters"))]
 #[inline(always)]
 pub fn record_leaf_sample(_entries: usize, _key_bytes: usize, _value_bytes: usize) {}
+
+#[cfg(not(feature = "churn-counters"))]
+#[inline(always)]
+pub fn record_arena_alloc(_bytes: usize) {}
 
 #[cfg(not(feature = "churn-counters"))]
 pub fn leaf_samples_since(_start: usize) -> (usize, Vec<[u32; 3]>) {

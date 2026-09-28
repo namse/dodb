@@ -2609,6 +2609,7 @@ pub(crate) fn encode_page_delta(
     base: &[u8; PAGE_SIZE],
     target: &[u8; PAGE_SIZE],
 ) -> Result<Vec<u8>> {
+    let _delta_site = crate::churn::enter(crate::churn::ChurnSite::PageDeltaGeneration);
     let spans = canonical_delta_spans(base, target);
     if spans.is_empty() {
         return Err(Error::invalid_input(

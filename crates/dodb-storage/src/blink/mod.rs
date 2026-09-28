@@ -1996,7 +1996,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 "experimental storage shard is degraded after an uncertain write",
             ));
         }
-        let _group_site = churn::enter(ChurnSite::GroupOther);
+        let _group_site = churn::enter(ChurnSite::OtherStorage);
 
         self.batch_metrics.logical_groups = self.batch_metrics.logical_groups.saturating_add(1);
         self.batch_metrics.logical_transactions = self
@@ -2112,7 +2112,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             )?,
             None => None,
         };
-        let serial_site = churn::enter(ChurnSite::SerialExecution);
+        let serial_site = churn::enter(ChurnSite::PackedLeafMutationCow);
         let preparation = match parallel_preparation {
             Some(preparation) => preparation,
             None => prepare_planned_serial_execution(
@@ -2151,7 +2151,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .dirty_union_nanos
             .saturating_add(elapsed_nanos(dirty_union_started));
         let catalog_started = Instant::now();
-        let catalog_site = churn::enter(ChurnSite::Catalog);
+        let catalog_site = churn::enter(ChurnSite::CatalogPublication);
         if !working
             .pages
             .keys()
@@ -2195,7 +2195,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .saturating_add(prepare_timing.catalog_state_scan_nanos);
 
         let wal_assembly_started = Instant::now();
-        let wal_assembly_site = churn::enter(ChurnSite::WalAssembly);
+        let wal_assembly_site = churn::enter(ChurnSite::WalPreparation);
         let serial_redo_record_count = executed
             .iter()
             .map(|transaction| transaction.images.len() as u64)
@@ -2394,7 +2394,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             }
         }
         let publication_started = Instant::now();
-        let publication_site = churn::enter(ChurnSite::Publication);
+        let publication_site = churn::enter(ChurnSite::CatalogPublication);
         let publish_timing = self.publisher.publish(published_generation);
         drop(publication_site);
         self.batch_metrics.generation_publication_nanos = self
@@ -3215,7 +3215,7 @@ fn shutdown_parallel_workers(workers: &mut [ParallelWorkerSlot]) {
 }
 
 fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerCommand>) {
-    let _worker_site = churn::enter(ChurnSite::WorkerThread);
+    let _worker_site = churn::enter(ChurnSite::OtherStorage);
     let thread_id = thread::current().id();
     while let Ok(command) = receiver.recv() {
         match command {
@@ -3277,7 +3277,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
         return Ok(None);
     };
     let dispatch_started = Instant::now();
-    let dispatch_site = churn::enter(ChurnSite::Dispatch);
+    let dispatch_site = churn::enter(ChurnSite::LeafJobConstruction);
     let transaction_count = plan.transactions.len();
     let fifo_limit = plan
         .transactions
@@ -3399,7 +3399,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
 
     let worker_run = worker_pool.execute(jobs)?;
     drop(dispatch_site);
-    let _collect_site = churn::enter(ChurnSite::Collect);
+    let _collect_site = churn::enter(ChurnSite::JobResultCollection);
     if worker_run.worker_threads.len() as u64 + 1 != worker_run.lanes {
         return Err(Error::invariant(
             "parallel Blink worker dispatch result count is inconsistent",
@@ -3581,7 +3581,7 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
 }
 
 fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
-    let _lane_site = churn::enter(ChurnSite::Lane);
+    let _lane_site = churn::enter(ChurnSite::LeafLaneExecution);
     #[cfg(test)]
     match job.fault {
         Some(ParallelWorkerFault::Error { .. }) => {

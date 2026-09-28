@@ -28,35 +28,39 @@ use dodb_storage::{
 
 #[cfg(feature = "churn-counters")]
 mod churn_allocator {
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{GlobalAlloc, Layout};
 
     struct CountingAllocator;
 
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             dodb_storage::churn::record_alloc(layout.size());
-            unsafe { System.alloc(layout) }
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             dodb_storage::churn::record_alloc(layout.size());
-            unsafe { System.alloc_zeroed(layout) }
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
         }
 
         unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
             dodb_storage::churn::record_free(layout.size());
-            unsafe { System.dealloc(pointer, layout) }
+            unsafe { mimalloc::MiMalloc.dealloc(pointer, layout) }
         }
 
         unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             dodb_storage::churn::record_realloc(new_size);
-            unsafe { System.realloc(pointer, layout, new_size) }
+            unsafe { mimalloc::MiMalloc.realloc(pointer, layout, new_size) }
         }
     }
 
     #[global_allocator]
     static GLOBAL: CountingAllocator = CountingAllocator;
 }
+
+#[cfg(not(feature = "churn-counters"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn churn_delta(
     before: &[(
