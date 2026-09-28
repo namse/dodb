@@ -230,6 +230,7 @@ pub struct BlinkBatchMetrics {
     pub parallel_fallback_overflow: u64,
     pub parallel_fallback_structural: u64,
     pub parallel_skipped_single_leaf: u64,
+    pub parallel_skipped_small_group: u64,
     pub structural_transactions: u64,
     pub transaction_mutation_histogram: Vec<u64>,
     pub transaction_dirty_page_histogram: Vec<u64>,
@@ -1306,6 +1307,7 @@ pub struct BlinkStore<F: DurableFile, W: DurableFile = crate::btree::NoWal> {
     batch_metrics: BlinkBatchMetrics,
     planned_execution: bool,
     parallel_workers: usize,
+    parallel_min_group_mutations: usize,
     parallel_worker_pool: Option<ParallelWorkerPool>,
     #[cfg(test)]
     parallel_worker_fault: Option<ParallelWorkerFault>,
@@ -1435,6 +1437,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             batch_metrics: BlinkBatchMetrics::default(),
             planned_execution: false,
             parallel_workers: 1,
+            parallel_min_group_mutations: 0,
             parallel_worker_pool: None,
             #[cfg(test)]
             parallel_worker_fault: None,
@@ -1506,6 +1509,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             batch_metrics: BlinkBatchMetrics::default(),
             planned_execution: false,
             parallel_workers: 1,
+            parallel_min_group_mutations: 0,
             parallel_worker_pool: None,
             #[cfg(test)]
             parallel_worker_fault: None,
@@ -1538,6 +1542,13 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
 
     pub fn enable_planned_execution(&mut self) {
         self.planned_execution = true;
+    }
+
+    /// Groups with fewer planned mutations than `mutations` run on the serial
+    /// executor even when the parallel executor is enabled. 0 keeps every
+    /// multi-leaf group eligible.
+    pub fn set_parallel_min_group_mutations(&mut self, mutations: usize) {
+        self.parallel_min_group_mutations = mutations;
     }
 
     pub fn enable_parallel_execution(&mut self, workers: usize) -> Result<()> {
@@ -2082,6 +2093,7 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
         let physical_started = Instant::now();
         let parallel_preparation = match self.parallel_worker_pool.as_ref() {
             Some(worker_pool) => prepare_leaf_parallel_execution(
+                self.parallel_min_group_mutations,
                 &self.state,
                 &self.publisher.pin(),
                 &plan,
@@ -3228,6 +3240,7 @@ fn parallel_worker_loop(worker_index: usize, receiver: Receiver<ParallelWorkerCo
 /// back to the serial executor before anything reaches the WAL.
 #[allow(clippy::too_many_arguments)]
 fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
+    min_group_mutations: usize,
     state: &'a BlinkState,
     published: &GenerationPin,
     plan: &Arc<BatchPlan>,
@@ -3246,6 +3259,17 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
     if plan.leaf_groups.len() <= 1 {
         metrics.parallel_skipped_single_leaf =
             metrics.parallel_skipped_single_leaf.saturating_add(1);
+        return Ok(None);
+    }
+    if plan
+        .leaf_groups
+        .iter()
+        .map(|leaf_group| leaf_group.mutations.len())
+        .sum::<usize>()
+        < min_group_mutations
+    {
+        metrics.parallel_skipped_small_group =
+            metrics.parallel_skipped_small_group.saturating_add(1);
         return Ok(None);
     }
     let Some(wal) = wal.filter(|wal| wal.page_delta_enabled()) else {
@@ -6713,6 +6737,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parallel_min_group_mutations_sends_small_groups_to_the_serial_executor() {
+        let (mut serial, _) = phase_d_store(0, 400);
+        let (mut adaptive, _) = phase_d_store(2, 400);
+        adaptive.set_parallel_min_group_mutations(8);
+        let distinct = keys_on_distinct_leaves(&adaptive, 400, 12);
+        let small = distinct[..3]
+            .iter()
+            .map(|(index, _)| put_request(&[(*index, b0_value(*index, 5))]))
+            .collect::<Vec<_>>();
+        let large = distinct
+            .iter()
+            .map(|(index, _)| put_request(&[(*index, b0_value(*index, 6))]))
+            .collect::<Vec<_>>();
+        for group in [&small, &large] {
+            let expected = serial.apply_transaction_group(group).unwrap();
+            let actual = adaptive.apply_transaction_group(group).unwrap();
+            assert_eq!(
+                successful_commit_lsns(&actual),
+                successful_commit_lsns(&expected)
+            );
+        }
+        let metrics = adaptive.batch_metrics();
+        assert_eq!(metrics.parallel_skipped_small_group, 1);
+        assert_eq!(metrics.parallel_groups, 1);
+        assert_eq!(serial.dirty_pages, adaptive.dirty_pages);
+        assert_eq!(
+            serial.scan(None, usize::MAX).unwrap(),
+            adaptive.scan(None, usize::MAX).unwrap()
+        );
+        let (_, serial_wal) = serial.into_files();
+        let (_, adaptive_wal) = adaptive.into_files();
+        assert_eq!(serial_wal.unwrap().0, adaptive_wal.unwrap().0);
     }
 
     #[test]

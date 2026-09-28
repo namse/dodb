@@ -389,6 +389,7 @@ struct Args {
     tokio_workers: usize,
     blink_workers: usize,
     parallel_workers: usize,
+    parallel_min_mutations: usize,
     seed: u64,
     output: PathBuf,
     window_seconds: Option<u64>,
@@ -424,6 +425,7 @@ impl Default for Args {
                 .map_or(1, std::num::NonZeroUsize::get),
             blink_workers: 2,
             parallel_workers: 0,
+            parallel_min_mutations: 0,
             seed: 0xd0db_2026_0000_0001,
             output: PathBuf::from(DEFAULT_OUTPUT),
             window_seconds: None,
@@ -520,6 +522,10 @@ impl Args {
                 }
                 "--parallel-workers" => {
                     args.parallel_workers = parse_usize(&take_value(&mut values, &flag), &flag)
+                }
+                "--parallel-min-mutations" => {
+                    args.parallel_min_mutations =
+                        parse_usize(&take_value(&mut values, &flag), &flag)
                 }
                 "--blink-workers" => {
                     args.blink_workers = parse_usize(&take_value(&mut values, &flag), &flag)
@@ -1681,6 +1687,7 @@ struct MetricDelta {
     parallel_fallback_overflow: u64,
     parallel_fallback_structural: u64,
     parallel_skipped_single_leaf: u64,
+    parallel_skipped_small_group: u64,
     structural_transactions: u64,
     transaction_mutation_histogram: Vec<u64>,
     transaction_dirty_page_histogram: Vec<u64>,
@@ -2159,6 +2166,10 @@ impl MetricDelta {
             parallel_fallback_structural: subtraction(
                 batch_after.parallel_fallback_structural,
                 batch_before.parallel_fallback_structural,
+            ),
+            parallel_skipped_small_group: subtraction(
+                batch_after.parallel_skipped_small_group,
+                batch_before.parallel_skipped_small_group,
             ),
             parallel_skipped_single_leaf: subtraction(
                 batch_after.parallel_skipped_single_leaf,
@@ -2865,6 +2876,7 @@ async fn open_adapter(
             }
             if args.parallel_workers > 0 {
                 store.enable_parallel_execution(args.parallel_workers)?;
+                store.set_parallel_min_group_mutations(args.parallel_min_mutations);
             }
             if CHECKPOINT_WAL_BYTES.load(Ordering::Relaxed) > 0 {
                 checkpoint_blink_store(&mut store)?;
@@ -3029,6 +3041,7 @@ fn build_record(
     json.usize("tokio_workers", args.tokio_workers);
     json.usize("blink_workers", args.blink_workers);
     json.usize("parallel_workers", args.parallel_workers);
+    json.usize("parallel_min_mutations", args.parallel_min_mutations);
     json.string("suite", scenario.suite.as_str());
     json.string("workload", scenario.workload);
     json.usize("writers", scenario.writers);
@@ -3444,6 +3457,10 @@ fn build_record(
     json.u64(
         "parallel_skipped_single_leaf_delta",
         delta.parallel_skipped_single_leaf,
+    );
+    json.u64(
+        "parallel_skipped_small_group_delta",
+        delta.parallel_skipped_small_group,
     );
     json.u64(
         "structural_transactions_delta",
