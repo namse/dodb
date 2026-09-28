@@ -752,3 +752,62 @@ The randomized packed-leaf differential covers 400 seeds × 120 operations and c
 **Keep the packed representation.** It removes all per-entry Arc operations and, on the targeted profile, reduces total cycles by 15.5% while improving durable throughput by 13.2%. The final full-matrix improvement is more modest at 2.9% geometric mean, so this adoption is based on the stated targeted gate and direct CPU evidence, not the atom count alone. The next bottleneck is **malloc/free cost**: 242,547 sampled cycles per transaction (30.6% of F1 samples), still the largest measured category. The counter breakdown attributes 166 allocator calls and about 8.0 KB per transaction to the benchmark harness.
 
 `results/wal-v3-phase-f/` contains `design.md`, `correctness.md` and correctness logs, `environment.txt`, `run-order.txt`, progress logs, `raw/` benchmark rows, `counters/`, `tables.md`, `analysis.json`, `perf/` profiles and reports, `crossver/`, `reopen/`, `scripts/`, `process-metrics.jsonl`, and `SHA256SUMS`.
+
+## Phase G — mimalloc and arena-based allocation elimination
+
+### Environment and allocator
+
+The OCI benchmark host was reached at `217.142.246.204` with strict host-key verification and the supplied identity. Work ran in detached temporary worktrees; `/home/opc/dodb` stayed untouched on `experiment/b-link-batched-engine`. The host is Oracle Linux 9.8, AArch64 Neoverse-N1, 2 OCPU, Rust 1.98.1; `/bench/zfs/db` is the mounted ZFS dataset.
+
+The workspace pins mimalloc 0.1.52. All executable targets in this checkout select `mimalloc::MiMalloc` at their binary boundary, and the phase0 counting allocator delegates to mimalloc. The storage library has no global allocator. The `dodb-server` package in this checkout is library-only, so no production executable exists here to configure; the production binary must select mimalloc at its own binary boundary.
+
+### G0 mimalloc baseline
+
+The plain phase0 executable without churn counters is the performance baseline. Runs used 2 seconds warmup, 5 seconds measurement and 3 repetitions. G0 throughput medians are in `results/wal-v3-phase-g/g0-summary.csv`; it includes the requested 4 sync-disabled controls and 6 durable scenarios.
+
+For 64w width16 uniform, the sync-disabled G0 median is 6,204 tx/s and real-sync is 4,994 tx/s. Counter-enabled storage allocation attribution for the same primary workload measured 361.69 allocation calls and 141,995 bytes per successful transaction, excluding 166.06 benchmark-harness calls and 7,980 bytes. The largest storage sources were planner (103.46 calls / 9,766 bytes), leaf lane execution (92.49 / 103,490 bytes), and admission (70.17 / 4,866 bytes). Full stages, frees and important size buckets are in `results/wal-v3-phase-g/counters/oci-g0-stage-attribution.csv`.
+
+Admission and planner descriptors have group lifetime. Lane results mix scratch with owned redo and page images, so only local metadata/scratch could enter an arena. Catalog/publication allocations may be reachable from pinned generations or dirty state and must remain normally owned. WAL payloads and final page images must remain owned until append/publication completes.
+
+A separate perf sample recorded 32.07B user cycles and 52.78B user instructions for 36,533 transactions (about 878k cycles and 1.445M instructions per transaction in that sample). `perf report` sampled mimalloc internals at 11.34% of total samples across allocator symbols (`_mi_page_malloc_zero` 3.12%, `mi_free` 2.26%, plus other allocation/free routines). At this sample rate that is roughly 99.6k sampled-equivalent cycles/tx; this is an estimate, not a precise allocator-cycle counter. Reports and raw profile are in `results/wal-v3-phase-g/perf/`.
+
+### Arena and allocation candidates
+
+No arena or reusable-buffer candidate passed the CPU gate, so none is retained. Candidate code snapshots, gate logs and raw rows are preserved in `results/wal-v3-phase-g/`.
+
+| Step | Change measured | Primary result vs G0 | Allocation evidence | Decision |
+|---|---|---:|---|---|
+| G1a | Group `Bump` for dependency flags | 0.921x sync-disabled width16; 0.947x real-sync width16; 0.985x width1 | Reduced scratch heap work without total CPU gain | Reject |
+| G1b | Also grouped transaction-to-leaf metadata in `BumpVec` | 0.949x; 0.958x; 0.965x | Allocation reduction did not offset regression | Reject |
+| G1c | Arena-encoded mutation keys and logical overlay keys, borrowed requests | 1.007x; 1.003x; 1.008x | Storage calls 361.69 → 325.08/tx; bytes 141,995 → 140,888/tx; admission calls 70.17 → 35.22/tx | Reject; throughput and bytes were effectively unchanged |
+| G2 | One shared job-operation slice, ranges per job (`Arc<[T]>`) | 0.921x; 0.977x; 0.976x | Removed per-job vectors but added shared result ownership cost | Reject |
+| G2b | Shared operation `Arc<Vec<T>>` | 0.994x; 0.949x; 0.979x | Avoided slice conversion copy; no CPU gain | Reject |
+| G3 | Two-pass canonical PageDelta span scan, no span `Vec` | 0.959x sync-disabled width16; 0.984x real-sync width16 diagnostic | PageDelta calls 32.17 → 16.05/tx and bytes 2,745 → 1,711/tx | Reject; the second scan cost more CPU than the removed allocation |
+| G4 | Contiguous transaction-result metadata and index ranges | 0.974x sync-disabled width16 | Job-result collection calls 7.04 → 6.09/tx; storage total 361.69 → 359.60 calls/tx | Reject; small allocation reduction did not offset CPU cost |
+
+G1a/G1b/G1c and G2/G2b passed `cargo test --workspace --release --no-fail-fast` on OCI. G3 and G4 also passed the full workspace release suite. G3 real-sync width1 diagnostics stopped at two repetitions after the primary gate failed. G4 was stopped after the primary gate failed; its real-sync controls were not run. The exact comparisons and runs are listed in `results/wal-v3-phase-g/gates/decision.csv`.
+
+The arena-reuse test in the G1c candidate exercised group sizes `1, 64, 3, 128, 2, 32, 1, 256`, reopened the database and verified values remained isolated. It passed. Since all arena candidates were rejected, no arena memory is retained in the final candidate and no 120-second RSS test was triggered.
+
+### Final gates and historical comparison
+
+Final G is G0 mimalloc-only because every allocation optimization was rejected. Thus final/G0 is 1.000x for each scenario by identity. The six-scenario durable comparison is `results/wal-v3-phase-g/durable-g0-vs-phase-f.csv`:
+
+| Scenario | G0 mimalloc tx/s | Phase F historical tx/s | G0 / F | Final / G0 |
+|---|---:|---:|---:|---:|
+| 16w width1 uniform | 8,692 | 8,454 | 1.028x | 1.000x |
+| 16w width16 uniform | 3,361 | 3,016 | 1.114x | 1.000x |
+| 64w width1 uniform | 25,628 | 30,501 | 0.840x | 1.000x |
+| 64w width16 uniform | 4,994 | 4,031 | 1.239x | 1.000x |
+| 64w width16 compact | 16,373 | 13,298 | 1.231x | 1.000x |
+| 64w width16 spread | 10,370 | 8,268 | 1.254x | 1.000x |
+
+The required arena success threshold of 1.05x over G0 is not met. Therefore the 14-scenario matrix, current RocksDB rerun and 120-second sustained-memory run are not triggered. This does not change the mandated mimalloc adoption. The Phase F RocksDB reference remains width1 1.130x and width16 0.394x; no Phase G RocksDB result is claimed.
+
+A deterministic public-API comparison between Phase F and final G ran 12 seed/value-limit/worker configurations. Transaction results, commit LSNs, reads, queries/documents, scans, reopen scans, data-file SHA256/size and WAL SHA256/size are byte-identical. The outputs are `results/wal-v3-phase-g/crossver/output-phase-f.txt` and `output-g0.txt`.
+
+### Decision and next bottleneck
+
+Keep mimalloc. Reject G1a through G4 because none reduced total CPU work while preserving width1 throughput. The final measured profile's largest single storage-owned category is **CRC32C** at about 11.2% of sampled cycles across storage worker/coordinator threads. The raw perf report is authoritative for that estimate; the next experiment should target CRC work without changing PageDelta or WAL bytes.
+
+Implementation, candidate source snapshots, benchmark rows, counters, perf samples, correctness logs, byte-identity outputs and run-order files are in `results/wal-v3-phase-g/`.
