@@ -687,3 +687,68 @@ On top of Phase E the parallel executor is worth 1.11–1.32× everywhere except
 ### Files
 
 `results/wal-v3-phase-e/`: `design.md`, `correctness.md` (+ `correctness/` logs, `crossver/` Phase D vs Phase E byte-for-byte check), `environment.txt`, `run-order.txt`, `process-metrics.jsonl`, progress logs, `raw/` (counter rows, step rows, CPU gate, durable gate, retention, perf rows), `counters/` (per-site tables and `steps.md`), `tables.md`, `analysis.json`, `perf/` (`perf.data`, reports, `copy-alloc-refcount*.txt`, `sources-*.json`), `scripts/` (`run_phase_e.py`, `analyze_phase_e.py`, `churn_summary.py`, `perf_categories.py`, `perf_sources.py`), `SHA256SUMS`.
+
+## Phase F — leaf-local packed storage
+
+Question: can replacing per-entry `Arc` ownership with leaf-local packed storage trade remote atomic reference-count traffic for cheaper sequential copies? The page and WAL encodings, revision rules, routing, overflow pages, checkpoints, planner and two-lane executor remain unchanged. F1 adopts the packed leaf representation; F2 (combining the slot and byte buffers into one allocation) was not run because the measured clone/drop allocation cost was only about 27k cycles/transaction, too small to justify another representation change. The adaptive parallel threshold is a separate control measured on the same final representation.
+
+### F0 population and representation
+
+The OCI probe sampled 64 writers, width 16, before the representation change. Uniform touched leaves held 15.1 entries on average (p50 15, p95 15, max 29), with 495 key bytes and 970 inline-value bytes on average. The combined key/value payload averaged 1,464 bytes (p95 1,455, max 2,789); including slots, a packed clone copies about 2.1 KB per ordinary touched leaf, not a 4 KiB page.
+
+Phase E's `LeafEntry` was 48 bytes and stored each key and inline value in a separate `Arc<[u8]>`; cloning a leaf copied about 720 bytes of entry records and changed roughly 948 payload reference counts per width-16 transaction. Phase F uses a 40-byte `LeafSlot` with offsets into one leaf-local byte buffer. A copied leaf has a slot vector and a byte vector; neither keys nor inline values have per-entry owners. The existing `Arc<BlinkPage>` remains the page-version ownership boundary, with no additional `Arc<LeafData>` layer. At 64w width 16 the measured clone volume is 9,090 slot bytes plus 21,967 payload bytes per transaction, or about 610 + 1,478 bytes per touched leaf. Cloning now needs two leaf-buffer allocations rather than one entry-vector allocation; total instrumented allocator calls were essentially flat (526 to 524 per transaction, harness included), and the lane allocation calls were 125 to 123.
+
+### F1 CPU profile and step result
+
+Real-sync frame-pointer profiling on the same OCI host compared Phase E (`4ead3de`) with packed F1 (`fe9dfad`), both built with CRC enabled. Arc reference-count samples fell from 110,451 to 35,871 cycles per transaction (11.8% to 4.5%); per-entry key/value clone and drop operations are zero in the packed leaf. The remaining Arc work belongs to page-version ownership. Sequential copies also fell from 52,930 to 38,088 cycles per transaction, while allocator time fell from 269,429 to 242,547 cycles. Total sampled cycles fell from 936,819 to 791,860 per transaction (15.5%). The copy/allocation/refcount group fell from 493,048 to 356,654 cycles. These results show the saved atomics were not paid back as memcpy work.
+
+| Real-sync run | Phase E tx/s | F1 tx/s | F1 / E |
+|---|---:|---:|---:|
+| 64w w16 uniform | 3,523 | 3,989 | **1.132** |
+| 64w w1 uniform | 28,397 | 30,246 | 1.065 |
+
+The copy counters show 14.9 leaf clones and about 225 copied entries per transaction in width-16 uniform. They also show the additional payload copy F1 introduces: about 22.0 KB of key/value bytes per transaction, alongside 9.1 KB of slots. Entry clone/drop allocations are replaced by packed buffers without increasing total allocation calls. A separate reopen probe on a local Mac decoded 6,759 pages: allocations per open fell from 274,632 to 81,258, with open time remaining within the same 32–36 ms range. This is local decode evidence, not an OCI throughput result.
+
+### Adaptive parallel control
+
+On the same F code, `--parallel-min-mutations 32` selected the serial executor for small groups and retained two lanes for larger groups. Against always-two-lane F, the geometric mean across five measured cases was 1.011. The 16w width-1 case was effectively tied (1.005); 64w width-1 improved to 1.033, while 16w width-16 was 0.985. The control restores small-group performance without materially changing the larger-group wins. The final durable and matrix tables use the adaptive setting.
+
+### Durable gate and full matrix
+
+The six-scenario real-sync gate passed both thresholds: 64w width 16 uniform F/E was 1.122×, and 16w width 1 F/Phase C was 1.026×. The gate's six-row geometric mean was F/E 1.083. The full 14-scenario matrix then measured a 1.029 F/E geometric mean. Width-16 uniform was 1.098×; single-writer width-1 uniform was 0.980×, where throughput is dominated by sync and within run variation.
+
+| Scenario | Phase C tx/s | Phase E tx/s | Phase F adaptive tx/s | F / E |
+|---|---:|---:|---:|---:|
+| 16w w1 uniform | 8,089 | 8,025 | 8,503 | 1.060 |
+| 16w w1 compact | 9,395 | 9,500 | 9,325 | 0.982 |
+| 16w w1 spread | 8,541 | 8,440 | 8,624 | 1.022 |
+| 16w w16 uniform | 1,902 | 2,674 | 2,867 | 1.072 |
+| 16w w16 compact | 5,975 | 6,588 | 6,592 | 1.001 |
+| 16w w16 spread | 5,551 | 6,183 | 6,337 | 1.025 |
+| 64w w1 uniform | 23,953 | 28,087 | 29,750 | 1.059 |
+| 64w w1 compact | 32,241 | 33,521 | 33,176 | 0.990 |
+| 64w w1 spread | 26,521 | 30,882 | 30,809 | 0.998 |
+| 64w w16 uniform | 2,045 | 3,512 | 3,855 | 1.098 |
+| 64w w16 compact | 10,800 | 13,132 | 13,351 | 1.017 |
+| 64w w16 spread | 6,030 | 7,675 | 8,220 | 1.071 |
+| 1w w1 uniform | 1,345 | 1,349 | 1,322 | 0.980 |
+| 1w w16 uniform | 806 | 836 | 871 | 1.042 |
+
+The width-1 durable result does not reverse the adoption decision: Phase F passed the predeclared gate, and F1's targeted CPU and throughput results both exceed the strong-candidate bar. The 14-case mean is smaller because it includes sync-bound and compact workloads with little leaf-copy work.
+
+### Same-session RocksDB comparison
+
+After the full-matrix gate, the two requested RocksDB cases were run on the same OCI ZFS session. Ratios are geometric means of paired repetitions.
+
+| Scenario | dodb Phase F tx/s | RocksDB tx/s | dodb / RocksDB |
+|---|---:|---:|---:|
+| 64w w1 uniform | 29,772 | 26,320 | **1.130** |
+| 64w w16 uniform | 3,820 | 9,814 | **0.394** |
+
+### Correctness and decision
+
+The randomized packed-leaf differential covers 400 seeds × 120 operations and compares lookup, fit, split, decode, and encoded page bytes against an independent Phase-E-style reference encoder. The existing published-generation isolation, WAL fault, parallel differential and recovery tests passed. Public API cross-version runs across Phase E, F1 and final F produced identical transaction results, commit LSNs, gets, queries, scans, reopen scans, data-file bytes and WAL bytes across 12 configurations. The on-disk 4 KiB page format is byte-identical.
+
+**Keep the packed representation.** It removes all per-entry Arc operations and, on the targeted profile, reduces total cycles by 15.5% while improving durable throughput by 13.2%. The final full-matrix improvement is more modest at 2.9% geometric mean, so this adoption is based on the stated targeted gate and direct CPU evidence, not the atom count alone. The next bottleneck is **malloc/free cost**: 242,547 sampled cycles per transaction (30.6% of F1 samples), still the largest measured category. The counter breakdown attributes 166 allocator calls and about 8.0 KB per transaction to the benchmark harness.
+
+`results/wal-v3-phase-f/` contains `design.md`, `correctness.md` and correctness logs, `environment.txt`, `run-order.txt`, progress logs, `raw/` benchmark rows, `counters/`, `tables.md`, `analysis.json`, `perf/` profiles and reports, `crossver/`, `reopen/`, `scripts/`, `process-metrics.jsonl`, and `SHA256SUMS`.
