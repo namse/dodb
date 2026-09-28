@@ -232,6 +232,21 @@ mod enabled {
         row[ChurnCounter::ReallocBytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    static LEAF_SAMPLES: std::sync::Mutex<Vec<[u32; 3]>> = std::sync::Mutex::new(Vec::new());
+
+    pub fn record_leaf_sample(entries: usize, key_bytes: usize, value_bytes: usize) {
+        if let Ok(mut samples) = LEAF_SAMPLES.lock() {
+            samples.push([entries as u32, key_bytes as u32, value_bytes as u32]);
+        }
+    }
+
+    pub fn leaf_samples_since(start: usize) -> (usize, Vec<[u32; 3]>) {
+        match LEAF_SAMPLES.lock() {
+            Ok(samples) => (samples.len(), samples.get(start..).unwrap_or(&[]).to_vec()),
+            Err(_) => (0, Vec::new()),
+        }
+    }
+
     pub fn snapshot() -> Vec<(ChurnSite, ChurnCounter, u64)> {
         let mut values = Vec::with_capacity(SITE_COUNT * COUNTER_COUNT);
         for site in CHURN_SITES {
@@ -248,7 +263,10 @@ mod enabled {
 }
 
 #[cfg(feature = "churn-counters")]
-pub use enabled::{SiteGuard, add, enter, record_alloc, record_free, record_realloc, snapshot};
+pub use enabled::{
+    SiteGuard, add, enter, leaf_samples_since, record_alloc, record_free, record_leaf_sample,
+    record_realloc, snapshot,
+};
 
 #[cfg(not(feature = "churn-counters"))]
 pub struct SiteGuard;
@@ -268,6 +286,15 @@ pub fn enter(_site: ChurnSite) -> SiteGuard {
 #[cfg(not(feature = "churn-counters"))]
 #[inline(always)]
 pub fn add(_counter: ChurnCounter, _amount: u64) {}
+
+#[cfg(not(feature = "churn-counters"))]
+#[inline(always)]
+pub fn record_leaf_sample(_entries: usize, _key_bytes: usize, _value_bytes: usize) {}
+
+#[cfg(not(feature = "churn-counters"))]
+pub fn leaf_samples_since(_start: usize) -> (usize, Vec<[u32; 3]>) {
+    (0, Vec::new())
+}
 
 #[cfg(not(feature = "churn-counters"))]
 pub fn snapshot() -> Vec<(ChurnSite, ChurnCounter, u64)> {

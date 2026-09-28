@@ -80,6 +80,33 @@ fn churn_delta(
         .collect()
 }
 
+fn leaf_sample_summary(samples: &[[u32; 3]]) -> Vec<(String, u64)> {
+    let mut summary = vec![("leaf_samples".to_owned(), samples.len() as u64)];
+    for (column, name) in ["entries", "key_bytes", "value_bytes", "payload_bytes"]
+        .iter()
+        .enumerate()
+    {
+        let mut values = samples
+            .iter()
+            .map(|sample| match column {
+                3 => u64::from(sample[1]) + u64::from(sample[2]),
+                _ => u64::from(sample[column]),
+            })
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            continue;
+        }
+        values.sort_unstable();
+        let sum = values.iter().sum::<u64>();
+        let at = |fraction: f64| values[((values.len() - 1) as f64 * fraction).round() as usize];
+        summary.push((format!("leaf_{name}_sum"), sum));
+        summary.push((format!("leaf_{name}_p50"), at(0.5)));
+        summary.push((format!("leaf_{name}_p95"), at(0.95)));
+        summary.push((format!("leaf_{name}_max"), *values.last().unwrap()));
+    }
+    summary
+}
+
 static CHECKPOINT_WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 static CHECKPOINT_EVENTS: Mutex<Vec<CheckpointEvent>> = Mutex::new(Vec::new());
 
@@ -3675,6 +3702,7 @@ async fn run_repetition(
     }
     let before = adapter.snapshot();
     let churn_before = dodb_storage::churn::snapshot();
+    let (leaf_sample_start, _) = dodb_storage::churn::leaf_samples_since(usize::MAX);
     let cpu_start = ProcessCpuSample::capture();
     let started = Instant::now();
     let sampler = args.window_seconds.map(|window_seconds| {
@@ -3705,7 +3733,9 @@ async fn run_repetition(
     let churn_after = dodb_storage::churn::snapshot();
     let after = adapter.snapshot();
     let delta = MetricDelta::from(&before, &after);
-    let churn = churn_delta(&churn_before, &churn_after);
+    let mut churn = churn_delta(&churn_before, &churn_after);
+    let (_, leaf_samples) = dodb_storage::churn::leaf_samples_since(leaf_sample_start);
+    churn.extend(leaf_sample_summary(&leaf_samples));
     print_run_summary(scenario, repetition, &measured, wall, &delta);
     let line = build_record(
         machine,

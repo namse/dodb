@@ -3627,6 +3627,21 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
     let mut timing = LeafChainTiming::default();
     let leaf_id = job.leaf_id;
     let base_started = Instant::now();
+    if churn::ENABLED
+        && let BlinkPage::Leaf { entries, .. } = &*job.initial_page
+    {
+        churn::record_leaf_sample(
+            entries.len(),
+            entries.iter().map(|entry| entry.key.len()).sum(),
+            entries
+                .iter()
+                .map(|entry| match &entry.value {
+                    Some(BlinkValueRef::Inline(value)) => value.len(),
+                    _ => 0,
+                })
+                .sum(),
+        );
+    }
     let mut page = BlinkPage::clone(&job.initial_page);
     drop(job.initial_page);
     let mut base = match job.chain_entry {
