@@ -1228,10 +1228,13 @@ struct LeafChainJob {
     fault: Option<ParallelWorkerFault>,
 }
 
+#[derive(Clone)]
 struct TrustedPageImage {
     image: Arc<[u8; PAGE_SIZE]>,
+    page_id: PageId,
     page_lsn: Lsn,
     fingerprint: u32,
+    page_checksum: u32,
 }
 
 enum LeafChainRedo {
@@ -3372,8 +3375,10 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
         let base_page = chain_entry.and_then(|(page_lsn, fingerprint)| {
             dirty_pages.get(&leaf_id).map(|image| TrustedPageImage {
                 image: Arc::clone(image),
+                page_id: leaf_id,
                 page_lsn,
                 fingerprint,
+                page_checksum: u32::from_le_bytes(image[28..32].try_into().unwrap()),
             })
         });
         churn::add(ChurnCounter::JobsBuilt, 1);
@@ -3638,10 +3643,13 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
                             "page {leaf_id} parallel delta base does not match the WAL page chain"
                         )));
                     }
+                    let page_checksum = u32::from_le_bytes(image[28..32].try_into().unwrap());
                     TrustedPageImage {
                         image,
+                        page_id: leaf_id,
                         page_lsn: chain_lsn,
                         fingerprint,
+                        page_checksum,
                     }
                 }
             };
@@ -3721,10 +3729,13 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
                 }
             }
         };
+        let page_checksum = u32::from_le_bytes(image[28..32].try_into().unwrap());
         base = Some(TrustedPageImage {
             image,
+            page_id: leaf_id,
             page_lsn: commit_lsn,
             fingerprint: image_crc,
+            page_checksum,
         });
         timing.delta_nanos = timing
             .delta_nanos
@@ -3786,8 +3797,15 @@ fn validate_trusted_page_image(
             .try_into()
             .map_err(|_| Error::invariant("trusted Blink page id bytes are invalid"))?,
     ));
-    if trusted.page_lsn != chain_lsn
+    let image_page_checksum = u32::from_le_bytes(
+        trusted.image[28..32]
+            .try_into()
+            .map_err(|_| Error::invariant("trusted Blink page checksum bytes are invalid"))?,
+    );
+    if trusted.page_id != page_id
+        || trusted.page_lsn != chain_lsn
         || trusted.fingerprint != chain_fingerprint
+        || trusted.page_checksum != image_page_checksum
         || image_page_id != page_id
         || blink_image_lsn(&trusted.image) != chain_lsn
     {
@@ -6547,41 +6565,51 @@ mod tests {
         let fingerprint = crc32c::crc32c(&image[..]);
         let trusted = TrustedPageImage {
             image: Arc::clone(&image),
+            page_id,
             page_lsn,
             fingerprint,
+            page_checksum: u32::from_le_bytes(image[28..32].try_into().unwrap()),
         };
         assert_eq!(fingerprint, crc32c::crc32c(&trusted.image[..]));
         validate_trusted_page_image(page_id, page_lsn, fingerprint, &trusted).unwrap();
 
         let wrong_lsn = TrustedPageImage {
             page_lsn: Lsn::new(page_lsn.get() + 1),
-            ..TrustedPageImage {
-                image: Arc::clone(&image),
-                page_lsn,
-                fingerprint,
-            }
+            ..trusted.clone()
         };
         assert!(validate_trusted_page_image(page_id, page_lsn, fingerprint, &wrong_lsn).is_err());
 
         let wrong_fingerprint = TrustedPageImage {
             fingerprint: fingerprint ^ 1,
-            image: Arc::clone(&image),
-            page_lsn,
+            ..trusted.clone()
         };
         assert!(
             validate_trusted_page_image(page_id, page_lsn, fingerprint, &wrong_fingerprint)
                 .is_err()
         );
 
-        let wrong_image = encode_blink_page_arc(PageId::new(20), &page).unwrap();
+        let wrong_page = BlinkPage::Leaf {
+            lsn: page_lsn,
+            high_key: Some(DocumentKey::new(b"fingerprint".to_vec(), b"other".to_vec()).encode()),
+            right_sibling: None,
+            entries: LeafEntries::default(),
+        };
+        let wrong_image = encode_blink_page_arc(page_id, &wrong_page).unwrap();
         let wrong_association = TrustedPageImage {
             image: wrong_image,
-            page_lsn,
-            fingerprint,
+            ..trusted.clone()
         };
         assert!(
             validate_trusted_page_image(page_id, page_lsn, fingerprint, &wrong_association)
                 .is_err()
+        );
+
+        let wrong_page_id = TrustedPageImage {
+            page_id: PageId::new(page_id.get() + 1),
+            ..trusted
+        };
+        assert!(
+            validate_trusted_page_image(page_id, page_lsn, fingerprint, &wrong_page_id).is_err()
         );
     }
 
