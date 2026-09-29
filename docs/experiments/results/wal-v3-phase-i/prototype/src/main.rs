@@ -497,7 +497,7 @@ fn emit_write_measurements(
     };
     let iteration_count = 200usize;
     let transactions = iteration_count * requests.len();
-    let (allocations_before, bytes_before) = reset_allocation_counters();
+    reset_allocation_counters();
     let cpu_started = ticks();
     let wall_started = Instant::now();
     let mut totals = GroupTiming::default();
@@ -512,7 +512,7 @@ fn emit_write_measurements(
     }
     let wall_nanos = wall_started.elapsed().as_nanos() as u64;
     let cpu_nanos = ticks().saturating_sub(cpu_started);
-    let (allocations_after, bytes_after) = reset_allocation_counters();
+    let (allocations, allocated_bytes) = reset_allocation_counters();
     println!(
         "{{\"record_type\":\"write_cpu\",\"git_commit\":{},\"segments_before_commit\":{},\"iterations\":{},\"successful_transactions\":{},\"logical_mutations\":{},\"cpu_ns_per_tx\":{},\"wall_ns_per_tx\":{},\"allocations_per_tx\":{:.4},\"allocated_bytes_per_tx\":{:.2},\"admission_ns_per_tx\":{:.2},\"overlay_mutation_ns_per_tx\":{:.2},\"freeze_sort_ns_per_tx\":{:.2},\"publication_ns_per_tx\":{:.2}}}",
         json_string(source_commit()),
@@ -522,8 +522,8 @@ fn emit_write_measurements(
         transactions * requests[0].mutations.len(),
         cpu_nanos / transactions as u64,
         wall_nanos / transactions as u64,
-        allocations_after.saturating_sub(allocations_before) as f64 / transactions as f64,
-        bytes_after.saturating_sub(bytes_before) as f64 / transactions as f64,
+        allocations as f64 / transactions as f64,
+        allocated_bytes as f64 / transactions as f64,
         totals.admission_nanos as f64 / transactions as f64,
         totals.overlay_mutation_nanos as f64 / transactions as f64,
         totals.freeze_sort_nanos as f64 / transactions as f64,
@@ -535,8 +535,8 @@ fn emit_write_measurements(
 fn measure_reads(view: &PublishedView, segment_count: usize) -> Result<()> {
     let base_hit = key_for(99_999);
     let base_miss = key_for(200_000);
-    let oldest_hit = key_for(10_000);
-    let newest_hit = key_for(10_000 + segment_count.saturating_sub(1) as u64 * 1_000);
+    let oldest_hit = key_for(1);
+    let newest_hit = key_for(segment_count.saturating_sub(1) as u64 * 704 + 1);
     let cases = [
         ("newest", newest_hit),
         ("oldest", oldest_hit),
