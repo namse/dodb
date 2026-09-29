@@ -811,3 +811,32 @@ A deterministic public-API comparison between Phase F and final G ran 12 seed/va
 Keep mimalloc. Reject G1a through G4 because none reduced total CPU work while preserving width1 throughput. The final measured profile's largest single storage-owned category is **CRC32C** at about 11.2% of sampled cycles across storage worker/coordinator threads. The raw perf report is authoritative for that estimate; the next experiment should target CRC work without changing PageDelta or WAL bytes.
 
 Implementation, candidate source snapshots, benchmark rows, counters, perf samples, correctness logs, byte-identity outputs and run-order files are in `results/wal-v3-phase-g/`.
+
+## Phase H — CRC32C scan elimination
+
+### Hardware and provenance
+
+H0/G0 was rebuilt from `a78472377fa16ed491c18bd2d6770f7dba7e9311`; H1 was built from `5998f7c47a15850c40bb40c8c378ac5c0deca061`. The accepted benchmark rows report those exact commits, and the binary SHA256 values are recorded with the raw run order. The OCI canonical checkout was `/home/opc/dodb-wal-v3`; G0 used a temporary detached worktree. Both builds used rustc 1.98.1, target `aarch64-unknown-linux-gnu`, repository `-C target-feature=+crc`, and `crc32c` 0.6.8 with `cfg armsimd`. `objdump` confirmed AArch64 `crc32cb` and `crc32cx` in both binaries. A first set of source-only-copy results reported `git_commit=unknown`; those files are retained under `results/wal-v3-phase-h/*/rejected-provenance/` and excluded from this section.
+
+### H0 attribution and H1 result
+
+For 64w width16 uniform, G0 performed 47.191 full-page CRC32C scans per transaction: 15.982 canonical page checksums, 15.983 image fingerprints, and 15.226 prior-page chain validations. This hashed 193,295 full-page bytes per transaction. Existing worker-stage timers put the base, encode, and fingerprint paths at about 27.93, 29.03, and 32.00 µs/tx respectively; these include adjacent work. The profile estimates CRC32C at 11.17% of sampled cycles, about 71,496 cycles/tx.
+
+H1 keeps the existing PageDelta fingerprint and persisted checksum semantics. It carries trusted immutable page ID, LSN, chain fingerprint, and embedded checksum metadata with the image, then validates that association in constant time. Untrusted file/WAL bytes still take the original full validation path. The prior-page full CRC scan is eliminated: total full-page scans fall to 31.965 and bytes to 130,929 per transaction. Sampled CRC cost falls to 6.38%, about 39,970 cycles/tx; total profile cycles fall 2.1%.
+
+| 64w width16 uniform | G0 | H1 | Throughput H1/G0 or cycles G0/H1 |
+|---|---:|---:|---:|
+| Sync-disabled tx/s | 5,707 | 6,150 | 1.078x |
+| Sync-disabled cycles/tx | 984,778 | 895,007 | 1.100x |
+| Real-sync tx/s | 4,461 | 4,473 | 1.003x |
+| Real-sync cycles/tx | 1,028,777 | 1,019,775 | 1.009x |
+
+The six-scenario durable gate completed three interleaved repetitions per variant. The 64w width1 real-sync protection is 0.997x, above its 0.98 floor. The 64w width16 uniform primary is 0.987x, below the 1.04 full-matrix gate, so the 14-scenario matrix and RocksDB rerun were not triggered.
+
+### H2, H3, correctness, and next bottleneck
+
+The H2 randomized digest test passed bit-for-bit across 4,096 cases on the OCI AArch64 host at H1 commit `5998f7c47a15850c40bb40c8c378ac5c0deca061`, but `crc32c_combine` was much slower than the second payload scan: 159-byte records took 73 ns direct versus 8,510 ns combined; 4,079-byte records took 545 ns versus 17,737 ns; 4,104-byte records took 543 ns versus 18,725 ns. H2 was rejected without production digest changes. H3 was skipped because the remaining canonical page checksum path is about 1.1% of sampled cycles, below its 5% prerequisite.
+
+The full release workspace suite passed. The deterministic public API comparison is byte-identical across 12 configurations for transaction results, commit LSNs, reads, queries, scans, reopen scans, data-file SHA256 and WAL SHA256. The production executable allocator item remains open because `dodb-server` is library-only in this checkout; the eventual production binary must select mimalloc at its binary boundary.
+
+The largest remaining storage-owned category in the H1 profile is **`encode_page_delta()` at 9.85%** of sampled cycles. It is larger than the remaining CRC32C category at 6.38% and is the one next bottleneck selected from the measurement. Phase H artifacts, provenance, raw data, scripts, profiles, correctness logs, tables, and checksums are in `results/wal-v3-phase-h/`.
