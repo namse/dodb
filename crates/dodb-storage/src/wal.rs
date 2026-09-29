@@ -3195,6 +3195,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn combined_payload_digest_matches_direct_digest_for_randomized_records() {
+        let mut random_state = 0x8f3d_9b71_c2a5_640d_u64;
+        let mut tested_records = 0usize;
+        let mut tested_page_deltas = 0usize;
+        let mut tested_page_images = 0usize;
+        for case_index in 0..4_096u32 {
+            random_state ^= random_state << 13;
+            random_state ^= random_state >> 7;
+            random_state ^= random_state << 17;
+            let record_count = (random_state as usize % 8) + 1;
+            let format_version = if case_index % 2 == 0 {
+                WAL_FORMAT_VERSION
+            } else {
+                LEGACY_WAL_FORMAT_VERSION
+            };
+            let mut direct_digest = case_index.wrapping_mul(0x9e37_79b9);
+            let mut combined_digest = direct_digest;
+            for record_position in 0..record_count {
+                random_state ^= random_state << 13;
+                random_state ^= random_state >> 7;
+                random_state ^= random_state << 17;
+                let record_type = if (case_index + record_position as u32) % 3 == 0 {
+                    tested_page_images += 1;
+                    WalRecordType::PageImage
+                } else {
+                    tested_page_deltas += 1;
+                    WalRecordType::PageDelta
+                };
+                let payload_length = match record_type {
+                    WalRecordType::PageImage => PAGE_SIZE + 8,
+                    WalRecordType::PageDelta => match random_state % 4 {
+                        0 => 24,
+                        1 => 159,
+                        2 => 2_048,
+                        _ => PAGE_SIZE - 17,
+                    },
+                    _ => unreachable!(),
+                };
+                let mut payload = Vec::with_capacity(payload_length);
+                while payload.len() < payload_length {
+                    random_state ^= random_state << 13;
+                    random_state ^= random_state >> 7;
+                    random_state ^= random_state << 17;
+                    payload.push(random_state as u8);
+                }
+                let split_point = payload.len() / 3;
+                let payload_parts = [&payload[..split_point], &payload[split_point..]];
+                let record_index = match record_position % 4 {
+                    0 => 0,
+                    1 => u32::MAX,
+                    _ => case_index
+                        .wrapping_mul(31)
+                        .wrapping_add(record_position as u32),
+                };
+                direct_digest = update_record_digest(
+                    direct_digest,
+                    format_version,
+                    record_type,
+                    record_index,
+                    &payload_parts,
+                );
+
+                let mut metadata_digest = combined_digest;
+                let combined_payload_length =
+                    payload_parts.iter().map(|part| part.len()).sum::<usize>();
+                if format_version >= WAL_FORMAT_VERSION {
+                    metadata_digest = crc32c::crc32c_append(metadata_digest, &[record_type as u8]);
+                    metadata_digest =
+                        crc32c::crc32c_append(metadata_digest, &record_index.to_le_bytes());
+                    metadata_digest = crc32c::crc32c_append(
+                        metadata_digest,
+                        &(combined_payload_length as u32).to_le_bytes(),
+                    );
+                }
+                let payload_crc = payload_parts
+                    .iter()
+                    .fold(0u32, |checksum, part| crc32c::crc32c_append(checksum, part));
+                combined_digest =
+                    crc32c::crc32c_combine(metadata_digest, payload_crc, combined_payload_length);
+                assert_eq!(
+                    combined_digest, direct_digest,
+                    "case {case_index}, record {record_position}"
+                );
+                tested_records += 1;
+            }
+        }
+        assert!(tested_records >= 4_096);
+        assert!(tested_page_deltas > 0);
+        assert!(tested_page_images > 0);
+
+        for (record_type, payload_length) in [
+            (WalRecordType::PageDelta, 159usize),
+            (WalRecordType::PageDelta, PAGE_SIZE - 17),
+            (WalRecordType::PageImage, PAGE_SIZE + 8),
+        ] {
+            let payload = vec![0x5a; payload_length];
+            let record_index = 17u32;
+            let iteration_count = 50_000u32;
+            let mut direct_digest = 0x1357_9bdf;
+            let direct_started = std::time::Instant::now();
+            for iteration in 0..iteration_count {
+                let payload_crc = crc32c::crc32c(std::hint::black_box(&payload));
+                direct_digest = update_record_digest(
+                    direct_digest,
+                    WAL_FORMAT_VERSION,
+                    record_type,
+                    record_index.wrapping_add(iteration),
+                    &[&payload],
+                );
+                std::hint::black_box(payload_crc);
+            }
+            let direct_elapsed = direct_started.elapsed();
+
+            let mut combined_digest = 0x1357_9bdf;
+            let combine_started = std::time::Instant::now();
+            for iteration in 0..iteration_count {
+                let payload_crc = crc32c::crc32c(std::hint::black_box(&payload));
+                let current_record_index = record_index.wrapping_add(iteration);
+                let mut metadata_digest =
+                    crc32c::crc32c_append(combined_digest, &[record_type as u8]);
+                metadata_digest =
+                    crc32c::crc32c_append(metadata_digest, &current_record_index.to_le_bytes());
+                metadata_digest =
+                    crc32c::crc32c_append(metadata_digest, &(payload.len() as u32).to_le_bytes());
+                combined_digest =
+                    crc32c::crc32c_combine(metadata_digest, payload_crc, payload.len());
+            }
+            let combine_elapsed = combine_started.elapsed();
+            assert_eq!(direct_digest, combined_digest);
+            println!(
+                "H2 length={payload_length} records={iteration_count} direct_ns_per_record={} combine_ns_per_record={}",
+                direct_elapsed.as_nanos() / u128::from(iteration_count),
+                combine_elapsed.as_nanos() / u128::from(iteration_count)
+            );
+        }
+    }
+
     fn wal_commits(commit_count: usize, pages_per_commit: usize) -> Vec<WalCommit> {
         let mut first_record_lsn = 1u64;
         (0..commit_count)
