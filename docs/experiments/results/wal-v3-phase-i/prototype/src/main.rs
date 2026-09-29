@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -18,6 +19,23 @@ struct AllocationCounter;
 
 static ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
+static SOURCE_COMMIT: OnceLock<String> = OnceLock::new();
+
+fn source_commit() -> &'static str {
+    SOURCE_COMMIT
+        .get_or_init(|| {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("git should be available in the benchmark checkout");
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .expect("git commit should be UTF-8")
+                .trim()
+                .to_owned()
+        })
+        .as_str()
+}
 
 unsafe impl GlobalAlloc for AllocationCounter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -496,7 +514,8 @@ fn emit_write_measurements(
     let cpu_nanos = ticks().saturating_sub(cpu_started);
     let (allocations_after, bytes_after) = reset_allocation_counters();
     println!(
-        "{{\"record_type\":\"write_cpu\",\"segments_before_commit\":{},\"iterations\":{},\"successful_transactions\":{},\"logical_mutations\":{},\"cpu_ns_per_tx\":{},\"wall_ns_per_tx\":{},\"allocations_per_tx\":{:.4},\"allocated_bytes_per_tx\":{:.2},\"admission_ns_per_tx\":{:.2},\"overlay_mutation_ns_per_tx\":{:.2},\"freeze_sort_ns_per_tx\":{:.2},\"publication_ns_per_tx\":{:.2}}}",
+        "{{\"record_type\":\"write_cpu\",\"git_commit\":{},\"segments_before_commit\":{},\"iterations\":{},\"successful_transactions\":{},\"logical_mutations\":{},\"cpu_ns_per_tx\":{},\"wall_ns_per_tx\":{},\"allocations_per_tx\":{:.4},\"allocated_bytes_per_tx\":{:.2},\"admission_ns_per_tx\":{:.2},\"overlay_mutation_ns_per_tx\":{:.2},\"freeze_sort_ns_per_tx\":{:.2},\"publication_ns_per_tx\":{:.2}}}",
+        json_string(source_commit()),
         segment_count,
         iteration_count,
         transactions,
@@ -540,7 +559,8 @@ fn measure_reads(view: &PublishedView, segment_count: usize) -> Result<()> {
         }
         let base_elapsed = base_started.elapsed().as_nanos() as u64;
         println!(
-            "{{\"record_type\":\"get\",\"segments\":{},\"case\":{},\"operations\":{},\"ns_per_op\":{:.2},\"ops_per_second\":{:.2},\"segments_consulted_per_op\":{:.2},\"h1_base_ns_per_op\":{:.2},\"prototype_over_base\":{:.3}}}",
+            "{{\"record_type\":\"get\",\"git_commit\":{},\"segments\":{},\"case\":{},\"operations\":{},\"ns_per_op\":{:.2},\"ops_per_second\":{:.2},\"segments_consulted_per_op\":{:.2},\"h1_base_ns_per_op\":{:.2},\"prototype_over_base\":{:.3}}}",
+            json_string(source_commit()),
             segment_count,
             json_string(case_name),
             operation_count,
@@ -575,7 +595,8 @@ fn measure_reads(view: &PublishedView, segment_count: usize) -> Result<()> {
         }
         let base_elapsed = base_started.elapsed().as_nanos() as u64;
         println!(
-            "{{\"record_type\":\"range_read\",\"segments\":{},\"operation\":{},\"operations\":{},\"rows_per_operation\":{:.2},\"h1_base_rows_per_operation\":{:.2},\"ns_per_op\":{:.2},\"ops_per_second\":{:.2},\"h1_base_ns_per_op\":{:.2},\"prototype_over_base\":{:.3}}}",
+            "{{\"record_type\":\"range_read\",\"git_commit\":{},\"segments\":{},\"operation\":{},\"operations\":{},\"rows_per_operation\":{:.2},\"h1_base_rows_per_operation\":{:.2},\"ns_per_op\":{:.2},\"ops_per_second\":{:.2},\"h1_base_ns_per_op\":{:.2},\"prototype_over_base\":{:.3}}}",
+            json_string(source_commit()),
             segment_count,
             json_string(operation),
             operation_count,
@@ -691,7 +712,8 @@ fn correctness_check(base: BlinkReadHandle) -> Result<()> {
     assert!(!query_rows.contains(&key_a));
     assert!(!scan_rows.contains(&key_a));
     println!(
-        "{{\"record_type\":\"correctness\",\"ordered_conditions\":true,\"failed_transaction_isolation\":true,\"delete_tombstone\":true,\"pinned_view_immutability\":true,\"query_overlay_merge\":true,\"scan_overlay_merge\":true}}"
+        "{{\"record_type\":\"correctness\",\"git_commit\":{},\"ordered_conditions\":true,\"failed_transaction_isolation\":true,\"delete_tombstone\":true,\"pinned_view_immutability\":true,\"query_overlay_merge\":true,\"scan_overlay_merge\":true}}",
+        json_string(source_commit())
     );
     Ok(())
 }
