@@ -2736,6 +2736,66 @@ fn effective_sync(args: &Args, scenario: &Scenario) -> (SyncMode, Duration) {
     }
 }
 
+#[cfg(feature = "phase-i-instrumentation")]
+fn write_phase_i_locality_samples(args: &Args, scenario: &Scenario, repetition: usize, seed: u64) {
+    use std::io::Write;
+
+    let Some(path) = env::var_os("DODB_PHASE_I_LOCALITY_OUTPUT") else {
+        let _ = dodb_storage::blink::take_phase_i_group_locality_samples();
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("locality output directory should be creatable");
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("locality output should open");
+    let encode_array = |values: &[usize]| {
+        values
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let git_commit = current_git_commit();
+    for (group_index, sample) in dodb_storage::blink::take_phase_i_group_locality_samples()
+        .into_iter()
+        .enumerate()
+    {
+        writeln!(
+            output,
+            "{{\"record_type\":\"group_locality\",\"git_commit\":{},\"sync_mode\":{},\"writers\":{},\"width\":{},\"distribution\":{},\"repetition\":{},\"seed\":{},\"group_index\":{},\"requested_transactions\":{},\"successful_transactions\":{},\"failed_transactions\":{},\"logical_mutations\":{},\"unique_keys\":{},\"boundary_materializations\":{},\"page_encodes\":{},\"page_delta_records\":{},\"distinct_touched_leaves\":{},\"mutations_per_leaf\":[{}],\"transactions_per_leaf\":[{}],\"leaves_by_transaction_touch_count\":[{},{},{}]}}",
+            json_string(&git_commit),
+            json_string(effective_sync(args, scenario).0.as_str()),
+            scenario.writers,
+            scenario.width,
+            json_string(scenario.distribution.as_str()),
+            repetition,
+            seed,
+            group_index,
+            sample.requested_transactions,
+            sample.successful_transactions,
+            sample.failed_transactions,
+            sample.logical_mutations,
+            sample.unique_keys,
+            sample.boundary_materializations,
+            sample.page_encodes,
+            sample.page_delta_records,
+            sample.distinct_touched_leaves,
+            encode_array(&sample.mutations_per_leaf),
+            encode_array(&sample.transactions_per_leaf),
+            sample.leaves_by_transaction_touch_count[0],
+            sample.leaves_by_transaction_touch_count[1],
+            sample.leaves_by_transaction_touch_count[2],
+        )
+        .expect("locality event should write");
+    }
+    output.flush().expect("locality output should flush");
+}
+
 fn benchmark_path(scenario: &Scenario, repetition: usize, seed: u64) -> PathBuf {
     let scenario_name = scenario.name().replace(['/', '\\'], "_");
     env::temp_dir().join(format!(
@@ -3715,6 +3775,8 @@ async fn run_repetition(
     )
     .await;
     let _ = warmup_stats;
+    #[cfg(feature = "phase-i-instrumentation")]
+    let _ = dodb_storage::blink::take_phase_i_group_locality_samples();
     if args.window_seconds.is_some() {
         samples.push(ResourceSample::capture(
             &*adapter,
@@ -3774,6 +3836,8 @@ async fn run_repetition(
         &samples,
         &churn,
     );
+    #[cfg(feature = "phase-i-instrumentation")]
+    write_phase_i_locality_samples(args, scenario, repetition, seed);
     use std::io::Write;
     writeln!(output, "{line}")?;
     output.flush()?;

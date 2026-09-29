@@ -13,6 +13,7 @@ mimalloc.workspace = true
 
 [features]
 churn-counters = []
+phase-i-instrumentation = []
 
 [dev-dependencies]
 proptest.workspace = true

@@ -237,6 +237,35 @@ pub struct BlinkBatchMetrics {
     pub transaction_leaf_page_histogram: Vec<u64>,
 }
 
+#[cfg(feature = "phase-i-instrumentation")]
+#[derive(Clone, Debug, Default)]
+pub struct PhaseIGroupLocalitySample {
+    pub requested_transactions: usize,
+    pub successful_transactions: usize,
+    pub failed_transactions: usize,
+    pub logical_mutations: usize,
+    pub unique_keys: usize,
+    pub boundary_materializations: usize,
+    pub page_encodes: usize,
+    pub page_delta_records: usize,
+    pub distinct_touched_leaves: usize,
+    pub mutations_per_leaf: Vec<usize>,
+    pub transactions_per_leaf: Vec<usize>,
+    pub leaves_by_transaction_touch_count: [usize; 3],
+}
+
+#[cfg(feature = "phase-i-instrumentation")]
+static PHASE_I_GROUP_LOCALITY: std::sync::Mutex<Vec<PhaseIGroupLocalitySample>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "phase-i-instrumentation")]
+pub fn take_phase_i_group_locality_samples() -> Vec<PhaseIGroupLocalitySample> {
+    PHASE_I_GROUP_LOCALITY
+        .lock()
+        .map(|mut samples| std::mem::take(&mut *samples))
+        .unwrap_or_default()
+}
+
 pub const BLINK_LOCALITY_HISTOGRAM_BUCKETS: usize = 65;
 
 fn record_histogram(histogram: &mut Vec<u64>, value: usize) {
@@ -2005,6 +2034,13 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
                 "experimental storage shard is degraded after an uncertain write",
             ));
         }
+        #[cfg(feature = "phase-i-instrumentation")]
+        let locality_leaf_encodes_before = self.batch_metrics.leaf_encodes;
+        #[cfg(feature = "phase-i-instrumentation")]
+        let locality_redo_before = self
+            .wal_metrics()?
+            .map(|metrics| metrics.redo)
+            .unwrap_or_default();
         let _group_site = churn::enter(ChurnSite::OtherStorage);
 
         self.batch_metrics.logical_groups = self.batch_metrics.logical_groups.saturating_add(1);
@@ -2469,6 +2505,62 @@ impl<F: DurableFile, W: DurableFile> BlinkStore<F, W> {
             .page_images
             .saturating_add(redo_record_count);
         self.batch_metrics.wal_bytes = self.batch_metrics.wal_bytes.saturating_add(wal_bytes);
+        #[cfg(feature = "phase-i-instrumentation")]
+        {
+            let mut unique_keys = BTreeSet::new();
+            let mut mutations_per_leaf = Vec::with_capacity(plan.leaf_groups.len());
+            let mut transactions_per_leaf = Vec::with_capacity(plan.leaf_groups.len());
+            let mut leaves_by_transaction_touch_count = [0usize; 3];
+            let mut boundary_materializations = 0usize;
+            for leaf_group in &plan.leaf_groups {
+                let touched_transactions = leaf_group
+                    .mutations
+                    .iter()
+                    .map(|(transaction_index, _)| *transaction_index)
+                    .collect::<BTreeSet<_>>();
+                let transaction_count = touched_transactions.len();
+                boundary_materializations += transaction_count;
+                leaves_by_transaction_touch_count[transaction_count.min(3) - 1] += 1;
+                mutations_per_leaf.push(leaf_group.mutations.len());
+                transactions_per_leaf.push(transaction_count);
+            }
+            for transaction in &admitted {
+                unique_keys.extend(transaction.encoded_mutation_keys.iter().cloned());
+            }
+            mutations_per_leaf.sort_unstable();
+            transactions_per_leaf.sort_unstable();
+            let locality_redo_after = self
+                .wal_metrics()?
+                .map(|metrics| metrics.redo)
+                .unwrap_or_default();
+            let sample = PhaseIGroupLocalitySample {
+                requested_transactions: requests.len(),
+                successful_transactions: admitted.len(),
+                failed_transactions: requests.len().saturating_sub(admitted.len()),
+                logical_mutations: admitted
+                    .iter()
+                    .map(|transaction| transaction.encoded_mutation_keys.len())
+                    .sum(),
+                unique_keys: unique_keys.len(),
+                boundary_materializations,
+                page_encodes: self
+                    .batch_metrics
+                    .leaf_encodes
+                    .saturating_sub(locality_leaf_encodes_before)
+                    as usize,
+                page_delta_records: locality_redo_after
+                    .page_delta_records
+                    .saturating_sub(locality_redo_before.page_delta_records)
+                    as usize,
+                distinct_touched_leaves: plan.leaf_groups.len(),
+                mutations_per_leaf,
+                transactions_per_leaf,
+                leaves_by_transaction_touch_count,
+            };
+            if let Ok(mut samples) = PHASE_I_GROUP_LOCALITY.lock() {
+                samples.push(sample);
+            }
+        }
         self.storage_metrics.btree_preparation_nanos = self
             .storage_metrics
             .btree_preparation_nanos
