@@ -1,0 +1,48 @@
+   Compiling dodb-storage v0.1.0 (/tmp/dodb-phase-h-final/src/crates/dodb-storage)
+    Finished `release` profile [optimized] target(s) in 59.76s
+     Running unittests src/lib.rs (/tmp/dodb-phase-h-final/target/aarch64-unknown-linux-gnu/release/deps/dodb_storage-468866236caf4753)
+
+running 1 test
+H2 length=159 records=50000 direct_ns_per_record=72 combine_ns_per_record=7967
+H2 length=4079 records=50000 direct_ns_per_record=544 combine_ns_per_record=14586
+H2 length=4104 records=50000 direct_ns_per_record=542 combine_ns_per_record=16155
+test wal::tests::combined_payload_digest_matches_direct_digest_for_randomized_records ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 148 filtered out; finished in 2.28s
+
+     Running unittests src/bin/phase0-bench.rs (/tmp/dodb-phase-h-final/target/aarch64-unknown-linux-gnu/release/deps/phase0_bench-e0350eb0498023a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase1-bench.rs (/tmp/dodb-phase-h-final/target/aarch64-unknown-linux-gnu/release/deps/phase1_bench-e0dcf8aa85db3245)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase2-crash-child.rs (/tmp/dodb-phase-h-final/target/aarch64-unknown-linux-gnu/release/deps/phase2_crash_child-51134ddc14874c5b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase4-bench.rs (/tmp/dodb-phase-h-final/target/aarch64-unknown-linux-gnu/release/deps/phase4_bench-11d5f3cfd348ce8a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase5-bench.rs (/tmp/dodb-phase-h-final/target/aarch64-unknown-linux-gnu/release/deps/phase5_bench-46049be4e2a0a4dc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase2_recovery.rs (/tmp/dodb-phase-h-final/target/aarch64-unknown-linux-gnu/release/deps/phase2_recovery-9b72e1bb480b02ac)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
