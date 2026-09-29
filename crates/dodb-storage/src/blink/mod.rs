@@ -1219,13 +1219,19 @@ enum ParallelWorkerFault {
 struct LeafChainJob {
     leaf_id: PageId,
     initial_page: Arc<BlinkPage>,
-    base_image: Option<Arc<[u8; PAGE_SIZE]>>,
+    base_page: Option<TrustedPageImage>,
     chain_entry: Option<(Lsn, u32)>,
     steps: Vec<(u32, u32)>,
     plan: Arc<BatchPlan>,
     commit_lsns: Arc<[Lsn]>,
     #[cfg(test)]
     fault: Option<ParallelWorkerFault>,
+}
+
+struct TrustedPageImage {
+    image: Arc<[u8; PAGE_SIZE]>,
+    page_lsn: Lsn,
+    fingerprint: u32,
 }
 
 enum LeafChainRedo {
@@ -3363,16 +3369,18 @@ fn prepare_leaf_parallel_execution<'a, W: DurableFile>(
             ));
         }
         let chain_entry = wal.page_chain_entry(leaf_id);
-        let base_image = if chain_entry.is_some() {
-            dirty_pages.get(&leaf_id).map(Arc::clone)
-        } else {
-            None
-        };
+        let base_page = chain_entry.and_then(|(page_lsn, fingerprint)| {
+            dirty_pages.get(&leaf_id).map(|image| TrustedPageImage {
+                image: Arc::clone(image),
+                page_lsn,
+                fingerprint,
+            })
+        });
         churn::add(ChurnCounter::JobsBuilt, 1);
         jobs.push(LeafChainJob {
             leaf_id,
             initial_page,
-            base_image,
+            base_page,
             chain_entry,
             steps,
             plan: Arc::clone(plan),
@@ -3615,21 +3623,29 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
     let mut base = match job.chain_entry {
         None => None,
         Some((chain_lsn, chain_crc)) => {
-            let image = match job.base_image {
-                Some(image) => image,
+            let trusted = match job.base_page {
+                Some(trusted) => {
+                    validate_trusted_page_image(leaf_id, chain_lsn, chain_crc, &trusted)?;
+                    trusted
+                }
                 None => {
                     churn::add(ChurnCounter::PageEncodes, 1);
                     churn::add(ChurnCounter::PageImageBuffers, 1);
-                    encode_blink_page_arc(leaf_id, &page)?
+                    let image = encode_blink_page_arc(leaf_id, &page)?;
+                    let fingerprint = crc32c::crc32c(&image[..]);
+                    if blink_image_lsn(&image) != chain_lsn || fingerprint != chain_crc {
+                        return Err(Error::invariant(format!(
+                            "page {leaf_id} parallel delta base does not match the WAL page chain"
+                        )));
+                    }
+                    TrustedPageImage {
+                        image,
+                        page_lsn: chain_lsn,
+                        fingerprint,
+                    }
                 }
             };
-            let image_crc = crc32c::crc32c(&image[..]);
-            if blink_image_lsn(&image) != chain_lsn || image_crc != chain_crc {
-                return Err(Error::invariant(format!(
-                    "page {leaf_id} parallel delta base does not match the WAL page chain"
-                )));
-            }
-            Some((image, chain_lsn, image_crc))
+            Some(trusted)
         }
     };
     timing.base_nanos = elapsed_nanos(base_started);
@@ -3681,13 +3697,13 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
         let image_crc = crc32c::crc32c(&image[..]);
         let redo = match &base {
             None => LeafChainRedo::Image(Arc::clone(&image)),
-            Some((base_image, base_lsn, base_crc)) => {
-                let payload = encode_page_delta(leaf_id, base_image, &image)?;
+            Some(base_page) => {
+                let payload = encode_page_delta(leaf_id, &base_page.image, &image)?;
                 if payload.len() >= PAGE_IMAGE_PAYLOAD_SIZE {
                     LeafChainRedo::Image(Arc::clone(&image))
                 } else {
                     let view = decode_page_delta(&payload)?;
-                    if !page_delta_rebuilds(base_image, &view, &image)? {
+                    if !page_delta_rebuilds(&base_page.image, &view, &image)? {
                         return Err(Error::invariant(format!(
                             "page {leaf_id} parallel delta does not rebuild its after-image"
                         )));
@@ -3697,15 +3713,19 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
                     drop(view);
                     LeafChainRedo::Delta {
                         payload,
-                        base_lsn: *base_lsn,
-                        base_crc: *base_crc,
+                        base_lsn: base_page.page_lsn,
+                        base_crc: base_page.fingerprint,
                         spans,
                         changed_bytes,
                     }
                 }
             }
         };
-        base = Some((image, commit_lsn, image_crc));
+        base = Some(TrustedPageImage {
+            image,
+            page_lsn: commit_lsn,
+            fingerprint: image_crc,
+        });
         timing.delta_nanos = timing
             .delta_nanos
             .saturating_add(elapsed_nanos(delta_started));
@@ -3716,8 +3736,9 @@ fn run_leaf_chain_job(job: LeafChainJob) -> Result<LeafChainOutcome> {
             redo,
         });
     }
-    let (final_image, _, _) =
-        base.ok_or_else(|| Error::invariant("parallel leaf chain produced no image"))?;
+    let final_image = base
+        .ok_or_else(|| Error::invariant("parallel leaf chain produced no image"))?
+        .image;
     Ok(LeafChainOutcome::Prepared(LeafChainResult {
         leaf_id,
         boundaries,
@@ -3752,6 +3773,29 @@ fn blink_image_lsn(image: &[u8; PAGE_SIZE]) -> Lsn {
     let mut lsn_bytes = [0u8; 8];
     lsn_bytes.copy_from_slice(&image[16..24]);
     Lsn::new(u64::from_le_bytes(lsn_bytes))
+}
+
+fn validate_trusted_page_image(
+    page_id: PageId,
+    chain_lsn: Lsn,
+    chain_fingerprint: u32,
+    trusted: &TrustedPageImage,
+) -> Result<()> {
+    let image_page_id = PageId::new(u64::from_le_bytes(
+        trusted.image[8..16]
+            .try_into()
+            .map_err(|_| Error::invariant("trusted Blink page id bytes are invalid"))?,
+    ));
+    if trusted.page_lsn != chain_lsn
+        || trusted.fingerprint != chain_fingerprint
+        || image_page_id != page_id
+        || blink_image_lsn(&trusted.image) != chain_lsn
+    {
+        return Err(Error::invariant(format!(
+            "page {page_id} trusted image metadata does not match the WAL page chain"
+        )));
+    }
+    Ok(())
 }
 
 /// Applies one planned mutation in place, with the same entry layout the
@@ -6489,6 +6533,58 @@ fn write_all_at<F: DurableFile>(file: &mut F, offset: u64, bytes: &[u8]) -> Resu
 mod tests {
     use super::*;
 
+    #[test]
+    fn trusted_page_fingerprint_stays_associated_with_immutable_image() {
+        let page_id = PageId::new(19);
+        let page_lsn = Lsn::new(42);
+        let page = BlinkPage::Leaf {
+            lsn: page_lsn,
+            high_key: None,
+            right_sibling: None,
+            entries: LeafEntries::default(),
+        };
+        let image = encode_blink_page_arc(page_id, &page).unwrap();
+        let fingerprint = crc32c::crc32c(&image[..]);
+        let trusted = TrustedPageImage {
+            image: Arc::clone(&image),
+            page_lsn,
+            fingerprint,
+        };
+        assert_eq!(fingerprint, crc32c::crc32c(&trusted.image[..]));
+        validate_trusted_page_image(page_id, page_lsn, fingerprint, &trusted).unwrap();
+
+        let wrong_lsn = TrustedPageImage {
+            page_lsn: Lsn::new(page_lsn.get() + 1),
+            ..TrustedPageImage {
+                image: Arc::clone(&image),
+                page_lsn,
+                fingerprint,
+            }
+        };
+        assert!(validate_trusted_page_image(page_id, page_lsn, fingerprint, &wrong_lsn).is_err());
+
+        let wrong_fingerprint = TrustedPageImage {
+            fingerprint: fingerprint ^ 1,
+            image: Arc::clone(&image),
+            page_lsn,
+        };
+        assert!(
+            validate_trusted_page_image(page_id, page_lsn, fingerprint, &wrong_fingerprint)
+                .is_err()
+        );
+
+        let wrong_image = encode_blink_page_arc(PageId::new(20), &page).unwrap();
+        let wrong_association = TrustedPageImage {
+            image: wrong_image,
+            page_lsn,
+            fingerprint,
+        };
+        assert!(
+            validate_trusted_page_image(page_id, page_lsn, fingerprint, &wrong_association)
+                .is_err()
+        );
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum OwnedValue {
         Inline(Vec<u8>),
@@ -7698,7 +7794,7 @@ mod tests {
                         right_sibling: None,
                         entries: LeafEntries::default(),
                     }),
-                    base_image: None,
+                    base_page: None,
                     chain_entry: None,
                     steps: vec![(0, 0)],
                     plan: Arc::clone(&plan),
